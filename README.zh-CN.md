@@ -1,315 +1,748 @@
+<div align="center">
+
+
+# Every DAgent
+
+### One Runtime. Many Plugins. An Agent for Everyday Life.
+
+**一个桌面原生、插件化、可扩展的个人 AI Agent。  
+围绕模块化 Agent Runtime、工具调用、持久化上下文与领域插件体系构建。**
+
+React · TypeScript · Tauri · Rust · ReAct · Tool Calling · SQLite
+
+[English](./README.md)
+
+</div>
+
+---
+
+## 项目简介
+
+**Every DAgent** 是一个可扩展的桌面 AI Agent，核心设计思想很简单：
+
+> 保持 Agent Runtime 足够小，通过独立的领域插件不断扩展真实世界能力。
+
+项目不会把模型、桌面 UI 与业务逻辑耦合在一起，而是将系统拆分为清晰的几层：
+
+- **桌面应用**：基于 React、Fluent UI 与 Tauri 构建原生桌面体验
+- **Agent Runtime**：负责模型调用、Agent Loop、工具、会话、上下文与持久化
+- **Domain Plugins**：承载音乐、日历、任务、个人财务等独立能力
+- **Tools & Services**：作为 Agent 与真实业务数据之间的显式能力边界
+- **Local Storage**：保存会话、记忆与领域数据
+
+当前 Reference Implementation 为 **Chinook Music**，覆盖音乐检索、推荐、订单查询与长期记忆。
+
+这个项目的长期目标并不是做一个音乐聊天机器人。
+
+它希望探索的是：
+
+> **如何构建一套足够小、但完整可用的个人 Agent 架构，并在不重写核心系统的情况下持续吸收新的领域能力。**
+
+---
+
+## Demo
+
+> Every DAgent 当前提供 Windows 桌面应用。
+
+<!-- 替换为最佳桌面端全窗口截图 -->
+
 <p align="center">
-  <img src="docs/logo.png" alt="DSH Life Assistant" width="240">
+  <img src="./assets/screenshots/home.png" width="900" alt="Every DAgent Desktop" />
 </p>
 
-# DSH Life Assistant
 
-[English](README.md) | 简体中文
+当前桌面端支持：
 
-一个围绕用户授权数据与领域工具构建的可扩展个人 AI 助手。
+- Assistant 流式输出
+- Tool 执行过程可视化
+- 持久化会话历史
+- Agent Activity Trace
+- 模型端点配置
+- Sidecar 自动恢复
+- 本地长期记忆
 
-当前版本首先实现 **Chinook Music** 领域，用音乐目录、购买记录、长期偏好记忆和本地 Session，验证"个人数据 → Domain Tools → Persistent Agent → Desktop Experience"的完整工作方式——同一个持久化个人 Agent，使用领域工具与本地数据理解偏好、搜索音乐、查询购买历史、记住长期兴趣，并提供桌面原生的交互体验。
+---
 
-![DSH Life Assistant](assets/screenshots/desktop-home.png)
+## 工程亮点
 
-## 今天可以做什么
+### 模块化 Agent 架构
 
-以下全部为 v1.0.2 中真实发布的能力——都由 Chinook Music 领域支撑。
+Every DAgent 将 Agent 系统拆分为五个核心职责：
 
-- **音乐目录搜索** — 跨目录查找艺人、专辑与曲目
-- **音乐推荐** — 相似专辑与流派热度，全部基于真实数据
-- **订单查询** — 用自然语言询问自己的购买历史
-- **发票所有权保护** — 发票明细只对当前客户可读
-- **客户级长期记忆** — 按客户记住事实，并在后续会话中复用
-- **持久化会话** — 每段对话都是可恢复的持久 Agent 会话
-- **流式回复** — 助手回答逐 token 实时流式呈现
-- **可见的 Tool 活动** — 每一次 Tool 调用都实时展示，而不是藏在模型内部
-- **桌面 Activity Drawer（活动抽屉）** — 完整可查的 Agent 运行轨迹：模型回合、Tool 调用、耗时
-- **Sidecar 崩溃恢复** — Agent 进程被守护，崩溃后自动重启并重连会话
-- **应用内模型端点配置** — 指向任意 OpenAI 兼容端点（Base URL、API Key、模型名称），从端点自己的模型列表中直接选择，并测试连接，无需接触环境变量
-
-## 当前领域 — Chinook Music
-
+```text
+Model Client
+     ↕
+Agent Loop
+     ↕
+Tool Registry
+     ↕
+Session & Context
+     ↕
+Persistence
 ```
-DSH Life Assistant
+
+通过这一边界，模型交互、工具执行、会话状态和存储机制可以与具体领域业务逻辑保持独立。
+
+### ReAct 风格工具执行
+
+Agent 可以在模型推理与工具执行之间进行迭代：
+
+```text
+用户请求
+    ↓
+上下文组装
+    ↓
+   LLM
+    ↓
+需要 Tool？
+ ↙       ↘
+是        否
+↓          ↓
+执行工具    回答
+↓
+Tool Result
+↓
+   LLM
+```
+
+Tool 不直接写入桌面 UI 或 Model Client。
+
+它们通过 Agent / Domain 边界注册，并通过显式 Contract 调用。
+
+### 插件化领域层
+
+业务能力位于 Agent Core 之外：
+
+```text
+Every DAgent
 │
-├── 共享 Agent Runtime
-│     ├── Session
-│     ├── Memory
-│     ├── Tool Calling
-│     ├── Streaming
-│     └── Desktop Runtime
+├── Agent Runtime
 │
-└── 领域插件（Domain Plugins）
-      ├── Chinook Music          ✅ 已实现（v1.0.0）
-      ├── Personal Finance       ◌ 未来
-      ├── Calendar / Tasks       ◌ 未来
-      └── 其他用户授权数据       ◌ 未来
+└── Domain Plugins
+     │
+     ├── Chinook Music        ✓ 已实现
+     ├── Calendar             规划中
+     ├── Tasks                规划中
+     ├── Personal Finance     规划中
+     └── ...
 ```
 
-### 为什么先做 Chinook？
+每个 Domain Plugin 独立拥有自己的：
 
-Chinook 不是随手挑的 Demo。它提供了一个结构清晰、可真实查询的音乐商店数据域，因此被选为第一个 Domain Implementation，用于端到端验证完整模式：领域插件、Tool Calling、长期记忆、数据所有权与桌面交互。
+- Tools
+- Services
+- 业务规则
+- 存储访问
+- 领域记忆行为
 
-## 架构
+Desktop Host 不需要知道音乐推荐或发票查询如何实现。
 
-一个持久化的 DSH Agent Runtime，外加可扩展的领域边界——添加新领域时，桌面宿主与 Agent 核心无需改动。
+Agent Runtime 也不需要知道底层数据库结构。
 
-```mermaid
-flowchart TD
-    UI["React + Fluent UI<br/>Desktop Presentation"]
-    HOST["Tauri v2 + Rust<br/>Desktop Host"]
-    BRIDGE["Node Agent Bridge<br/>Transport Adapter"]
-    AGENT["DSH AgentRuntime<br/>Persistent Personal Agent"]
+### 桌面原生 Agent 架构
 
-    DOMAIN["Domain Plugins"]
+Every DAgent 不是简单套一层 Web UI 调用 API。
 
-    MUSIC["Chinook Music<br/>Implemented"]
-    FINANCE["Personal Finance<br/>Future"]
-    CALENDAR["Calendar / Tasks<br/>Future"]
-
-    UI --> HOST
-    HOST --> BRIDGE
-    BRIDGE --> AGENT
-    AGENT --> DOMAIN
-
-    DOMAIN --> MUSIC
-    DOMAIN -. future .-> FINANCE
-    DOMAIN -. future .-> CALENDAR
-```
-
-技术路径保持明确：
+项目采用多进程桌面架构：
 
 ```text
 React + Fluent UI
         ↓
-Tauri Commands / Channels
+Tauri IPC / Channel
         ↓
 Rust Desktop Host
         ↓
-stdin/stdout JSONL
+stdin / stdout JSONL
         ↓
-Node Agent Bridge
+Node Agent Process
         ↓
-DSH AgentRuntime
+Agent Runtime
         ↓
-领域插件（Domain Plugin）
-        ↓
-Tools / SQLite / Memory
+Domain Plugin
 ```
 
-| 层 | 职责 |
-| --- | --- |
-| React + Fluent UI | 展示层。纯对话/时间线 UI，从不直接访问数据库或模型 |
-| Rust Desktop Host | 窗口、应用生命周期与单个长驻 Agent sidecar 进程 |
-| Node Agent Bridge | 传输适配层 — 通过 stdin/stdout 上的 JSONL 在宿主与 Agent Runtime 之间通信 |
-| DSH AgentRuntime | DeepSeek Harness Agent 核心：会话、模型调用、Tool 分发、记忆 |
-| 领域插件 | 业务层 — 由 SQLite 与客户记忆支撑的领域 Tool |
+Rust Host 管理应用生命周期以及长期运行的 Agent Sidecar。
 
-## Agent Tools
+Node 进程承载 Agent 执行环境。
 
-以下是 Chinook Music 领域当前提供的 7 个 Tool：
+两者通过轻量 JSONL 协议通信，而不是 HTTP / WebSocket。
 
-| Tool | 作用 |
-| --- | --- |
-| `search_catalog` | 按艺人、专辑或曲目搜索音乐目录 |
-| `find_similar_albums` | 推荐与给定专辑相似的专辑 |
-| `popular_in_genre` | 展示某一音乐流派中的热门内容 |
-| `list_my_orders` | 列出当前客户的订单 |
-| `get_invoice_details` | 读取某张发票的明细行（带所有权校验） |
-| `remember` | 将当前客户的一条事实写入长期记忆 |
-| `recall` | 检索已存储的当前客户事实 |
+### 持久化 Session 与长期记忆
 
-## 桌面体验
+Every DAgent 中的 Conversation 是可以恢复的 Agent Session，而不是一次性的聊天消息。
 
-桌面应用包装了与最初 CLI 相同的 Agent 核心。首页为对话视图，带一条实时活动条：Agent 工作时，你能看到当前步骤（模型回合、Tool 调用、Tool 结果），回复实时流式呈现。标题栏同时展示产品名（**DSH Life Assistant**）与当前领域（**Chinook Music**）。**Activity Drawer（活动抽屉）** 保存每次运行的完整轨迹。侧边栏列出持久化会话，包括可恢复的历史会话。Agent 作为应用管控下的子 Node 进程运行——若崩溃会被自动重启并重连会话。标题栏的 **设置** 面板可在应用内配置模型端点（Base URL、API Key、模型名称，见[首次运行](#首次运行配置模型端点)）；密钥单向写入本机凭据库，不会回显。
+当前实现支持：
 
-## 技术栈
+- Session History 持久化
+- Session 恢复
+- Customer-scoped 长期记忆
+- Runtime Identity 传递
+- SQLite 本地持久化
 
-| 领域 | 选型 |
-| --- | --- |
-| 前端 | React 18 + Fluent UI v9，经 Tauri v2 在 WebView2 中渲染 |
-| 桌面宿主 | Rust（Tauri v2）；NSIS / MSI 安装包 |
-| Agent 桥 | Node.js 进程经 stdin/stdout JSONL 与 Rust 通信（esbuild 打包） |
-| Agent 运行时 | DeepSeek Harness（DSH）AgentRuntime（`@deepseek-ai/dsh`） |
-| 业务层 | TypeScript 领域插件：7 个 Tool、SQLite 服务、按客户记忆 |
-| 数据 | 经 `better-sqlite3` 使用 SQLite — 公开 Chinook 示例库结构，外加记忆存储 |
-| 工具链 | pnpm workspace、TypeScript、Vite、Vitest、Cargo |
+领域数据与长期记忆均绑定当前用户身份。
 
-## 项目结构
+### 可观察 Tool 执行
+
+Agent 的执行过程不会被隐藏在一个 Loading 动画背后。
+
+桌面端能够展示：
 
 ```text
-dsh-life-assistant/
-├── apps/
-│   ├── agent-bridge/     # Node 桥：桌面宿主 <-> DSH 的 JSONL 传输适配层
-│   ├── cli/              # Agent CLI REPL（最初入口）
-│   └── desktop/          # Tauri 桌面应用：React 前端、Rust 宿主、打包
-├── plugins/chinook/      # Chinook Music 领域插件：Tool、服务、记忆
-├── profiles/chinook/     # Chinook Music 领域的 DSH profile 装配
-├── scripts/              # bootstrap 与构建辅助脚本
-├── tests/                # Vitest 套件：插件、服务、桥、架构
-├── docs/                 # 项目 logo
-└── assets/screenshots/   # 项目截图
+turn/start
+model/start
+tool/call
+tool/result
+assistant/chunk
+turn/end
+turn/error
 ```
 
-## 快速开始
+这样可以从用户请求一直观察到最终回答。
 
-### 前置要求
+### Runtime Recovery
 
-- Node.js ≥ 22 与 pnpm
-- Rust stable（MSVC 工具链）+ Visual Studio Build Tools（C++）— 仅桌面宿主需要
-- Windows 10/11 及 WebView2 运行时（Windows 11 已内置）
+Desktop Host 会监控 Node Agent Process。
 
-### 1. 安装依赖
+如果 Sidecar 异常退出，应用可以：
+
+1. 检测异常
+2. 重启 Agent Process
+3. 恢复上一个 Session
+4. 重新 Hydrate 桌面状态
+5. 继续接收请求
+
+从而将进程生命周期问题保持在 Desktop Host 内部，而不是泄露到业务插件层。
+
+---
+
+# 系统架构
+
+<p align="center">
+  <img src="./assets/architecture/every-dagent-architecture.png"
+       width="1000"
+       alt="Every DAgent Architecture" />
+</p>
+
+
+系统主要分为六层：
+
+| 层级                  | 职责                                                |
+| --------------------- | --------------------------------------------------- |
+| **Desktop App**       | Chat UI、会话历史、Tool Activity 与设置             |
+| **Desktop Host**      | 原生生命周期、IPC、Sidecar 管理与恢复               |
+| **Agent Runtime**     | 模型调用、Agent Loop、Tools、Context 与 Persistence |
+| **Domain Plugins**    | 独立的现实领域能力模块                              |
+| **Domain Services**   | 业务逻辑与存储抽象                                  |
+| **External Services** | LLM Provider 与未来第三方 API                       |
+
+整个架构遵循一个核心原则：
+
+> **Agent 编排留在 Runtime 中，业务行为留在 Plugin 中。**
+
+---
+
+# 一次 Agent Turn 如何执行
+
+完整的数据流如下：
+
+```text
+User
+ │
+ ▼
+React Chat UI
+ │
+ ▼
+Tauri Command
+ │
+ ▼
+Rust Desktop Host
+ │
+ ▼
+JSONL IPC
+ │
+ ▼
+Agent Process
+ │
+ ▼
+Session & Context
+ │
+ ▼
+LLM
+ │
+ ├──────────── no tool ────────────┐
+ │                                  │
+ ▼                                  │
+Tool Call                            │
+ │                                  │
+ ▼                                  │
+Tool Registry                        │
+ │                                  │
+ ▼                                  │
+Domain Plugin                        │
+ │                                  │
+ ▼                                  │
+Service Layer                        │
+ │                                  │
+ ▼                                  │
+SQLite / External Data               │
+ │                                  │
+ ▼                                  │
+Tool Result                          │
+ │                                  │
+ └──────────────► LLM ◄─────────────┘
+                    │
+                    ▼
+             Streaming Events
+                    │
+                    ▼
+              Desktop UI
+```
+
+Frontend 不直接访问业务数据库，也不直接调用模型。
+
+---
+
+# Reference Domain — Chinook Music
+
+Chinook Music 是 Every DAgent 的第一个完整领域实现，用于验证整套架构是否能够端到端工作。
+
+它被定义为一个 **Reference Plugin**，而不是整个项目的身份。
+
+### 已实现 Tools
+
+| Tool                  | 能力                        |
+| --------------------- | --------------------------- |
+| `search_catalog`      | 搜索歌手、专辑与歌曲        |
+| `find_similar_albums` | 查找相似专辑                |
+| `popular_in_genre`    | 浏览指定 Genre 下的热门音乐 |
+| `list_my_orders`      | 查询当前用户订单            |
+| `get_invoice_details` | 查看当前用户拥有的发票明细  |
+| `remember`            | 写入用户长期记忆            |
+| `recall`              | 检索用户长期记忆            |
+
+这些 Tools 展示了三类 Agent 能力：信息检索、用户范围内的业务操作，以及长期记忆。
+
+---
+
+# Agent Runtime
+
+Agent Runtime 是 Every DAgent 的架构中心。
+
+它刻意只保留少量职责：
+
+```text
+Agent Runtime
+│
+├── Model Client
+│     └── LLM 请求 / 响应抽象
+│
+├── Agent Loop
+│     └── model → tool → observation → model
+│
+├── Tool Registry
+│     └── Tool 注册与分发
+│
+├── Session & Context
+│     └── 会话生命周期与运行时上下文
+│
+└── Persistence
+      └── Session 与状态持久化
+```
+
+Domain Layer 被有意排除在 Runtime Core 之外。
+
+因此同一 Runtime 可以复用于不同的个人数据领域。
+
+### 当前 Runtime
+
+当前稳定版本在这一 Runtime 边界内部使用 **DeepSeek Harness（DSH）** 提供模型执行、Session 与 Tool Dispatch 等能力。
+
+而 Desktop Host、JSONL Transport、Domain Boundary、Business Services、Storage Model 与 UI Event Projection 均保持与这一具体实现解耦。
+
+### Runtime 演进方向
+
+后续 Runtime 将进一步收缩为一个轻量级独立实现：
+
+```text
+Model Client
+Agent Loop
+Tool Registry
+Session Context
+Persistence
+```
+
+目标不是重新造一个大型 Agent Framework。
+
+而是只保留一个可靠的 Single-Agent 应用真正需要的最小抽象。
+
+---
+
+# Desktop Architecture
+
+## Frontend
+
+```text
+React
+TypeScript
+Fluent UI
+Vite
+```
+
+Frontend 是纯表现层。
+
+它负责：
+
+- Conversation Rendering
+- Session Navigation
+- Agent Activity Visualization
+- Model Settings
+- Desktop Interaction
+
+它不承载业务逻辑。
+
+## Rust Desktop Host
+
+Rust Host 基于 **Tauri v2**。
+
+负责：
+
+- Application Lifecycle
+- Agent Sidecar Lifecycle
+- IPC
+- Process Monitoring
+- Recovery
+- Local Configuration
+- Windows Packaging
+
+当前项目首先支持 Windows，同时为未来 macOS 扩展保留清晰边界。
+
+## Agent Bridge
+
+Desktop Host 与 Node Agent Process 之间使用：
+
+```text
+stdin  → JSONL requests
+stdout ← JSONL events
+```
+
+Bridge 保持极薄。
+
+它只负责 Transport，而不是 Business Logic。
+
+---
+
+# Tool & Plugin Contract
+
+每个领域通过 Tool 暴露能力，而不是把底层存储原语直接交给 LLM。
+
+例如：
+
+```text
+get_invoice_details(invoice_id)
+```
+
+优于直接向模型开放任意 SQL 查询。
+
+这样 Domain Layer 可以集中实现：
+
+- Ownership Check
+- Identity Boundary
+- Parameter Validation
+- Stable Business Semantics
+- Controlled Data Access
+
+模型决定：
+
+> **应该使用哪个能力。**
+
+Plugin 决定：
+
+> **这个能力应该如何被安全实现。**
+
+---
+
+# 技术栈
+
+| 模块                 | 技术                                 |
+| -------------------- | ------------------------------------ |
+| Desktop UI           | React 18 + TypeScript + Fluent UI v9 |
+| Build                | Vite                                 |
+| Native Host          | Tauri v2 + Rust                      |
+| Agent Process        | Node.js + TypeScript                 |
+| Runtime Transport    | stdin / stdout JSONL                 |
+| Agent Runtime        | DSH-backed runtime boundary          |
+| Business Layer       | TypeScript Domain Plugins            |
+| Database             | SQLite / `better-sqlite3`            |
+| Testing              | Vitest + Cargo Test                  |
+| Package Management   | pnpm workspace                       |
+| Windows Distribution | NSIS / MSI                           |
+
+---
+
+# 项目结构
+
+```text
+every-dagent/
+│
+├── apps/
+│   ├── desktop/
+│   │   ├── React frontend
+│   │   └── Tauri / Rust host
+│   │
+│   ├── agent-bridge/
+│   │   └── Desktop ↔ Agent JSONL transport
+│   │
+│   └── cli/
+│       └── CLI Agent entry
+│
+├── plugins/
+│   └── chinook/
+│       ├── tools/
+│       ├── services/
+│       └── memory/
+│
+├── profiles/
+│   └── chinook/
+│
+├── tests/
+├── docs/
+└── assets/
+    ├── screenshots/
+    └── architecture/
+```
+
+---
+
+# Reliability & Testing
+
+项目在 Agent 与 Desktop 两侧都提供自动化测试。
+
+覆盖内容包括：
+
+- Domain Services
+- Tools
+- Long-term Memory
+- Agent Bridge
+- Configuration
+- Model Listing
+- Agent E2E
+- Desktop Reducers
+- Architecture Invariants
+
+运行：
+
+```bash
+pnpm test
+```
+
+当前 TypeScript 测试：
+
+```text
+15 suites
+207 tests
+```
+
+Rust Desktop Host 具有独立的 Cargo Test：
+
+```bash
+cd apps/desktop/src-tauri
+cargo test
+```
+
+---
+
+# 快速开始
+
+## 环境要求
+
+- Windows 10 / 11
+- Node.js >= 22
+- pnpm
+- Rust stable + MSVC toolchain
+- WebView2
+
+## 安装依赖
 
 ```bash
 pnpm install
 ```
 
-### 2. 环境配置
-
-复制 `.env.example` 为 `.env` 并填入模型凭据（见 [环境](#环境)）。切勿提交真实凭据——仓库只跟踪 `.env.example`。
-
-### 3. 初始化本地数据
+## 初始化本地数据
 
 ```bash
 pnpm bootstrap
 ```
 
-该命令在本地 DSH home 下准备 Chinook Music 数据库、初始化记忆存储表结构并装配 profile。
+该命令会初始化本地 Chinook Domain 与 Memory Storage。
 
-### 4. 使用 Agent
-
-原有 CLI REPL 仍然可用——桌面应用是当前的主要产品入口：
+## 启动 CLI Agent
 
 ```bash
 pnpm chinook-agent
 ```
 
-### 5. 桌面开发
+## 启动桌面端
 
 ```bash
 pnpm desktop
 ```
 
-该命令构建 React 前端、编译 Rust 宿主并打开带热重载的桌面窗口。启动器会清理上一次运行残留的进程,并在退出(包括 Ctrl+C)时结束整棵进程树。
+## 模型配置
 
-### 6. 测试
+桌面应用提供模型设置页面。
 
-```bash
-pnpm test
-cd apps/desktop/src-tauri && cargo test
-```
+可以配置：
 
-### 7. 生产构建与打包
+- Base URL
+- API Key
+- Model
 
-```bash
-node apps/agent-bridge/build.mjs        # 打包 bridge
-node apps/desktop/scripts/stamp-runtime.mjs   # 生成应用自带运行时镜像
-cd apps/desktop
-node ../../node_modules/@tauri-apps/cli/tauri.js build
-```
+当前实现支持 OpenAI-compatible Model Endpoint。
 
-安装包输出到 `apps/desktop/src-tauri/target/release/bundle/`：
+Credentials 仅保存在本地，不会提交到仓库。
 
-- **NSIS 安装包**（`DSH Life Assistant_1.0.2_x64-setup.exe`）— Windows 推荐安装方式
-- **MSI**（`DSH Life Assistant_1.0.2_x64_en-US.msi`）— 备选安装格式
+---
 
-## 首次运行：配置模型端点
+# 设计原则
 
-应用内置设置面板，全新安装无需接触 Windows 环境变量即可指向任意模型端点。
+### 1. Keep the Agent Core Small
 
-1. 启动应用，点击标题栏的 **设置**（齿轮）图标。它在任何运行状态下都存在——包括错误卡片，错误卡片上也有一个 **模型设置** 按钮。
-2. 填写三个字段：
-   - **Base URL** — 任意 OpenAI 兼容端点，例如 `https://api.deepseek.com`。只需填到域名（或 `/v1`），末尾的 `/chat/completions` 会被自动去掉。留空表示使用端点自带默认值。
-   - **API Key** — 由你所指向的网关签发（可在 [DeepSeek 开放平台](https://platform.deepseek.com/) 创建）。该字段每次打开面板都是空的，且值永不回显：密钥写入应用本机凭据库（`%APPDATA%\com.dsh.chinook\agent\.credentials.yaml`，仅所有者可读），界面只显示*是否*已配置密钥以及来自哪一层。留空表示保持已保存的密钥。
-   - **模型名称** — 原样发送给端点。点击字段旁的 **获取模型** 会向 Base URL 询问它提供哪些模型（`GET {baseUrl}/models`，OpenAI 兼容标准），并从可点击列表中挑选——第三方网关期望的模型 id 往往猜不出来。并非所有端点都实现 `/models`；不支持时面板会说明原因，字段仍可手动输入。
-3. 点击 **保存并测试连接**。端点、凭据与模型会被保存，然后用一次最小的真实请求验证，结果以中文呈现——密钥被拒绝、模型不存在、地址无法连接等。保存后的模型对下一条消息立即生效，无需重启。
+只有通用 Agent 职责应该进入 Runtime。
 
-该面板已随 v1.0.2 发布；使用更早的安装包时请走下面的环境变量方式。
+领域知识必须留在 Runtime 之外。
 
-### 进阶 / CI：环境变量方式
+### 2. Tools Are Capability Boundaries
 
-将 `DEEPSEEK_API_KEY` 配置为 **Windows 用户环境变量**，然后**完全退出并重新打开**应用（环境变量只在应用启动时读取；若仍未生效，请重新登录一次 Windows 后再启动）：
+LLM 获得的是明确的领域能力，而不是无限制数据库访问。
 
-```powershell
-[Environment]::SetEnvironmentVariable(
-  "DEEPSEEK_API_KEY",
-  "sk-your-key",
-  "User"
-)
-```
+### 3. Context Follows Execution
 
-兼容环境下 Runtime 也支持 `ANTHROPIC_AUTH_TOKEN`，但它仅在 `DEEPSEEK_API_KEY` 未设置时作为后备。
+Identity、Session 与 Configuration 跟随 Agent Execution Context 传递。
 
-**优先级：启动环境中的变量永远优先于应用内设置。** 当应用启动时已带有上述变量，其凭据库会拒绝覆盖该密钥——面板会如实显示为 只读（*由启动环境提供*），密钥输入框被禁用，并写明原因，而不是让保存静默地什么都不做。要改为在应用内管理密钥，请移除该环境变量后重启应用。
+### 4. Plugins Own Business Rules
 
-请勿将真实密钥写入源码、README 或提交到 Git——README 与提交历史都是公开的。
+Runtime 负责 Orchestration。
 
-## 环境
+Plugin 决定领域操作真正意味着什么。
 
-| 变量 | 用途 | 示例 |
-| --- | --- | --- |
-| `DEEPSEEK_API_KEY` | DeepSeek 兼容模型端点的主要凭据 | `sk-your-key` |
-| `ANTHROPIC_AUTH_TOKEN` | 备用凭据（同一端点接受的 Anthropic 格式 token） | `sk-ant-...` |
-| `CHINOOK_CUSTOMER_ID` | 演示客户身份；订单/发票/记忆均以其为作用域 | `1` |
-| `DSH_HOME` | DSH home 目录覆盖（开发环境默认为 `<repo>/.dsh`） | `C:\path\to\home` |
+### 5. Desktop Is a Host, Not the Agent
 
-完整说明见 `.env.example`。`CHINOOK_CUSTOMER_ID` 未设置或无效即为匿名——订单、发票与记忆 Tool 会返回 `IDENTITY_REQUIRED`。
+React 与 Rust 负责用户交互和生命周期。
 
-在此处配置的凭据优先级高于应用内设置；面板会将其显示为只读（见[首次运行](#首次运行配置模型端点)）。
+它们不承载 Agent 业务逻辑。
 
-## 开发
+### 6. Prefer Explicit Data Flow
 
-```bash
-pnpm build             # 对 workspace 做类型检查并编译插件
-pnpm chinook-agent     # 在 CLI REPL 中运行 Agent
-```
+Tool Call、Tool Result 与 Agent Events 尽可能显式可观察，而不是隐藏在框架内部。
 
-开发运行将 DSH home 放在 `<repo>/.dsh`。打包后的桌面应用会在 `%APPDATA%\com.dsh.chinook` 下创建自己的 home，并从内置运行时镜像（Node + bridge + 精简依赖 + 全新 schema-only home）运行，因此被安装的机器既不需要 Node，也不需要仓库检出。
+---
 
-## 测试 / 构建
+# Roadmap
 
-- `pnpm test` — Vitest：15 个套件 / 207 个测试，覆盖插件服务、Tool、记忆、桥（单元 + 集成，含配置面与模型列表）、Agent e2e、桌面 reducer/表单辅助与架构不变量
-- `cd apps/desktop/src-tauri && cargo test` — Rust 宿主测试
-- `pnpm build` — workspace 类型检查 + 插件编译；Tauri 生产构建会执行前端构建与 Rust release 构建，产出上面的 NSIS/MSI 安装包
+### Agent Runtime
 
-## Roadmap
+- [x] Persistent Agent Sessions
+- [x] Tool Calling
+- [x] Runtime Context
+- [x] Local Persistence
+- [x] Streaming Execution Events
+- [ ] Lightweight Standalone Agent Loop
+- [ ] Independent Model Client
+- [ ] Standalone Tool Registry
+- [ ] Runtime-level Budget & Termination Policies
+
+### Domain Plugins
+
+- [x] Chinook Music
+- [ ] Calendar
+- [ ] Tasks
+- [ ] Personal Finance
+- [ ] More User-authorized Domains
+
+### Desktop
+
+- [x] Windows Desktop Application
+- [x] Streaming Chat
+- [x] Tool Activity Visualization
+- [x] Session History
+- [x] Model Settings
+- [x] Sidecar Recovery
+- [ ] macOS Support
+
+---
+
+# Why Every DAgent?
+
+很多 Agent Demo 从框架开始，最后停在一个 Chatbot。
+
+Every DAgent 尝试从相反方向出发：
 
 ```text
-✅ Chinook Music 领域（v1.0.0 — 已发布）
-◌ Personal Finance 领域
-◌ Calendar / Tasks 领域
-◌ 更多用户授权数据领域
+Real Application
+      ↓
+Explicit Architecture
+      ↓
+Small Agent Runtime
+      ↓
+Composable Domain Plugins
 ```
 
-未来可以继续接入个人财务、日程、任务等用户授权的数据域。以上目前都未实现——当前架构只是建立了"无需重写桌面宿主或 Agent 核心即可增加新领域"的边界。没有时间承诺。
+这个项目关注的是：
 
-## 架构边界
+> **如何把一个 LLM Agent 真正组织成一个可维护的桌面应用。**
 
-- 桌面宿主只负责窗口、应用生命周期与 sidecar 进程——不含任何业务逻辑
-- React 层是纯展示层，从不直接查询数据库或调用模型
-- 业务规则（发票所有权、记忆作用域、目录查询）都在领域插件中
-- Node 桥是薄传输适配层；所有 Agent 行为来自 DSH 与插件
+核心问题包括：
 
-## 已知限制
+- Agent Loop 应该放在哪里？
+- 哪些信息应该进入 Context？
+- 什么东西应该暴露成 Tool？
+- Identity 应该在哪里被约束？
+- Desktop Host 应该如何与 Agent 通信？
+- 新增 Domain 时如何避免重写整个系统？
+- Runtime 可以小到什么程度，同时仍然保持可用？
 
-- **Windows-first**：桌面应用在 Windows 11 上构建并验证；其他平台尚未覆盖
-- **演示身份而非认证**：v1 使用本地演示身份（`CHINOOK_CUSTOMER_ID`）；未实现生产级认证
-- **单用户、本地化**：数据存放在本机；没有服务端、云端或多用户模式
-- **需要可用的模型凭据**：对话依赖应用内设置面板或上面环境变量配置的可达模型端点
-- **未签名安装包**：NSIS/MSI 未做代码签名，首次运行 Windows SmartScreen 可能告警
-- **仅安装版，无独立便携 exe**：桌面可执行文件随运行时资源一起分装在安装包内，未验证可脱离资源独立运行
-- **演示数据**：业务数据是公开 Chinook 示例商店，不是真实生产后端
+Every DAgent 是对这些问题的一次工程化回答。
 
-## 致谢
+---
 
-- **DeepSeek Harness（DSH）** — 本项目所基于的 Agent 运行时
-- **Chinook sample database** — 作为第一个领域表结构与数据的公开示例音乐商店数据集
-- **Original Chinook/LangChain example** — 领域 Agent 的创意借鉴自经典 Chinook + LangChain 示例（[langchain-basics](https://github.com/masoodfaisal/langchain-basics)）
+# 当前边界
 
-## License / 第三方声明
+Every DAgent 当前是一个工程项目和 Reference Implementation，而不是面向生产环境的多用户平台。
 
-本仓库目前未为其自身源码声明 License；在所有者选定之前不授予任何 License。
+目前边界包括：
 
-第三方组件保留各自 License：DeepSeek Harness 各包、React、Fluent UI 与 `better-sqlite3` 为 MIT；Tauri 为 Apache-2.0 OR MIT。Chinook 示例数据库是广泛流传的公开示例数据集。
+- Windows-first
+- Local Single-user Execution
+- Demo Identity，而不是生产级 Authentication
+- SQLite Local Persistence
+- Chinook 是当前唯一完整 Domain Plugin
+- 需要用户提供可用的模型 Credentials
+- Windows Installer 尚未签名
+
+这些限制是有意保留的：项目重点是 Agent Architecture，而不是生产级 SaaS Infrastructure。
+
+---
+
+# Inspirations
+
+Every DAgent 在设计与实现过程中参考和研究了多个 Agent 系统及示例：
+
+- **DeepSeek Harness** — Agent Runtime 与 Plugin Architecture
+- **pi** — Lightweight Agent / Coding-Agent Design
+- **LangChain Chinook Example** — 原始 Music Domain Agent Example
+
+项目正在从 Framework-backed Implementation 逐步演进为更轻量、可独立控制的 Agent Runtime。
+
+---
+
+<div align="center">
+
+
+## Every DAgent
+
+**One Runtime. Many Plugins. An Agent for Everyday Life.**
+
+Build real Agent applications,  
+not just another LLM wrapper.
+
+</div>
