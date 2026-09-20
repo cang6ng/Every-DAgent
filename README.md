@@ -1,315 +1,687 @@
+<div align="center">
+
+
+
+# Every DAgent
+
+### One Runtime. Many Plugins. An Agent for Everyday Life.
+
+**A desktop-native personal AI agent built around a modular runtime,  
+tool calling, persistent context and plugin-based domain architecture.**
+
+React · TypeScript · Tauri · Rust · ReAct · Tool Calling · SQLite
+
+[简体中文](./README.zh-CN.md)
+
+</div>
+
+---
+
+## Overview
+
+**Every DAgent** is an extensible desktop AI agent designed around a simple idea:
+
+> Keep the Agent Runtime small, and grow real-world capabilities through independent domain plugins.
+
+Instead of coupling the model, UI and business logic together, Every DAgent separates the system into clear layers:
+
+- **Desktop Application** — native user experience built with React, Fluent UI and Tauri
+- **Agent Runtime** — model interaction, agent loop, tools, sessions, context and persistence
+- **Domain Plugins** — isolated capabilities such as music, calendar, tasks and personal finance
+- **Tools & Services** — explicit interfaces between the agent and real data
+- **Local Storage** — persistent sessions, memories and domain data
+
+The current reference implementation ships with **Chinook Music**, a complete music-store domain covering catalog search, recommendations, order lookup and long-term memory.
+
+The long-term goal is not to build a music chatbot.
+
+It is to build a **small but complete personal Agent architecture that can continuously absorb new capabilities without rewriting the core system.**
+
+---
+
+## Demo
+
+> Every DAgent currently ships as a Windows desktop application.
+
+<!-- Replace with the best full-window screenshot -->
+
 <p align="center">
-  <img src="docs/logo.png" alt="DSH Life Assistant" width="240">
+  <img src="./assets/screenshots/home.png" width="900" alt="Every DAgent Desktop" />
 </p>
 
-# DSH Life Assistant
 
-English | [简体中文](README.zh-CN.md)
+The desktop experience includes:
 
-An extensible personal AI assistant built around user-authorized data and domain tools.
+- streaming assistant responses
+- visible tool execution
+- persistent conversation history
+- agent activity tracing
+- model endpoint configuration
+- automatic sidecar recovery
+- local long-term memory
 
-The current release ships with **Chinook Music**, the first complete domain implementation. It demonstrates how one persistent personal agent can use domain-specific tools and local data to understand preferences, search music, inspect purchase history, remember long-term interests, and provide a desktop-native interactive experience.
+---
 
-![DSH Life Assistant](assets/screenshots/desktop-home.png)
+## Engineering Highlights
 
-## What it can do today
+### Modular Agent Architecture
 
-Everything below is real and shipped in v1.0.2 — all of it powered by the Chinook Music domain.
+Every DAgent separates the Agent system into five core responsibilities:
 
-- **Music catalog search** — find artists, albums and tracks across the catalog
-- **Music recommendation** — similar albums and genre popularity, grounded in real data
-- **Order lookup** — ask about your own purchase history in natural language
-- **Invoice ownership protection** — invoice details are only readable for the current customer
-- **Customer-scoped long-term memory** — facts are remembered per customer and used in later sessions
-- **Persistent sessions** — every conversation is a durable agent session that can be restored
-- **Streaming assistant responses** — replies stream token by token
-- **Visible Tool Activity** — every tool call is surfaced live, not hidden inside the model
-- **Desktop Activity Drawer** — a full, inspectable trace of the agent run: model turns, tool calls, timings
-- **Sidecar restart recovery** — the agent process is watched, restarted and reconnected automatically
-- **In-app model endpoint configuration** — point the app at any OpenAI-compatible endpoint (base URL, API key, model name), pick the model from the endpoint's own list, and test the connection, without touching environment variables
-
-## Current Domain — Chinook Music
-
+```text
+Model Client
+     ↕
+Agent Loop
+     ↕
+Tool Registry
+     ↕
+Session & Context
+     ↕
+Persistence
 ```
-DSH Life Assistant
+
+This boundary keeps model interaction, tool execution, conversation state and storage independent from domain-specific business logic.
+
+### ReAct-style Tool Execution
+
+The Agent can iteratively move between model reasoning and tool execution:
+
+```text
+User Request
+      ↓
+Context Assembly
+      ↓
+     LLM
+      ↓
+  Tool Call?
+   ↙     ↘
+ Yes      No
+  ↓        ↓
+Execute   Answer
+  ↓
+Tool Result
+  ↓
+     LLM
+```
+
+Tools are not embedded directly into the desktop UI or model client.
+
+They are registered through the Agent / Domain boundary and invoked through explicit contracts.
+
+### Plugin-based Domain Layer
+
+Business capabilities live outside the Agent core.
+
+```text
+Every DAgent
 │
-├── Shared Agent Runtime
-│     ├── Session
-│     ├── Memory
-│     ├── Tool Calling
-│     ├── Streaming
-│     └── Desktop Runtime
+├── Agent Runtime
 │
 └── Domain Plugins
-      ├── Chinook Music        ✅ implemented (v1.0.0)
-      ├── Personal Finance     ◌ future
-      ├── Calendar / Tasks     ◌ future
-      └── Other user-authorized data   ◌ future
+     │
+     ├── Chinook Music        ✓ implemented
+     ├── Calendar             planned
+     ├── Tasks                planned
+     ├── Personal Finance     planned
+     └── ...
 ```
 
-### Why Chinook?
+A domain plugin owns its own tools, services, business rules, storage access and domain-specific memory behavior.
 
-Chinook is not a random demo. It provides a well-structured, genuinely queryable music-store data domain, so it was chosen as the first domain implementation to validate the whole pattern end to end: domain plugins, tool calling, long-term memory, data ownership and desktop interaction.
+The desktop host does not need to know how a music recommendation or invoice query works.
 
-## Architecture
+The Agent Runtime does not need to know how the underlying database is structured.
 
-One persistent DSH agent runtime, with an extensible domain boundary — the desktop host and the agent core do not change when a new domain is added.
+### Desktop-native Agent Runtime
 
-```mermaid
-flowchart TD
-    UI["React + Fluent UI<br/>Desktop Presentation"]
-    HOST["Tauri v2 + Rust<br/>Desktop Host"]
-    BRIDGE["Node Agent Bridge<br/>Transport Adapter"]
-    AGENT["DSH AgentRuntime<br/>Persistent Personal Agent"]
+Every DAgent is not a browser wrapper around an API.
 
-    DOMAIN["Domain Plugins"]
-
-    MUSIC["Chinook Music<br/>Implemented"]
-    FINANCE["Personal Finance<br/>Future"]
-    CALENDAR["Calendar / Tasks<br/>Future"]
-
-    UI --> HOST
-    HOST --> BRIDGE
-    BRIDGE --> AGENT
-    AGENT --> DOMAIN
-
-    DOMAIN --> MUSIC
-    DOMAIN -. future .-> FINANCE
-    DOMAIN -. future .-> CALENDAR
-```
-
-The technical path stays explicit:
+The application uses a multi-process desktop architecture:
 
 ```text
 React + Fluent UI
         ↓
-Tauri Commands / Channels
+Tauri IPC / Channel
         ↓
 Rust Desktop Host
         ↓
-stdin/stdout JSONL
+stdin / stdout JSONL
         ↓
-Node Agent Bridge
+Node Agent Process
         ↓
-DSH AgentRuntime
+Agent Runtime
         ↓
 Domain Plugin
-        ↓
-Tools / SQLite / Memory
 ```
 
-| Layer | Role |
-| --- | --- |
-| React + Fluent UI | Presentation. Pure chat/timeline UI; never touches the database or the model |
-| Rust Desktop Host | Window, app lifecycle, and the single long-lived agent sidecar process |
-| Node Agent Bridge | Transport adapter — speaks JSONL over stdin/stdout between the host and the agent runtime |
-| DSH AgentRuntime | The DeepSeek Harness agent core: sessions, model calls, tool dispatch, memory |
-| Domain Plugin | Business layer — domain tools backed by SQLite and customer memory |
+The Rust host owns the application lifecycle and manages the long-running Agent sidecar process.
 
-## Agent Tools
+The Node process owns the Agent execution environment.
 
-These are the seven tools currently provided by the Chinook Music domain:
+They communicate through a small JSONL protocol instead of HTTP or WebSocket.
 
-| Tool | What it does |
-| --- | --- |
-| `search_catalog` | Search the music catalog by artist, album or track |
-| `find_similar_albums` | Recommend albums similar to a given album |
-| `popular_in_genre` | Show what is popular within a music genre |
-| `list_my_orders` | List the orders of the current customer |
-| `get_invoice_details` | Read the line items of one invoice (ownership-checked) |
-| `remember` | Store a fact about the current customer into long-term memory |
-| `recall` | Retrieve stored facts about the current customer |
+### Persistent Sessions & Memory
 
-## Desktop Experience
+Conversations are durable Agent sessions rather than temporary chat messages.
 
-The desktop app wraps the same agent core as the original CLI. The home screen is a chat view with a live activity strip: while the agent works you see the current step (model turn, tool call, tool result) and the reply streams in real time. The title bar shows the product (**DSH Life Assistant**) and the active domain (**Chinook Music**). The **Activity Drawer** holds the full trace of each run. The sidebar lists persistent sessions, including historical ones that can be restored. The agent runs as a child Node process under the app's control — if it crashes it is restarted automatically and the session reconnects. The title-bar **设置** panel configures the model endpoint from inside the app (base URL, API key, model name — see [First Run](#first-run-configure-a-model-endpoint)); the key travels one way only, into the local credential store.
+The current implementation supports persistent session history, session restoration, customer-scoped long-term memory, runtime identity propagation and local SQLite persistence.
 
-## Tech Stack
+Domain data and memory remain scoped to the active user identity.
 
-| Area | Choice |
-| --- | --- |
-| Frontend | React 18 + Fluent UI v9, rendered in WebView2 via Tauri v2 |
-| Desktop host | Rust (Tauri v2); NSIS / MSI installers |
-| Agent bridge | Node.js process bridged to Rust over stdin/stdout JSONL (esbuild bundle) |
-| Agent runtime | DeepSeek Harness (DSH) AgentRuntime (`@deepseek-ai/dsh`) |
-| Business layer | TypeScript domain plugin: 7 tools, SQLite services, per-customer memory |
-| Data | SQLite via `better-sqlite3` — the public Chinook sample schema, plus a memory store |
-| Tooling | pnpm workspace, TypeScript, Vite, Vitest, Cargo |
+### Observable Tool Execution
 
-## Project Structure
+Agent execution is exposed to the user instead of being hidden behind a loading indicator.
+
+The desktop UI can visualize events such as:
 
 ```text
-dsh-life-assistant/
-├── apps/
-│   ├── agent-bridge/     # Node bridge: desktop host <-> DSH JSONL transport adapter
-│   ├── cli/              # Agent CLI REPL (original entry point)
-│   └── desktop/          # Tauri desktop app: React frontend, Rust host, packaging
-├── plugins/chinook/      # Chinook Music domain plugin: tools, services, memory
-├── profiles/chinook/     # DSH profile wiring for the Chinook Music domain
-├── scripts/              # bootstrap and build helpers
-├── tests/                # Vitest suites: plugin, services, bridge, architecture
-├── docs/                 # Project logo
-└── assets/screenshots/   # Project screenshots
+turn/start
+model/start
+tool/call
+tool/result
+assistant/chunk
+turn/end
+turn/error
 ```
 
-## Getting Started
+This makes an Agent run inspectable from request to final response.
 
-### Prerequisites
+### Runtime Recovery
 
-- Node.js ≥ 22 and pnpm
-- Rust stable (MSVC toolchain) + Visual Studio Build Tools (C++) — required only for the desktop host
-- Windows 10/11 with WebView2 runtime (preinstalled on Windows 11)
+The desktop host supervises the Node Agent process.
 
-### 1. Install dependencies
+If the sidecar exits unexpectedly, the application can detect the failure, restart the Agent process, restore the previous session, rehydrate the desktop state and continue accepting requests.
+
+This keeps lifecycle concerns inside the desktop host rather than leaking them into business plugins.
+
+---
+
+# Architecture
+
+<p align="center">
+  <img src="./assets/architecture/every-dagent-architecture.png"
+       width="1000"
+       alt="Every DAgent Architecture" />
+</p>
+
+
+The system is organized into six layers:
+
+| Layer                 | Responsibility                                               |
+| --------------------- | ------------------------------------------------------------ |
+| **Desktop App**       | Chat UI, session history, tool activity and settings         |
+| **Desktop Host**      | Native lifecycle, IPC, sidecar management and recovery       |
+| **Agent Runtime**     | Model interaction, Agent Loop, tools, context and persistence |
+| **Domain Plugins**    | Independent real-world capability modules                    |
+| **Domain Services**   | Business logic and storage abstraction                       |
+| **External Services** | LLM providers and future third-party APIs                    |
+
+The key design rule is simple:
+
+> **Agent orchestration stays inside the Runtime. Business behavior stays inside plugins.**
+
+---
+
+# How One Agent Turn Works
+
+A complete request travels through the system like this:
+
+```text
+User
+ │
+ ▼
+React Chat UI
+ │
+ ▼
+Tauri Command
+ │
+ ▼
+Rust Desktop Host
+ │
+ ▼
+JSONL IPC
+ │
+ ▼
+Agent Process
+ │
+ ▼
+Session & Context
+ │
+ ▼
+LLM
+ │
+ ├──────────── no tool ────────────┐
+ │                                  │
+ ▼                                  │
+Tool Call                            │
+ │                                  │
+ ▼                                  │
+Tool Registry                        │
+ │                                  │
+ ▼                                  │
+Domain Plugin                        │
+ │                                  │
+ ▼                                  │
+Service Layer                        │
+ │                                  │
+ ▼                                  │
+SQLite / External Data               │
+ │                                  │
+ ▼                                  │
+Tool Result                          │
+ │                                  │
+ └──────────────► LLM ◄─────────────┘
+                    │
+                    ▼
+             Streaming Events
+                    │
+                    ▼
+              Desktop UI
+```
+
+The frontend never queries the business database directly and never calls the model directly.
+
+---
+
+# Reference Domain — Chinook Music
+
+Chinook Music is the first complete domain implementation used to validate the architecture end to end.
+
+It is intentionally treated as a **reference plugin**, rather than the identity of the whole project.
+
+### Available Tools
+
+| Tool                  | Capability                                   |
+| --------------------- | -------------------------------------------- |
+| `search_catalog`      | Search artists, albums and tracks            |
+| `find_similar_albums` | Find related albums                          |
+| `popular_in_genre`    | Explore popular music within a genre         |
+| `list_my_orders`      | Query the active customer's purchase history |
+| `get_invoice_details` | Inspect an owned invoice and its line items  |
+| `remember`            | Write customer-scoped long-term memory       |
+| `recall`              | Retrieve customer-scoped memory              |
+
+These tools demonstrate retrieval, user-scoped business actions and long-term memory.
+
+---
+
+# Agent Runtime
+
+The Agent Runtime is the architectural center of Every DAgent.
+
+Its responsibilities are intentionally kept small:
+
+```text
+Agent Runtime
+│
+├── Model Client
+│     └── LLM request / response abstraction
+│
+├── Agent Loop
+│     └── model → tool → observation → model
+│
+├── Tool Registry
+│     └── registration and dispatch
+│
+├── Session & Context
+│     └── conversation lifecycle and runtime context
+│
+└── Persistence
+      └── durable session and state storage
+```
+
+The domain layer is intentionally excluded from this core.
+
+This makes the runtime reusable across different personal-data domains.
+
+### Current Runtime
+
+The current stable implementation uses **DeepSeek Harness (DSH)** behind this runtime boundary for model execution, sessions and tool dispatch.
+
+The surrounding architecture — desktop host, JSONL transport, domain boundary, business services, storage model and UI event projection — is kept independent from that implementation.
+
+### Runtime Direction
+
+The Runtime boundary is being reduced toward a lightweight standalone implementation built around:
+
+```text
+Model Client
+Agent Loop
+Tool Registry
+Session Context
+Persistence
+```
+
+The goal is not to build another large Agent framework.
+
+The goal is to keep the minimum abstractions required to run a reliable single-Agent application.
+
+---
+
+# Desktop Architecture
+
+## Frontend
+
+```text
+React
+TypeScript
+Fluent UI
+Vite
+```
+
+The frontend is a presentation layer.
+
+It owns conversation rendering, session navigation, Agent activity visualization, model settings and desktop interaction.
+
+It does **not** own business logic.
+
+## Rust Desktop Host
+
+Built with **Tauri v2**, the Rust host manages application lifecycle, Agent sidecar lifecycle, IPC, process monitoring, recovery, local configuration and Windows packaging.
+
+The application is currently Windows-first while keeping the desktop boundary compatible with future platform expansion.
+
+## Agent Bridge
+
+The desktop host communicates with the Node Agent process through:
+
+```text
+stdin  → JSONL requests
+stdout ← JSONL events
+```
+
+The bridge remains deliberately thin.
+
+It is transport, not business logic.
+
+---
+
+# Tool & Plugin Contract
+
+Every domain exposes capabilities through tools instead of exposing raw storage primitives directly to the LLM.
+
+For example:
+
+```text
+get_invoice_details(invoice_id)
+```
+
+is preferred over giving the model unrestricted SQL access.
+
+This allows the domain layer to enforce ownership checks, identity boundaries, parameter validation, stable business semantics and controlled data access.
+
+The model decides **which capability to use**.
+
+The plugin decides **how that capability is safely implemented**.
+
+---
+
+# Tech Stack
+
+| Area                 | Technology                           |
+| -------------------- | ------------------------------------ |
+| Desktop UI           | React 18 + TypeScript + Fluent UI v9 |
+| Build                | Vite                                 |
+| Native Host          | Tauri v2 + Rust                      |
+| Agent Process        | Node.js + TypeScript                 |
+| Runtime Transport    | stdin / stdout JSONL                 |
+| Agent Runtime        | DSH-backed runtime boundary          |
+| Business Layer       | TypeScript Domain Plugins            |
+| Database             | SQLite / `better-sqlite3`            |
+| Testing              | Vitest + Cargo Test                  |
+| Package Management   | pnpm workspace                       |
+| Windows Distribution | NSIS / MSI                           |
+
+---
+
+# Project Structure
+
+```text
+every-dagent/
+│
+├── apps/
+│   ├── desktop/
+│   │   ├── React frontend
+│   │   └── Tauri / Rust host
+│   │
+│   ├── agent-bridge/
+│   │   └── Desktop ↔ Agent JSONL transport
+│   │
+│   └── cli/
+│       └── CLI Agent entry
+│
+├── plugins/
+│   └── chinook/
+│       ├── tools/
+│       ├── services/
+│       └── memory/
+│
+├── profiles/
+│   └── chinook/
+│
+├── tests/
+├── docs/
+└── assets/
+    ├── screenshots/
+    └── architecture/
+```
+
+---
+
+# Reliability & Testing
+
+The project contains automated tests across both the Agent and desktop boundaries.
+
+Current coverage includes domain services, tools, long-term memory, Agent bridge, configuration, model listing, Agent end-to-end flow, desktop reducers and architecture invariants.
+
+```bash
+pnpm test
+```
+
+The current TypeScript test suite contains:
+
+```text
+15 suites
+207 tests
+```
+
+The Rust desktop host has an independent Cargo test suite:
+
+```bash
+cd apps/desktop/src-tauri
+cargo test
+```
+
+---
+
+# Getting Started
+
+## Requirements
+
+- Windows 10 / 11
+- Node.js >= 22
+- pnpm
+- Rust stable + MSVC toolchain for desktop development
+- WebView2
+
+## Install
 
 ```bash
 pnpm install
 ```
 
-### 2. Environment setup
-
-Copy `.env.example` to `.env` and fill in your model credential (see [Environment](#environment)). Never commit real credentials — only `.env.example` is tracked.
-
-### 3. Bootstrap the local data
+## Bootstrap Local Data
 
 ```bash
 pnpm bootstrap
 ```
 
-This prepares the Chinook Music database under the local DSH home, initializes the memory store schema, and wires the profile.
+This initializes the local Chinook domain and memory storage.
 
-### 4. Use the agent
-
-The original CLI REPL is still available — the desktop app is the current main product entry:
+## Start the CLI Agent
 
 ```bash
 pnpm chinook-agent
 ```
 
-### 5. Desktop development
+## Start the Desktop App
 
 ```bash
 pnpm desktop
 ```
 
-This builds the React frontend, compiles the Rust host and opens the desktop window with hot reload. The launcher clears anything a previous run left behind and tears down the whole process tree on exit, including Ctrl+C.
+## Model Configuration
 
-### 6. Tests
+The desktop application provides an in-app model settings page.
 
-```bash
-pnpm test
-cd apps/desktop/src-tauri && cargo test
-```
+You can configure:
 
-### 7. Production build & packaging
+- Base URL
+- API Key
+- Model
 
-```bash
-node apps/agent-bridge/build.mjs        # bundle the bridge
-node apps/desktop/scripts/stamp-runtime.mjs   # build the app's self-contained runtime image
-cd apps/desktop
-node ../../node_modules/@tauri-apps/cli/tauri.js build
-```
+The current implementation supports OpenAI-compatible model endpoints.
 
-The installers land in `apps/desktop/src-tauri/target/release/bundle/`:
+Credentials are stored locally and are not committed to the repository.
 
-- **NSIS installer** (`DSH Life Assistant_1.0.2_x64-setup.exe`) — the recommended Windows install format
-- **MSI** (`DSH Life Assistant_1.0.2_x64_en-US.msi`) — alternative installer format
+---
 
-## First Run: Configure a Model Endpoint
+# Design Principles
 
-The app has an in-app settings panel, so a fresh install can be pointed at a model endpoint without touching Windows environment variables.
+### 1. Keep the Agent Core Small
 
-1. Launch the app and click the **设置** (gear) icon in the title bar. It is present in every runtime state — including the error card, which offers a **模型设置** button of its own.
-2. Fill in three fields:
-   - **Base URL** — any OpenAI-compatible endpoint, e.g. `https://api.deepseek.com`. Give only the domain (or up to `/v1`); a trailing `/chat/completions` is stripped for you. Leave it empty to use the endpoint's built-in default.
-   - **API Key** — issued by whichever gateway you point at (create one at the [DeepSeek open platform](https://platform.deepseek.com/)). The field starts empty every time the panel opens and its value is never read back: the key is written to the app's local credential store (`%APPDATA%\com.dsh.chinook\agent\.credentials.yaml`, owner-only) and the panel only ever reports *whether* a key resolves and from which layer. Leave it empty to keep the stored key.
-   - **模型名称** — sent verbatim to the endpoint. Click **获取模型** beside the field to ask the Base URL which models it serves (`GET {baseUrl}/models`, the OpenAI-compatible standard) and pick from a clickable list — the ids a third-party gateway expects are rarely guessable. Not every endpoint implements `/models`; when yours does not, the panel says so and the field stays free text.
-3. Click **保存并测试连接**. The endpoint, credential and model are saved, then exercised with one minimal real request, and the outcome is reported in Chinese — a rejected key, an unknown model, an unreachable host. A saved model applies to your next message; no restart is needed.
+Only generic Agent responsibilities belong in the Runtime.
 
-The panel is part of v1.0.2; on an older build, use the environment-variable route below.
+Domain knowledge stays outside.
 
-### Advanced / CI: the environment-variable route
+### 2. Tools Are Capability Boundaries
 
-Set `DEEPSEEK_API_KEY` as a **Windows user environment variable**, then **fully quit and reopen** the app (the variable is only read at startup; if it is still not picked up, sign out and back into Windows once):
+The model receives meaningful domain operations, not unrestricted database access.
 
-```powershell
-[Environment]::SetEnvironmentVariable(
-  "DEEPSEEK_API_KEY",
-  "sk-your-key",
-  "User"
-)
-```
+### 3. Context Follows Execution
 
-In compatible environments the runtime also accepts `ANTHROPIC_AUTH_TOKEN`, but only as a fallback when `DEEPSEEK_API_KEY` is unset.
+Identity, session and configuration travel with the Agent execution context.
 
-**Precedence: an inherited environment variable always wins over the in-app setting.** When the app is launched with one of those variables already set, its credential store refuses to overwrite that key — so the panel reports 只读 (*supplied by the launching environment*), the key field is disabled, and the reason is spelled out rather than a save silently doing nothing. Remove the variable and restart to manage the key from the app.
+### 4. Plugins Own Business Rules
 
-Never commit real API keys to this repository — README files and commit history are public.
+The Runtime orchestrates.
 
-## Environment
+Plugins decide what domain operations actually mean.
 
-| Variable | Purpose | Example |
-| --- | --- | --- |
-| `DEEPSEEK_API_KEY` | Primary credential for the DeepSeek-compatible model endpoint | `sk-your-key` |
-| `ANTHROPIC_AUTH_TOKEN` | Fallback credential (Anthropic-format token accepted by the same endpoint) | `sk-ant-...` |
-| `CHINOOK_CUSTOMER_ID` | Demo customer identity; orders/invoices/memory are scoped to it | `1` |
-| `DSH_HOME` | DSH home directory override (defaults to `<repo>/.dsh` in development) | `C:\path\to\home` |
+### 5. Desktop Is a Host, Not the Agent
 
-Full set with comments: `.env.example`. Unset or invalid `CHINOOK_CUSTOMER_ID` means anonymous — order, invoice and memory tools answer `IDENTITY_REQUIRED`.
+React and Rust manage user interaction and lifecycle.
 
-Credentials set here outrank the in-app setting; the panel reports them as read-only (see [First Run](#first-run-configure-a-model-endpoint)).
+They do not contain Agent business logic.
 
-## Development
+### 6. Prefer Explicit Data Flow
 
-```bash
-pnpm build             # type-check the workspace and compile the plugin
-pnpm chinook-agent     # run the agent in the CLI REPL
-```
+Tool calls, results and Agent events are observable instead of hidden behind abstractions.
 
-Development runs keep the DSH home in `<repo>/.dsh`. The packaged desktop app creates its own home under `%APPDATA%\com.dsh.chinook` and runs from a bundled runtime image (Node + bridge + pruned dependencies + a fresh schema-only home), so an installed machine needs neither Node nor a repository checkout.
+---
 
-## Testing / Build
+# Roadmap
 
-- `pnpm test` — Vitest: 15 suites / 207 tests covering plugin services, tools, memory, the bridge (unit + integration, including the configuration surface and model listing), agent e2e, desktop reducers/form helpers and architecture invariants
-- `cd apps/desktop/src-tauri && cargo test` — Rust host tests
-- `pnpm build` — workspace type-check + plugin compile; the Tauri production build runs the frontend build and Rust release build, producing the NSIS/MSI installers above
+### Agent Runtime
 
-## Roadmap
+- [x] Persistent Agent sessions
+- [x] Tool calling
+- [x] Runtime context
+- [x] Local persistence
+- [x] Streaming execution events
+- [ ] Lightweight standalone Agent Loop
+- [ ] Independent Model Client abstraction
+- [ ] Standalone Tool Registry
+- [ ] Runtime-level execution budgets and termination policies
+
+### Domain Plugins
+
+- [x] Chinook Music
+- [ ] Calendar
+- [ ] Tasks
+- [ ] Personal Finance
+- [ ] Additional user-authorized domains
+
+### Desktop
+
+- [x] Windows desktop application
+- [x] Streaming chat
+- [x] Tool activity visualization
+- [x] Session history
+- [x] Model settings
+- [x] Sidecar recovery
+- [ ] macOS support
+
+---
+
+# Why Every DAgent?
+
+Many Agent demos start from a framework and end at a chatbot.
+
+Every DAgent explores the opposite direction:
 
 ```text
-✅ Chinook Music domain (v1.0.0 — shipped)
-◌ Personal Finance domain
-◌ Calendar / Tasks domain
-◌ Additional user-authorized data domains
+Real Application
+      ↓
+Explicit Architecture
+      ↓
+Small Agent Runtime
+      ↓
+Composable Domain Plugins
 ```
 
-Future domains may include personal finance, calendars, tasks, and other user-authorized data sources. None of these are implemented today — the current architecture simply establishes the boundary needed to add additional domains without rewriting the desktop host or core agent runtime. There are no timeline commitments.
+The project is primarily an exploration of **how to turn an LLM Agent into a maintainable desktop application**:
 
-## Architecture Boundaries
+- Where should the Agent Loop live?
+- What belongs in Context?
+- What should be a Tool?
+- Where should identity be enforced?
+- How should the desktop host communicate with the Agent?
+- How can new domains be added without rebuilding the entire system?
+- How small can the Runtime remain before it stops being useful?
 
-- The desktop host only owns the window, the app lifecycle and the sidecar process — it contains no business logic
-- The React layer is pure presentation; it never queries the database or calls the model directly
-- Business rules (invoice ownership, memory scoping, catalog queries) live in the domain plugin
-- The Node bridge is a thin transport adapter; all agent behavior comes from DSH and the plugin
+Every DAgent is the working answer to those questions.
 
-## Known Limitations
+---
 
-- **Windows-first**: the desktop app is built and verified on Windows 11; other platforms are not yet covered
-- **Demo identity, not authentication**: v1 uses a local demo identity (`CHINOOK_CUSTOMER_ID`); production-grade authentication is not implemented
-- **Single-user and local**: data lives on the local machine; there is no server, cloud or multi-user mode
-- **Requires live model credentials**: conversations need a reachable model endpoint configured in the in-app settings panel or via the environment variables above
-- **Unsigned installers**: NSIS/MSI packages are not code-signed, so Windows SmartScreen may warn on first run
-- **Installed app only, no standalone portable exe**: the desktop executable is distributed with its runtime resources inside the installers and has not been validated to run standalone
-- **Demonstration data**: the business data is the public Chinook sample store, not a real production backend
+# Current Limitations
 
-## Acknowledgements
+Every DAgent is currently an engineering project and reference implementation, not a production multi-user platform.
 
-- **DeepSeek Harness (DSH)** — the agent runtime this project is built on
-- **Chinook sample database** — the public sample music-store dataset used as the first domain's schema and data
-- **Original Chinook/LangChain example** — the domain-agent idea is inspired by the classic Chinook + LangChain example ([langchain-basics](https://github.com/masoodfaisal/langchain-basics))
+Current boundaries include:
 
-## License / Third-party Notice
+- Windows-first desktop support
+- local single-user execution
+- demo identity rather than production authentication
+- local SQLite persistence
+- Chinook as the only complete domain plugin
+- live model credentials required
+- unsigned Windows installers
 
-This repository does not currently declare a license for its own source code; no license is granted until the owner chooses one.
+These constraints are intentional: the project focuses on Agent architecture rather than production SaaS infrastructure.
 
-Third-party components keep their own licenses: DeepSeek Harness packages, React, Fluent UI and `better-sqlite3` are MIT; Tauri is Apache-2.0 OR MIT. The Chinook sample database is a widely distributed public sample dataset.
+---
+
+# Inspirations
+
+Every DAgent was built while studying and experimenting with several Agent systems and examples:
+
+- **DeepSeek Harness** — Agent runtime and plugin architecture
+- **pi** — lightweight Agent / coding-agent design
+- **LangChain Chinook example** — the original music-domain Agent example
+
+The project gradually moves from framework-backed implementation toward a smaller, independently controlled Agent Runtime.
+
+---
+
+<div align="center">
+
+
+## Every DAgent
+
+**One Runtime. Many Plugins. An Agent for Everyday Life.**
+
+Built to understand how real Agent applications should be structured —  
+not just how to call an LLM.
+
+</div>
