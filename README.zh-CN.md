@@ -47,7 +47,7 @@ React · TypeScript · Tauri · Rust · ReAct · Tool Calling · SQLite
 <!-- 替换为最佳桌面端全窗口截图 -->
 
 <p align="center">
-  <img src="./assets/screenshots/home.png" width="900" alt="Every DAgent Desktop" />
+  <img src="/docs/Every_DAgent_首页.png" width="900" alt="Every DAgent Desktop" />
 </p>
 
 
@@ -218,7 +218,7 @@ Desktop Host 会监控 Node Agent Process。
 # 系统架构
 
 <p align="center">
-  <img src="./assets/architecture/every-dagent-architecture.png"
+  <img src="./docs/Every_Dagent_Structure.png"
        width="1000"
        alt="Every DAgent Architecture" />
 </p>
