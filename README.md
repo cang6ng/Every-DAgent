@@ -46,7 +46,7 @@ It is to build a **small but complete personal Agent architecture that can conti
 <!-- Replace with the best full-window screenshot -->
 
 <p align="center">
-  <img src="./assets/screenshots/home.png" width="900" alt="Every DAgent Desktop" />
+  <img src="/docs/Every_DAgent_首页.png" width="900" alt="Every DAgent Desktop" />
 </p>
 
 
@@ -199,7 +199,7 @@ This keeps lifecycle concerns inside the desktop host rather than leaking them i
 # Architecture
 
 <p align="center">
-  <img src="./assets/architecture/every-dagent-architecture.png"
+  <img src="./docs/Every_Dagent_Structure.png"
        width="1000"
        alt="Every DAgent Architecture" />
 </p>
