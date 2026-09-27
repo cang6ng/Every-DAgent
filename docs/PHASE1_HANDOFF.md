@@ -12,24 +12,25 @@
 | 项 | 值 |
 | --- | --- |
 | Branch | `rewrite/runtime-lite` |
-| Code baseline | `aece33e2d1e9f1b0289606397775fd7be6171ab4` — `feat(core): harden agent runtime execution` |
+| Code baseline | `b193d51cd2691b0261ef4c3c31cdf06b131d2452` — `feat(core): add real model adapter` |
 | Remote | `origin/rewrite/runtime-lite`；code baseline 已 push |
-| 当前 milestone | P1.3 ✅ 已完成、已提交 |
-| 下一个 milestone | P1.4 Real LLM（未开始） |
-| Tests | **81 passed / 9 files**（`pnpm test`） |
+| 当前 milestone | P1.4 ✅ 已完成、已提交 |
+| 下一个 milestone | P1.5 Persistence + E2E（未开始） |
+| Tests | **106 passed / 1 skipped / 12 files**（`pnpm test`；skipped 是真实 provider smoke，见 §7） |
 | Typecheck | **0 错**（`pnpm typecheck`） |
-| Production LOC | `packages/agent-core/src/` 13 文件 / **1076 行**（去空行、整行 `//` 与块注释后 644 行） |
+| Production LOC | `packages/agent-core/src/` 14 文件 / **1408 行**（去空行、整行 `//` 与块注释后 843 行） |
+| Real provider | **未通过**：真实端点可达，但本机凭据被 provider 判为 invalid（§7 有原文） |
 | 工作区 | 除 `.zcode/` 与 `.zcodeignore`（untracked，**不得提交**）外，改动均已入库 |
 
 ```text
 P1.1 Core Contracts        ✅  b96937d
 P1.2 Minimal ReAct Loop    ✅  c24fe68
-P1.3 Runtime Engineering   ✅  aece33e  ← code baseline
-P1.4 Real LLM              ⬜  next
-P1.5 Persistence + E2E     ⬜
+P1.3 Runtime Engineering   ✅  aece33e
+P1.4 Real LLM              ✅  b193d51  ← code baseline
+P1.5 Persistence + E2E     ⬜  next
 ```
 
-仓库形态：pnpm workspace，只有一个包 `packages/agent-core`。**无构建步骤**（`main` 指向 `src/index.ts`）、**无 CI**、**无 Cordis / pi-ai 依赖**；devDependencies 仅 `typescript` / `vitest` / `@types/node`（`pnpm-workspace.yaml` 里 `allowBuilds: esbuild: true`，否则 `pnpm <script>` 跑不起来）。模块路径导入一律带 `.js` 后缀（ESM + `moduleResolution: bundler`）。
+仓库形态：pnpm workspace，只有一个包 `packages/agent-core`。**无构建步骤**（`main` 指向 `src/index.ts`）、**无 CI**；运行时唯一依赖是 `@earendil-works/pi-ai@0.87.1`（ESM-only，`engines: node >=22.19`，根 `package.json` 的 engines 与 `packageManager` 已对齐），devDependencies 仅 `typescript` / `vitest` / `@types/node`。**该依赖很重**：连同 `openai`、`@anthropic-ai/sdk`、`@aws-sdk/client-bedrock-runtime`、`@google/genai`、`typebox` 等，生产闭包 80+ 个包（本仓 `.pnpm` 共约 131 MB，其中 pi-ai 生产闭包约 60 MB，其余是 dev 树）。adapter 对 pi-ai 只用 `import type`，所以 **Core 自己的模块图**运行时不会加载其中任何一个（构造 adapter 的宿主当然用的是真 pi-ai）。模块路径导入一律带 `.js` 后缀。
 
 > SPEC 的实际文件名是 `docs/PHASE1_AGENT_CORE_SPEC .md` —— `SPEC` 与 `.md` 之间**有一个空格**，按此路径打开。
 
@@ -44,8 +45,9 @@ composition root (host / test)
   ├── createSession(id)
   ├── createToolRegistry()  ──register(tool)
   ├── createDefaultContextBuilder(systemPrompt?)
+  ├── createPiAiModelClient({ models, model, apiKey?, maxTokens?, timeoutMs? })   ← ModelClient
   ├── createAgentLoop({ modelClient, tools, contextBuilder })
-  └── createAgentRuntime({ loop })            ← Runtime 不构造 Loop
+  └── createAgentRuntime({ loop })            ← Runtime 不构造 Loop，也不构造 ModelClient
 ```
 
 **运行期调用方向**（一个 turn 内，谁调用谁）：
@@ -58,14 +60,12 @@ AgentRuntime.stream(input) ┘                 生成 turnId 与 RuntimeContext
   └──> AgentLoop.runTurn({ session, turnId, context, emit })
          ├──> ContextBuilder.build({ session, tools, context }) ──> ModelRequest
          ├──> ModelClient.stream(request, context) ──> ModelEvent*
-         │        ├─ text-delta    ──> emit(assistant/chunk)
-         │        └─ tool-call     ──> 收进本 step 的 toolCalls
+         │      └─ 具体实现：PiAiModelClient ──> pi-ai Models.stream ──> provider HTTP
          ├──> ToolRegistry.execute(name, input, context) ──> ToolExecutionResult
-         │        tool/call 在派发前 emit，tool/result 在派发后 emit
          └──> Session.append(...)   写 message/assistant, tool/call, tool/result
 ```
 
-关键点：**Loop 从不读日志**（不调 `session.events()`）。每一步都重新经 ContextBuilder 从 Session 派生 request，日志是唯一事实来源。模型输入的构造路径只有 ContextBuilder 一条（`deriveMessages()` 在 `src/` 内的唯一调用点是 `context-builder.ts`），但 `Session.events()` / `deriveMessages()` 是公开 API，宿主与测试当然可以直接读。`run()` 与 `stream()` **共用同一条 `driveTurn()`**，唯一差别是事件推给谁（no-op 还是 channel）。
+关键点：**Loop 从不读日志**（不调 `session.events()`）。每一步都重新经 ContextBuilder 从 Session 派生 request，日志是唯一事实来源。模型输入的构造路径只有 ContextBuilder 一条，`run()` 与 `stream()` 共用同一条 `driveTurn()`。**Core / Loop 里没有任何 provider 分支**：OpenAI-compatible 与 Anthropic 的差异全部由 pi-ai 在 adapter 之下处理（adapter 自己会按设计写入 pi-ai 要求的 `api` / `provider` / `model` 元数据）。
 
 ---
 
@@ -73,19 +73,23 @@ AgentRuntime.stream(input) ┘                 生成 turnId 与 RuntimeContext
 
 ### P1.1 Core Contracts
 
-八个契约，均已定稿并实现：`RuntimeContext`（`src/runtime/runtime-context.ts`）、`RuntimeEvent`（四种，各带 `sessionId` + `turnId`，`turn/end` 另有可选 `error`）、`SessionEvent`（六类 + `TurnEndReason`）、`Session`（append-only，`append` 只生成 `seq` / `time`）、`Tool`（`execute` 是**方法签名**，失败是值 `ToolExecutionResult`）、`ToolRegistry`（Map 实现，`execute` 不抛业务失败）、`ModelClient`（`stream(request, context)`，失败一定是 throw）、`ContextBuilder`（systemPrompt + `deriveMessages()` + tool schemas）。
+八个契约，均已定稿并实现：`RuntimeContext`、`RuntimeEvent`（四种，各带 `sessionId` + `turnId`，`turn/end` 另有可选 `error`）、`SessionEvent`（六类 + `TurnEndReason`）、`Session`（append-only，`append` 只生成 `seq` / `time`）、`Tool`（`execute` 是**方法签名**，失败是值 `ToolExecutionResult`）、`ToolRegistry`（Map 实现，`execute` 不抛业务失败）、`ModelClient`（`stream(request, context)`，失败一定是 throw）、`ContextBuilder`（systemPrompt + `deriveMessages()` + tool schemas）。
 
 ### P1.2 Minimal ReAct Loop
 
-DoD 链路跑通（User → Model → Tool → Result → Model → Final Answer）；`FakeModelClient` / `EchoTool` 只在 `tests/helpers/`；覆盖 plain turn、同一 step 内多 tool call、多 step tool 链、tool 抛错恢复、unknown tool 恢复、非字符串 tool 输出渲染。
-
+DoD 链路跑通（User → Model → Tool → Result → Model → Final Answer）；`FakeModelClient` / `EchoTool` 放在 `tests/helpers/`（测试内部另有就地定义的桩工具与桩流，见 `tests/`）；覆盖 plain turn、同一 step 内多 tool call、多 step tool 链、tool 抛错恢复、unknown tool 恢复、非字符串 tool 输出渲染。
 ### P1.3 Runtime Engineering
 
-- `AgentLoop`（`src/loop/agent-loop.ts`，315 行）：ReAct 编排 + 步预算 + 模型重试 + 取消检查点 + 事件发射；`runTurn()` 返回 `TurnOutcome`（不再是字符串）。
-- `AgentRuntime`（`src/runtime/agent-runtime.ts`，220 行）：`run()` 与 `stream()` 两个 facade 共用 `driveTurn()`；Runtime 持有 turn 边界与 RuntimeEvent 信封（`turnId` 唯一生产者）。
-- `src/errors.ts`：`errorMessageOf` 从 tool-registry 抽出，loop 与 registry 共用。
-- 四种结局全部真实落地并被测试：`completed` / `max_steps` / `cancelled` / `error`；**循环内部任何失败都不会留下未闭合的 turn**。
-- 覆盖：步预算（含边界：第 12 步仍可作答）、重试成功 / 重试耗尽 / 已产出 text 不重试 / 空输出重试、pre-abort（0 次 model 调用）、流中途 abort、tool 块中途 abort 的 call/result 补齐、tool 自身失败仍是 observation、RuntimeEvent 顺序与信封、`run()`/`stream()` 同路径、消费者提前 break 后 turn 仍闭合。
+- `AgentLoop`（`src/loop/agent-loop.ts`）：ReAct 编排 + 步预算 + 模型重试 + 取消检查点 + 事件发射；`runTurn()` 返回 `TurnOutcome`。
+- `AgentRuntime`（`src/runtime/agent-runtime.ts`）：`run()` 与 `stream()` 共用 `driveTurn()`；Runtime 持有 turn 边界与 RuntimeEvent 信封。
+- 四种结局全部落地并被测试：`completed` / `max_steps` / `cancelled` / `error`；**循环内部任何失败都不会留下未闭合的 turn**。
+
+### P1.4 Real LLM
+
+- `PiAiModelClient`（`src/model/pi-ai-client.ts`）：把 `ModelRequest` 翻译成 pi-ai 的 `Context`，把 pi-ai 的事件流翻译成 `ModelEvent`，把每一种失败翻译成 throw。是 `src/` 里唯一 import pi-ai 的文件（且只用 `import type`）。
+- 支持 **OpenAI-compatible（`api: "openai-completions"`）与 Anthropic（`api: "anthropic-messages"`）** 两条 wire path：不是自己实现协议，而是把 `Model` / `Models` 交给 pi-ai 自带的 provider 层。
+- 确定性验证分三层：adapter 单测（事件 / 失败 / 请求投影 / 选项透传）、真 pi-ai `fauxProvider` + 真 Core 的 DoD 往返、以及**只把 socket 换成桩的 wire 级测试**（真 wire adapter + 真 SSE 解析 + 真参数累加；Anthropic 那条同时证明 tool 结果被折进 user message）。
+- 真实端点：`tests/real-provider.e2e.test.ts` 只在 `DEEPSEEK_API_KEY` 存在时运行；本次结果见 §7。
 
 ---
 
@@ -107,40 +111,50 @@ DoD 链路跑通（User → Model → Tool → Result → Model → Final Answer
 
 **数据与隔离**
 9. **Session 是 append-only event log**；`seq` / `time` 由 Session 生成，`turnId` 由调用方生成 —— 调用方不能自行指定或伪造 `seq` / `time`，事件的语义 append 顺序由 Runtime / Loop 保证。
-10. **每个完成的 model step 恰好一条 `message/assistant`**（先落日志再判分支；空 text 的 tool step 也写一条）。**被取消或失败的 step 不写**：它没有完成，半截的 step 不是会话事实。
+10. **每个完成的 model step 恰好一条 `message/assistant`**（先落日志再判分支；空 text 的 tool step 也写一条）。**被取消或失败的 step 不写**。
 11. **structural shallow isolation only**：`append` 单层浅拷贝 + `Object.freeze`；`deriveMessages` 的 assistant 分支新建数组 + 新建 `ToolCall` 对象。**`ToolCall.input` 保持原引用，不做 deep clone，不递归 deepFreeze**。
-12. **`message/assistant` 事件自携带 `toolCalls`**，使 `deriveMessages()` 成为逐事件 1:1 映射；**`tool/call` 事件不产出任何投影消息**（它是「已派发」这一刻的事实记录）。
+12. **`message/assistant` 事件自携带 `toolCalls`**，使 `deriveMessages()` 成为逐事件 1:1 映射；**`tool/call` 事件不产出任何投影消息**。
 
 **模型与工具契约**
-14. **`ModelEvent.tool-call` 是已拼装完整的成品**，不是增量 delta。provider 的 argument-delta 累积属于 ModelClient 实现内部 —— 这是 Loop 里没有任何 stream assembler 的原因。
+14. **`ModelEvent.tool-call` 是已拼装完整的成品**，不是增量 delta。provider 的 argument-delta 累积属于 ModelClient 实现内部（P1.4 由 pi-ai 完成）—— 这是 Loop 里没有任何 stream assembler 的原因。
 15. **provider-specific assembler 不进 Loop**。
-16. **`ModelEvent.done` = 当前 model step 的终止事件**：遇到即停止消费；**同时允许 AsyncIterable 自然结束也表示 step 完成**。实现必须用**带标签 break 真正退出 `for await`**，label 的实际形状是 `modelStep: for await (...) { ... break modelStep; }`，绝不能写成只 break switch。**自然结束但无 text 且无 tool call 不算「完成」**，而是可重试的失败（见 #30）。
-17. **ModelClient 失败一定是 throw / 迭代中途 reject**，绝不通过 `ModelEvent` 表达失败（所以刻意没有 error 变体）。取消与失败的区分靠 `context.signal.aborted`。
-18. **Core-level retry 归 AgentLoop；adapter 不得实现 retry** —— 否则两边相乘。重试在**尚未产出 text 时是静默的**（Phase 1 没有 attempt 类事件，SPEC §5.2 明确不加）；只有重试耗尽才把原因写进 `turn/end.error`，所以「重试决策留在 Core 侧、可被 Core 观测」指的是它发生在 Core，而不是每次尝试都要发事件。
+16. **`ModelEvent.done` = 当前 model step 的终止事件**：遇到即停止消费；**同时允许 AsyncIterable 自然结束也表示 step 完成**。实现必须用**带标签 break 真正退出 `for await`**：`modelStep: for await (...) { ... break modelStep; }`。**自然结束但无 text 且无 tool call 不算「完成」**，而是可重试的失败（见 #30）。
+17. **ModelClient 失败一定是 throw / 迭代中途 reject**，绝不通过 `ModelEvent` 表达失败。取消与失败的区分靠 `context.signal.aborted`。
+18. **Core-level retry 归 AgentLoop；adapter 不得实现 retry**（pi-ai 侧的请求层默认也不重试，见 #41）。
 19. **ToolRegistry 只做 dispatch / catch / normalize**：不验证 schema、不做字符串化、不并行。
-20. **P1.1 不做 schema validation**：`inputSchema: unknown`，不加 JSON Schema validator（P1.4 再定）。
-21. **Tool execution serial，且 tool/call → tool/result 逐调用交替**：`tool/call A → tool/result A → tool/call B → tool/result B`，不是批量 `call A, call B, result A, result B`。
-22. **`tool-call` 事件浅复制**（`toolCalls.push({ ...event.call })`），防止 client 事后改写 Loop 已记录的数据。
-23. **`ToolRegistry.execute()` 对 Tool 执行路径不抛业务失败**：unknown tool / `Tool.execute` throw / 非 Error throw 统一规范化为 `{ ok: false, error }` 观察结果，交回模型。**`register()` 等配置 / 管理 API 的错误仍允许抛异常**。
-24. **tool 结果 → 文本的转换只发生在 `agent-loop.ts` 的 `toolResultContent()`**：`!ok → error`；string → 原样；否则 `JSON.stringify(value) ?? String(value)`；抛错 → `<unserializable tool result>`。它必须是全函数。
+20. **P1.1 不做 schema validation**：`inputSchema: unknown`，P1.4 已裁决见 #39。
+21. **Tool execution serial，且 tool/call → tool/result 逐调用交替**。
+22. **`tool-call` 事件浅复制**（`toolCalls.push({ ...event.call })`）。
+23. **`ToolRegistry.execute()` 对 Tool 执行路径不抛业务失败**：unknown tool / throw / 非 Error throw 统一规范化为 `{ ok: false, error }` 观察结果。**`register()` 等配置 API 的错误仍允许抛异常**。
+24. **tool 结果 → 文本的转换只发生在 `agent-loop.ts` 的 `toolResultContent()`**：`!ok → error`；string → 原样；否则 `JSON.stringify(value, bigintAsString) ?? String(value)`；抛错 → `<unserializable tool result>`。必须是全函数。
 
 **接口稳定性**
-25. **P1.1 定义 `Tool.execute` 必须用方法签名**，不能改成属性接函数类型 —— TS 对方法参数做双变检查，改成属性会因参数逆变导致 `Tool<string, number>` 无法注册。
-26. **`AgentRuntime.run()` 的参数与返回类型名不变**（仍是 `run(input: AgentRuntimeInput): Promise<TurnResult>`），P1.3 只新增 `stream(): AsyncIterable<RuntimeEvent>`。**`TurnResult` 以附加方式扩展**为 `{ turnId, text, reason, error? }`，`AgentLoop.runTurn()` 的返回类型由 `Promise<string>` 放宽为 `Promise<TurnOutcome>` —— 否则 Runtime 无从得知 reason，只能硬编码 `completed`。
-27. **`ToolSchema` 是独立类型**，不是 `Tool` 的子集 —— 防止 `execute` 意外随 schema 进入 ModelRequest。
+25. **`Tool.execute` 必须用方法签名**（双变检查），不能改成属性接函数类型。
+26. **`AgentRuntime.run()` 的参数与返回类型名不变**；`TurnResult` 附加扩展为 `{ turnId, text, reason, error? }`；`AgentLoop.runTurn()` 返回 `Promise<TurnOutcome>`。
+27. **`ToolSchema` 是独立类型**，不是 `Tool` 的子集。
 
 **运行时纪律**
-28. **`MAX_STEPS = 12` 是常量，不是配置项**。一次 **step = 一次 model 调用 + 它请求的 tool 派发**；预算在 model 调用**之前**检查，所以「第 12 步请求了 tool」不会被拒绝执行，只是不会再有第 13 步。**abort 检查在预算检查之前**，取消的 turn 记 `cancelled` 而不是 `max_steps`。
-29. **`MAX_MODEL_ATTEMPTS = 3`**（1 次 + 2 次重试），**重试不消耗 step 预算**：单 turn 最多 12 × 3 = 36 次 provider 调用。
-30. **重试条件只有一个：该次尝试尚未产出 text**。tool call 在 step 完成前既不入日志也不 emit，因此可以整体丢弃后重试；text 已经到达观众，不能重来 → 直接把失败报出来。**空输出（无 text 无 tool call）算可重试失败**，不静默返回空答案。
-31. **abort 优先于 retry，也优先于 max_steps**；`signal.aborted` 是区分「取消」与「模型坏了」的唯一依据，错误类型不参与判断（于是 AbortError 也被记作 cancelled，而不是 error）。
-32. **取消或失败发生在 step 中途时，该 step 的 `assistant/chunk` 只到过 stream，不进日志**：日志里没有半截 step，但 `stream()` 的消费者确实看过那些 chunk（`run()` 路径下这些 chunk 没有观众）。
-33. **每个 `message/assistant.toolCalls` 之后、下一条 message 之前，必须有对应的 `tool/result`**：取消时未派发的 call 补记 `tool/call` + `tool/result{ ok: false, content: "tool not executed: the turn was cancelled" }`；`ToolRegistry.execute` 若违反自己的契约抛错，由 loop 的 `dispatchTool()` 兜成 `{ ok: false }`。这条不变量是给下一个 provider 请求用的：悬空 tool call 会被 provider 拒绝。
-34. **turn 闭合双保险**：loop 内部兜底（`runTurn()` 的 try/catch，把任何逃出的异常变成 `cancelled` / `error` 结局）**加上** Runtime 的 `runLoop()` 再兜一层 —— 因为 Loop 是注入依赖，而 turn 边界的承诺属于 Runtime。两层的边界是 `Session.append` 本身：Session 是本地 append-only 日志，它若抛错，没有能写下 `turn/end` 的人。
-35. **`turn/end` 记录 `TurnOutcome.error`（有则写）**，`SessionEvent` 与 `RuntimeEvent` 两个类型同时具备该字段；内置 loop 只在 `reason: "error"` 时产生它。
-36. **`RuntimeEvent` 保持四种，不加 `assistant/message`**：一个 step 的内容就是它的 chunk 拼接，边界就是 `tool/call` / 下一条 chunk / `turn/end`；Phase 3 还没有消费者，加冗余表示只会多一份要同步的东西。
-37. **`stream()` 的消费者提前 break 不 abort turn**：turn 继续跑到闭合，日志完整；要中止必须 abort signal。channel 队列无上限（生产者与消费者之间隔着一次 model 调用，阻塞消费者等于阻塞它要报告的东西）。
-38. **`ToolResult.ok = false` 用于「未执行」**：取消导致的未执行记录为失败观察，是当前类型下唯一诚实且 provider 合法的表达。
+28. **`MAX_STEPS = 12` 是常量**。一次 step = 一次 model 调用 + 它请求的 tool 派发；预算在 model 调用之前检查；**abort 检查在预算检查之前**。
+29. **`MAX_MODEL_ATTEMPTS = 3`**（1 次 + 2 次重试），重试不消耗 step 预算：单 turn 最多 12 × 3 = 36 次 provider 调用。
+30. **重试条件只有一个：该次尝试尚未产出 text**。tool call 在 step 完成前既不入日志也不 emit，所以可以整体丢弃重试。**空输出算可重试失败**。
+31. **abort 优先于 retry，也优先于 max_steps**；`signal.aborted` 是区分取消与模型失败的**唯一**依据。
+32. **取消或失败发生在 step 中途时，该 step 的 `assistant/chunk` 只到过 stream，不进日志**。
+33. **每个 `message/assistant.toolCalls` 之后、下一条 message 之前必须有对应 `tool/result`**：取消时未派发的 call 补记 `tool/call` + `tool/result{ ok: false, content: "tool not executed: the turn was cancelled" }`；`ToolRegistry.execute` 若违反契约抛错，由 `dispatchTool()` 兜成 `{ ok: false }`。
+34. **turn 闭合双保险**：loop 内部兜底 + Runtime 的 `runLoop()` 再兜一层。两层的边界是 `Session.append` 本身。
+35. **`turn/end` 记录 `TurnOutcome.error`（有则写）**，`SessionEvent` 与 `RuntimeEvent` 两个类型同时具备。
+36. **`RuntimeEvent` 保持四种，不加 `assistant/message`**。
+37. **`stream()` 的消费者提前 break 不 abort turn**：turn 继续跑到闭合；要中止必须 abort signal。
+38. **`ToolResult.ok = false` 用于「未执行」**。
+
+**P1.4 新增（provider 边界）**
+
+39. **Core 不做 tool input schema 校验，且这是裁决而非遗漏**。`Tool.inputSchema` 保持 `unknown`（P1.1 契约不变），模型给的参数直接进 `Tool.execute`；参数不合法由 **Tool 自己**抛错 → ToolRegistry 规范化为 `{ ok: false, error }` 观察结果 → 模型有机会纠正（`tests/pi-ai-integration.test.ts` 钉住了这条路径）。pi-ai 确实导出 `validateToolCall` / `validateToolArguments`（TypeBox，对纯 JSON Schema 也能用），但它自己的 wire adapter 从不调用它，所以「pi-ai 会替我们校验」是假的。**若将来要引入校验，唯一自洽的位置是 ToolRegistry**（放 adapter 会把「模型参数不合法」变成 step 失败 + 重试，模型反而失去纠正机会），且需要同时改 `Tool.inputSchema` 的契约（TypeBox）与 SPEC §5.5 的措辞 —— 属 Phase 2 插件场景（插件是外来代码，那时才需要主动防御）。
+40. **adapter 的失败映射是**：pi-ai 的 `error` 终端 → throw（`aborted` 与 `error` 用不同措辞）；`done` 但 `message.stopReason` 是 `length`（截断）/ `pending` / `deferred` / `aborted` / `error` → throw；**流在没有终端事件的情况下结束 → throw**（因为 Core 把静默结束读作「step 完成」，这是它唯一不能收到的失败）。`stop` / `toolUse` 才是正常结束。未知事件或未知 stop reason 由 `never` 赋值在**编译期**挡住。
+41. **adapter 不重试，并显式传 `maxRetries: 0`**。pi-ai 的请求层默认已是 0（`utils/provider-retry.js` 的 `options.maxRetries ?? 0`），SDK 客户端也被 pi-ai 强制 `maxRetries: 0`；显式写出来是为了让这个性质不会在 Core 脚下改变。
+42. **provider 侧的消息归一（连续 tool 结果合并、role 映射）全部由 pi-ai 完成，`deriveMessages` 一行不改**。Anthropic 把连续 tool 结果折进一条 user message，OpenAI-compatible 保持独立 `role:"tool"` —— Core 与 Session 都不知道这个区别。
+43. **adapter 交给 Core 的 tool call 是顶层复制**（`{ ...arguments }` 仅当它是对象）；**不是对象就原样透传**，绝不 spread 成 `{0: ...}`（那会凭空造出模型没给过的参数）。反向重放时，`input` 不是对象的记录会**抛本地错误**，而不是让 provider 去拒绝。
+44. **凭据是宿主的责任**：adapter 只接受可选的 `apiKey`；不传则交给 pi-ai 自己的 credential store / 环境变量解析。Core 从不读凭据，任何地方都不打印它们。（注意：provider 的错误文本可能回显凭据片段，它会被记进 `turn/end.error`，将来持久化时会落盘 —— P1.5 若要写日志，需要留意这一点。）
+45. **adapter 的依赖是 pi-ai 的一个切片**（`PiAiStreamSource`，只有 `stream`），而不是整个 `Models`：既让 adapter 说清自己依赖什么，也让测试能用脚本化事件驱动它。集成测试把 pi-ai 真实的 `Models` 交给它，所以签名漂移会在那里编译失败。
 
 ---
 
@@ -150,23 +164,26 @@ DoD 链路跑通（User → Model → Tool → Result → Model → Final Answer
 
 ```ts
 createSession(id: string): Session
-  readonly id: string
-  append(event: SessionEventInput): SessionEvent      // 生成 seq / time，返回存储形态
+  append(event: SessionEventInput): SessionEvent      // 生成 seq / time
   events(): readonly SessionEvent[]                   // 冻结快照
   deriveMessages(): ModelMessage[]
 
 createToolRegistry(): ToolRegistry
   register(tool: Tool): () => void                    // 重名抛错；disposer 幂等
-  get(name: string): Tool | undefined
-  list(): Tool[]
+  get(name) / list()
   execute(name, input, context): Promise<ToolExecutionResult>   // 不抛业务失败
 
 createDefaultContextBuilder(systemPrompt?: string): ContextBuilder
   build({ session, tools, context }): Promise<ModelRequest>
 
-createAgentLoop(deps: {
-  modelClient: ModelClient; tools: ToolRegistry; contextBuilder: ContextBuilder;
-}): AgentLoop
+createPiAiModelClient(options: {
+  models: PiAiStreamSource;    // pi-ai 的 Models（或测试里的脚本化实现）
+  model: Model<Api>;           // 自带 api 协议与 baseUrl
+  apiKey?: string; maxTokens?: number; timeoutMs?: number;
+}): ModelClient
+  stream(request, context): AsyncIterable<ModelEvent>
+
+createAgentLoop(deps: { modelClient; tools; contextBuilder }): AgentLoop
   runTurn({ session, turnId, context, emit? }): Promise<TurnOutcome>
   // TurnOutcome = { reason: TurnEndReason; text: string; error?: string }
   // emit?: (event: AgentLoopEvent) => void   —— 无信封的 assistant/chunk | tool/call | tool/result
@@ -180,7 +197,7 @@ MAX_STEPS = 12            // 每次 turn 的 model 调用上限
 MAX_MODEL_ATTEMPTS = 3    // 每个 model step 的尝试上限（1 + 2 次重试）
 ```
 
-`AgentRuntimeInput.signal` 现在是**真正的取消开关**：abort 后 turn 在下一个检查点停下并以 `cancelled` 闭合。SPEC §5.9 建议里的 `cancel(...)` / `getSession(...)` **没有实现**（HANDOFF 从未冻结它们）：取消走调用方自己的 signal，session 由组装的调用方持有。
+`AgentRuntimeInput.signal` 是**真正的取消开关**：abort 后 turn 在下一个检查点停下并以 `cancelled` 闭合。SPEC §5.9 建议里的 `cancel(...)` / `getSession(...)` **没有实现**（HANDOFF 从未冻结它们）：取消走调用方自己的 signal，session 由组装的调用方持有。
 
 ---
 
@@ -221,64 +238,66 @@ turn/end{reason:"completed"}
 
 ```bash
 pnpm typecheck    # tsc --noEmit -p tsconfig.json  → 0 错
-pnpm test         # vitest run                     → 81 passed (9 files)
+pnpm test         # vitest run                     → 106 passed, 1 skipped (12 files)
 ```
 
-测试分布：session 12 / tool-registry 16 / context-builder 6 / derive-messages 10 / agent-loop 7 / agent-runtime 2 / react-loop 3 / agent-loop-limits 15 / agent-runtime-stream 10。
+测试分布：session 12 / tool-registry 16 / context-builder 6 / derive-messages 10 / agent-loop 7 / agent-runtime 2 / react-loop 3 / agent-loop-limits 15 / agent-runtime-stream 10 / pi-ai-client 17 / pi-ai-integration 8。
 
-注意：编译期断言（穷尽 switch、`Tool<string,number>` 可赋值性）只在 `typecheck` 下生效，`test` 单独跑不覆盖 —— 将来加 CI 必须两条命令都跑。
+注意：编译期断言（穷尽 switch、`never` 赋值、`Tool<string,number>` 可赋值性）只在 `typecheck` 下生效，`test` 单独跑不覆盖 —— 将来加 CI 必须两条命令都跑。
+
+**Real provider smoke：未通过（凭据被 provider 拒绝）**
+
+```bash
+# 凭据存在时才会真的调用；不存在则 skip（不会假通过）
+DEEPSEEK_API_KEY=... npx vitest run packages/agent-core/tests/real-provider.e2e.test.ts
+```
+
+2026-09-28 在 `deepseek/deepseek-flash`（`https://api.deepseek.com`，OpenAI-compatible）上运行的结果：端点返回 `401: {"message":"Authentication Fails, Your api key: ****mlbo is invalid", ...}`。同一凭据直接用 pi-ai 调用（不经过本仓库任何代码）得到同样的 401，所以**不是 adapter 的问题**，是本机配置的 key 已失效。可以确认的是：请求构造、真实 HTTPS 往返、失败映射、以及 Core 的 3 次重试都在真实端点上跑通了（turn 以 `error` 闭合，错误原文保留）。**一个成功的真实补全还没有发生过。**
 
 ---
 
 ## 8. Deferred Decisions / Technical Debt
 
-### P1.4 Real LLM（开工清单）
-
-- `PiAiModelClient` 包 `@earendil-works/pi-ai`（npm 实测 0.87.1，ESM-only，`engines: node >=22.19`），覆盖 OpenAI-compatible（`api: "openai-completions"`）与 Anthropic（`api: "anthropic-messages"`）。
-- **provider 截断 / 超时必须以 throw 表达，不得用静默 natural end** —— 因为 Loop 把「流自然结束」也当作 step 完成（#16）。pi-ai 的终端事件是 `done` / `error`（含 `stopReason: "length"` = 截断、"aborted"、"error"），adapter 负责把它们翻译成 Core 的 throw 或正常结束。
-- **Tool input validation strategy 再决定**：SPEC §5.5 把「参数验证」列为 ToolRegistry 职责，当前实现没有；pi-ai 自带 `validateToolCall`（TypeBox）可复用。
-- **Tool result serialization contract 再决定**，包括 bigint：当前 `JSON.stringify(10n)` 会抛，导致**成功的** tool 结果被渲染成 `<unserializable tool result>`。
-- **Provider adapter 不得在 yield 之后继续 mutate 已交给 Core 的 `ToolCall` / `input` 对象**：pi-ai 的 `partial` 是共享可变累加器，`toolcall_delta` 期间不能把它交给 Core。
-- 连续同角色 tool 消息的 provider 归一由 adapter / pi-ai 处理，**不得改 `deriveMessages`**。
-
 ### P1.5 Persistence + E2E
 
 - `SessionStore` seam：先 `MemorySessionStore`，再视进度做 `SQLiteSessionStore`。
-- 从既有日志构造 Session 供 `SessionStore.load`（加可选第二参数即可）、真实 LLM + Calculator Tool E2E。
+- 从既有日志构造 Session 供 `SessionStore.load`（加可选第二参数即可）、Calculator Tool、真实 LLM + Calculator 的 E2E（DoD 最后一块）。
+- **Phase 1 是否算完成取决于真实补全**：凭据可用时跑 `real-provider.e2e.test.ts` 与 Calculator E2E；不可用时必须写明 `REAL_PROVIDER_SMOKE = NOT RUN/BLOCKED`，Phase 1 保持 PARTIAL。
 
 ### Later
 
+- **Tool input schema 校验**（TypeBox）留到 Phase 2 插件场景，位置必须是 ToolRegistry（#39）。
 - `deriveMessages()` 目前全量重建（正确，不改）；将来若要缓存放 Session 内部，**压缩 / 裁剪永远属于 ContextBuilder**。
-- tool schema 暴露顺序（P2 插件加载序 / P1.4 prompt cache；当前 Map 插入序已确定且稳定）。
+- tool schema 暴露顺序（P2 插件加载序 / prompt cache；当前 Map 插入序已确定且稳定）。
 - 重名注册策略（P2 若需 last-wins）。
-- `inputSchema` 收窄（与验证机制同时进行）。
 - `assistantSteps` helper 在多个测试文件中逐字重复（已裁决不处理）。
-- 取消与真实错误同时发生时按 `cancelled` 记账（#31 的代价）：错误原因不进日志。若将来两者都要留痕，得给 `turn/end` 增加独立字段或事件类型。
+- 取消与真实错误同时发生时按 `cancelled` 记账（#31 的代价）：错误原因不进日志。
+- `turn/end.error` 会带上 provider 的错误原文，而 provider 有时会回显凭据片段（#44）；将来把日志落盘或展示给他人前要留意。
+- 真实 provider 的 tool-call 往返（真实 endpoint 上的 argument delta → parsed input → tool）从未验证过；只有桩 socket 级的 wire 测试覆盖。
 
 ---
 
 ## 9. Explicit Non-Goals
 
 Phase 1 内不做：Multi-Agent / Subagent、Planner / Plan-and-Execute / ToT、Workflow Engine、MCP、Skills、Browser / Shell / Code Interpreter、Web UI / React / Tauri、业务插件（Music / Calendar / Gmail）、GraphRAG / vector DB / Context Compaction、复杂 permission sandbox 与 human-in-the-loop approval。完整清单见 SPEC §7。
-
 ---
 
 ## 10. Next Window
 
-**Next milestone: P1.4 Real LLM**
+**Next milestone: P1.5 Persistence + E2E**
 
 启动顺序：
 
 1. 先读 `docs/PHASE1_AGENT_CORE_SPEC .md`（注意文件名里的空格）。
 2. 再读本文件。
 3. Explore 当前 `packages/agent-core/src` 与 `tests`，核对真实代码与本文档。
-4. **先 Plan P1.4，不直接 Implement。** 批准后再动手。
+4. **先 Plan P1.5，不直接 Implement。** 批准后再动手。
 
-P1.4 的 P0 待设计问题（其余见 §8）：
+P1.5 的 P0 待设计问题：
 
-1. pi-ai 的 `error` 终端事件（含 `aborted`）如何翻译成 Core 的 throw 与 `cancelled`，而不与「自然结束=step 完成」冲突？
-2. `toolcall_delta` 的累加放在 adapter 哪一层，如何保证交给 Core 的 `ToolCall` 之后再不被 mutate？
-3. 真实 provider smoke 用什么凭据、跑什么最小用例；没有凭据时如何明确标记 `REAL_PROVIDER_SMOKE = NOT RUN` 而不假称已验证。
+1. `SessionStore` 的最小接口（`create` / `load` / `append`）与 `Session` 如何解耦；`load` 需要从既有事件重建 Session（`createSession` 加可选第二参数，还是单独的工厂函数），以及 `seq` / `time` / `turnId` 如何保真。
+2. SQLite 在 Phase 1 是否真的需要（SPEC 说「先 Memory，SQLite 不得阻塞最小 ReAct Core」，DoD 未强制）；如果做，存的是事件表还是整份日志。
+3. Calculator Tool 的契约（`{ a, b }` 的数字与错误路径），以及 E2E 在没有凭据时如何明确标记为 pending 而不是假通过。
 
 ---
 
