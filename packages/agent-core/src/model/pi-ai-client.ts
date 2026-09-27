@@ -295,7 +295,8 @@ function toArguments(call: ToolCall): JsonObject {
 }
 
 /** pi-ai wants usage on a replayed assistant message; a replay has none to report. */
-function noUsage(): Usage {  return {
+function noUsage(): Usage {
+  return {
     input: 0,
     output: 0,
     cacheRead: 0,

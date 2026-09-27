@@ -60,13 +60,36 @@ export function restoreSession(id: string, events: readonly SessionEvent[]): Ses
     }
 
     // Frozen exactly the way `append` freezes: a restored event is no more mutable
-    // than a recorded one, and `data` stays a single shallow level.
+    // than a recorded one, down to the arrays the payload owns.
     // One cast, as in `append`: the correlated union cannot be re-derived from a
     // spread even though every branch is structurally identical here.
-    recorded.push(Object.freeze({ ...event, data: Object.freeze({ ...event.data }) }) as SessionEvent);
+    recorded.push(
+      Object.freeze({
+        ...event,
+        data: Object.freeze(ownedPayload({ ...event.data })),
+      }) as SessionEvent,
+    );
   }
 
   return new EventLogSession(id, recorded);
+}
+
+/**
+ * Copies the arrays an event's own payload owns, one level deep.
+ *
+ * The envelope and `data` are copied already, but a shallow copy would still hand the
+ * caller's `toolCalls` array to the log — and the log is a record nobody may edit
+ * afterwards. The calls themselves are copied too; their `input` stays by reference,
+ * which is the isolation boundary the rest of the Core uses.
+ */
+function ownedPayload<T extends object>(data: T): T {
+  const toolCalls = (data as { toolCalls?: unknown }).toolCalls;
+  if (!Array.isArray(toolCalls)) return data;
+
+  return {
+    ...data,
+    toolCalls: Object.freeze(toolCalls.map((call) => ({ ...(call as object) }))),
+  } as T;
 }
 
 class EventLogSession implements Session {
@@ -86,7 +109,7 @@ class EventLogSession implements Session {
       turnId: input.turnId,
       seq: this.log.length,
       time: Date.now(),
-      data: Object.freeze({ ...input.data }),
+      data: Object.freeze(ownedPayload({ ...input.data })),
     }) as SessionEvent;
 
     this.log.push(event);

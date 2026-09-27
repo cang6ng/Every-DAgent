@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { createSession } from "../src/session/session.js";
+import type { Session } from "../src/session/session.js";
 import type { SessionEvent } from "../src/session/session-event.js";
 
 describe("createSession", () => {
@@ -107,7 +108,28 @@ describe("Session immutability", () => {
     expect(() => snapshot.push(snapshot[0])).toThrow();
     expect(session.events()).toHaveLength(1);
   });
+
+  it("detaches the tool calls of a recorded assistant step from the caller's array", () => {
+    const session = createSession("s");
+    const toolCalls = [{ callId: "c1", name: "echo", input: { text: "hi" } }];
+    session.append({ type: "message/assistant", turnId: "t1", data: { text: "", toolCalls } });
+
+    // The caller keeps its own array and may do what it likes with it: what the log
+    // recorded is a copy, not that array.
+    toolCalls.push({ callId: "c2", name: "echo", input: { text: "second" } });
+
+    expect(recordedCalls(session)).toHaveLength(1);
+    // The call record is copied too; its `input` stays by reference, which is the
+    // isolation boundary the rest of the Core uses.
+    expect(recordedCalls(session)[0]?.input).toBe(toolCalls[0]?.input);
+  });
 });
+
+/** The tool calls the log recorded for its first assistant step. */
+function recordedCalls(session: Session): readonly { readonly input: unknown }[] {
+  const [event] = session.events();
+  return event?.type === "message/assistant" ? event.data.toolCalls : [];
+}
 
 describe("SessionEvent narrowing", () => {
   it("exposes each payload through its own event type", () => {

@@ -443,7 +443,8 @@ describe("pi-ai wire adapter with a stubbed socket", () => {
   });
 });
 
-describe("pi-ai adapter cancellation", () => {  it("closes the turn as cancelled when the signal aborts mid-answer", async () => {
+describe("pi-ai adapter cancellation", () => {
+  it("closes the turn as cancelled when the signal aborts mid-answer", async () => {
     const abort = new AbortController();
     const chunks: string[] = [];
     // The provider keeps talking after the abort: the Core must stop listening at
