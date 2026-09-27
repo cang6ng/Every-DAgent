@@ -14,8 +14,10 @@ export type {
   TurnEndReason,
   TurnStartData,
 } from "./session/session-event.js";
-export { createSession } from "./session/session.js";
+export { createSession, restoreSession } from "./session/session.js";
 export type { Session } from "./session/session.js";
+export { createMemorySessionStore } from "./session/session-store.js";
+export type { SessionStore } from "./session/session-store.js";
 
 export type { ModelMessage, ToolCall, ToolResult } from "./model/message.js";
 export type { ModelClient, ModelEvent, ModelRequest, ToolSchema } from "./model/model-client.js";
@@ -25,6 +27,7 @@ export type { PiAiModelClientOptions, PiAiStreamSource } from "./model/pi-ai-cli
 export type { Tool, ToolExecutionResult } from "./tools/tool.js";
 export { createToolRegistry } from "./tools/tool-registry.js";
 export type { ToolRegistry } from "./tools/tool-registry.js";
+export { createCalculatorTool } from "./tools/calculator.js";
 
 export { createDefaultContextBuilder } from "./context/context-builder.js";
 export type { ContextBuilder, ContextBuilderInput } from "./context/context-builder.js";

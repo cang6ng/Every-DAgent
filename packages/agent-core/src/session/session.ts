@@ -3,8 +3,8 @@ import type { SessionEvent, SessionEventInput } from "./session-event.js";
 
 /**
  * The session is the factual record of a conversation; the model context is a
- * derivation of it. Persistence is deliberately out of scope here — a
- * SessionStore attaches later without this interface changing.
+ * derivation of it. Persistence stays out of this interface: a SessionStore is built
+ * on top of it (`restoreSession` is the way back in) rather than inside it.
  */
 export interface Session {
   readonly id: string;
@@ -31,12 +31,51 @@ export function createSession(id: string): Session {
   return new EventLogSession(id);
 }
 
+/**
+ * Rebuilds a session from events it recorded earlier.
+ *
+ * Separate from `createSession` because the two do different things with an event's
+ * envelope: `append` assigns `seq` and `time`, while a restored session carries the
+ * ones already written — a stored log is a record of what happened, and nothing here
+ * may renumber or re-stamp it.
+ *
+ * The events are expected to be that session's own and to be all of them, which is
+ * the caller's obligation: the envelope carries no session id, and a log that does
+ * not run from `seq` 0 to the end is either a window onto part of a conversation or a
+ * corrupt log. Either way it is refused, because quietly repairing a broken record
+ * would turn one bug into a wrong history.
+ */
+export function restoreSession(id: string, events: readonly SessionEvent[]): Session {
+  const recorded: SessionEvent[] = [];
+
+  for (let seq = 0; seq < events.length; seq++) {
+    const event = events[seq];
+    if (event === undefined) {
+      throw new Error(`session "${id}" cannot be restored: its log has a hole at seq ${seq}`);
+    }
+    if (event.seq !== seq) {
+      throw new Error(
+        `session "${id}" cannot be restored: expected seq ${seq}, found seq ${event.seq}`,
+      );
+    }
+
+    // Frozen exactly the way `append` freezes: a restored event is no more mutable
+    // than a recorded one, and `data` stays a single shallow level.
+    // One cast, as in `append`: the correlated union cannot be re-derived from a
+    // spread even though every branch is structurally identical here.
+    recorded.push(Object.freeze({ ...event, data: Object.freeze({ ...event.data }) }) as SessionEvent);
+  }
+
+  return new EventLogSession(id, recorded);
+}
+
 class EventLogSession implements Session {
   readonly id: string;
-  private readonly log: SessionEvent[] = [];
+  private readonly log: SessionEvent[];
 
-  constructor(id: string) {
+  constructor(id: string, recorded: readonly SessionEvent[] = []) {
     this.id = id;
+    this.log = [...recorded];
   }
 
   append(input: SessionEventInput): SessionEvent {
