@@ -27,8 +27,14 @@ export type { ToolRegistry } from "./tools/tool-registry.js";
 export { createDefaultContextBuilder } from "./context/context-builder.js";
 export type { ContextBuilder, ContextBuilderInput } from "./context/context-builder.js";
 
-export { createAgentLoop } from "./loop/agent-loop.js";
-export type { AgentLoop, AgentLoopDeps, AgentLoopInput } from "./loop/agent-loop.js";
+export { MAX_MODEL_ATTEMPTS, MAX_STEPS, createAgentLoop } from "./loop/agent-loop.js";
+export type {
+  AgentLoop,
+  AgentLoopDeps,
+  AgentLoopEvent,
+  AgentLoopInput,
+  TurnOutcome,
+} from "./loop/agent-loop.js";
 
 export { createAgentRuntime } from "./runtime/agent-runtime.js";
 export type {

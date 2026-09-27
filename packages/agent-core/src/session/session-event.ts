@@ -49,6 +49,11 @@ export interface MessageAssistantData {
 
 export interface TurnEndData {
   readonly reason: TurnEndReason;
+  /**
+   * Present only when `reason` is `error`: the failure is recorded here rather
+   * than thrown away, so a closed turn explains itself.
+   */
+  readonly error?: string;
 }
 
 export interface SessionEventDataMap {

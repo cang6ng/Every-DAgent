@@ -40,13 +40,13 @@ export type ModelEvent =
  *   `ModelEvent`. There is deliberately no error variant: the AgentLoop tells a
  *   cancellation from a failure by checking `context.signal.aborted`, and turns
  *   anything else it catches into an `error` turn end.
- * - Retrying is the AgentLoop's responsibility. An adapter must not implement
- *   Core-level retry, so that retry decisions stay on the runtime event stream
- *   and in the session log rather than being hidden inside a provider wrapper.
+ * - Retrying is the AgentLoop's responsibility, not the adapter's, so that the two
+ *   never multiply. A retry is silent while it can be — the loop only repeats a
+ *   step that produced nothing — and an exhausted one is reported as the turn's
+ *   own `error`. Phase 1 has no event kind for an attempt, so a retry that
+ *   succeeded leaves no separate trace beyond the step it produced.
  * - Implementations must honour `context.signal` and stop producing once it is
  *   aborted.
- *
- * P1.1 defines this contract only; no retry is implemented yet.
  */
 export interface ModelClient {
   stream(request: ModelRequest, context: RuntimeContext): AsyncIterable<ModelEvent>;

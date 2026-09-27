@@ -1,3 +1,4 @@
+import { errorMessageOf } from "../errors.js";
 import type { RuntimeContext } from "../runtime/runtime-context.js";
 import type { Tool, ToolExecutionResult } from "./tool.js";
 
@@ -55,26 +56,5 @@ class MapToolRegistry implements ToolRegistry {
     } catch (error) {
       return { ok: false, error: errorMessageOf(error) };
     }
-  }
-}
-
-/**
- * Normalizes anything a tool can throw into a string, including non-Error
- * throws and values whose own `message` getter throws.
- */
-function errorMessageOf(error: unknown): string {
-  try {
-    if (error instanceof Error) return error.message;
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "message" in error &&
-      typeof (error as { message?: unknown }).message === "string"
-    ) {
-      return (error as { message: string }).message;
-    }
-    return String(error);
-  } catch {
-    return "<unprintable thrown value>";
   }
 }

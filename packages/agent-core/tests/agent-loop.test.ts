@@ -59,9 +59,9 @@ describe("AgentLoop model steps", () => {
       ],
     ]);
 
-    const answer = await loopFor(client, createToolRegistry()).runTurn({ session, turnId: TURN, context });
+    const outcome = await loopFor(client, createToolRegistry()).runTurn({ session, turnId: TURN, context });
 
-    expect(answer).toBe("abc");
+    expect(outcome.text).toBe("abc");
     expect(client.requests).toHaveLength(1);
     expect(session.events().map((event) => event.type)).toEqual(["turn/start", "message/user", "message/assistant"]);
     expect(assistantSteps(session)).toEqual([{ text: "abc", toolCalls: [] }]);
@@ -72,9 +72,9 @@ describe("AgentLoop model steps", () => {
     openTurn(session, "hi");
     const client = createFakeModelClient([[{ type: "text-delta", text: "still complete" }]]);
 
-    const answer = await loopFor(client, createToolRegistry()).runTurn({ session, turnId: TURN, context });
+    const outcome = await loopFor(client, createToolRegistry()).runTurn({ session, turnId: TURN, context });
 
-    expect(answer).toBe("still complete");
+    expect(outcome.text).toBe("still complete");
     expect(client.requests).toHaveLength(1);
     expect(assistantSteps(session)).toEqual([{ text: "still complete", toolCalls: [] }]);
   });
@@ -90,9 +90,9 @@ describe("AgentLoop model steps", () => {
       ],
     ]);
 
-    const answer = await loopFor(client, createToolRegistry()).runTurn({ session, turnId: TURN, context });
+    const outcome = await loopFor(client, createToolRegistry()).runTurn({ session, turnId: TURN, context });
 
-    expect(answer).toBe("before");
+    expect(outcome.text).toBe("before");
     expect(assistantSteps(session)).toEqual([{ text: "before", toolCalls: [] }]);
   });
 });
@@ -113,9 +113,9 @@ describe("AgentLoop tool dispatch", () => {
       [{ type: "text-delta", text: "both" }, { type: "done" }],
     ]);
 
-    const answer = await loopFor(client, tools).runTurn({ session, turnId: TURN, context });
+    const outcome = await loopFor(client, tools).runTurn({ session, turnId: TURN, context });
 
-    expect(answer).toBe("both");
+    expect(outcome.text).toBe("both");
     // A call is fully settled before the next one starts; results are never batched.
     expect(session.events().map((event) => event.type)).toEqual([
       "turn/start",
@@ -164,9 +164,9 @@ describe("AgentLoop tool dispatch", () => {
       [{ type: "text-delta", text: "recovered" }, { type: "done" }],
     ]);
 
-    const answer = await loopFor(client, tools).runTurn({ session, turnId: TURN, context });
+    const outcome = await loopFor(client, tools).runTurn({ session, turnId: TURN, context });
 
-    expect(answer).toBe("recovered");
+    expect(outcome.text).toBe("recovered");
     expect(client.requests).toHaveLength(2);
     expect(toolResults(session)).toEqual([{ callId: "call-1", name: "boom", ok: false, content: "boom" }]);
   });
@@ -180,9 +180,9 @@ describe("AgentLoop tool dispatch", () => {
     ]);
 
     // An empty registry: the name the model asked for does not exist.
-    const answer = await loopFor(client, createToolRegistry()).runTurn({ session, turnId: TURN, context });
+    const outcome = await loopFor(client, createToolRegistry()).runTurn({ session, turnId: TURN, context });
 
-    expect(answer).toBe("recovered");
+    expect(outcome.text).toBe("recovered");
     expect(client.requests).toHaveLength(2);
     expect(toolResults(session)).toEqual([
       { callId: "call-1", name: "nope", ok: false, content: 'unknown tool "nope"' },
@@ -220,9 +220,9 @@ describe("AgentLoop tool result rendering", () => {
         [{ type: "text-delta", text: "final" }, { type: "done" }],
       ]);
 
-      const answer = await loopFor(client, tools).runTurn({ session, turnId: TURN, context });
+      const outcome = await loopFor(client, tools).runTurn({ session, turnId: TURN, context });
 
-      expect(answer).toBe("final");
+      expect(outcome.text).toBe("final");
       expect(toolResults(session)).toEqual([{ callId: "call-1", name, ok: true, content }]);
     }
   });
