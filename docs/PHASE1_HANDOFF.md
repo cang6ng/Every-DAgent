@@ -12,15 +12,15 @@
 | 项 | 值 |
 | --- | --- |
 | Branch | `rewrite/runtime-lite` |
-| Code baseline | `42fdec9b57e7a0f52f65393927c2205dc61afffd` — `feat(core): add session persistence and calculator e2e` |
+| Code baseline | `b26c69eab3e31f9e855e7cd80f064dd57b814a1f` — `fix(core): keep recorded tool calls out of the caller's array` |
 | Remote | `origin/rewrite/runtime-lite`；code baseline 已 push |
-| 当前 milestone | P1.5 ✅ 代码已完成、已提交 |
+| 当前 milestone | P1.5 ✅ 代码已完成、已提交（含 final audit 的修复） |
 | **Phase 1 状态** | **PARTIAL** —— 唯一未满足项是**一次成功的真实补全**（§7） |
 | 下一个 milestone | 先用有效凭据跑通真实 E2E；之后才是 Phase 2 Plugin Contract + PluginManager |
-| Tests | **129 passed / 2 skipped / 15 files**（`pnpm test`；2 个 skipped 是真实 provider 用例，见 §7） |
+| Tests | **130 passed / 2 skipped / 15 files**（`pnpm test`；2 个 skipped 是真实 provider 用例，见 §7） |
 | Typecheck | **0 错**（`pnpm typecheck`） |
-| Production LOC | `packages/agent-core/src/` 16 文件 / **1572 行**（去空行、整行 `//` 与块注释后 932 行）—— 略过 SPEC §11 的 ~1500 目标，远低于 ~2500 警戒 |
-| Real provider | **未通过**：真实端点可达，但本机凭据被 provider 判为 invalid（§7 有原文） |
+| Production LOC | `packages/agent-core/src/` 16 文件 / **1595 行**（含注释；去空行与整行注释后 945 行）—— 按含注释口径略过 SPEC §11 的 ~1500 目标，有效行只有目标的一半，远低于 ~2500 警戒 |
+| Real provider | **未通过**：真实端点可达，但本机凭据被 provider 判为 invalid（§7） |
 | 工作区 | 除 `.zcode/` 与 `.zcodeignore`（untracked，**不得提交**）外，改动均已入库 |
 
 ```text
@@ -28,7 +28,7 @@ P1.1 Core Contracts        ✅  b96937d
 P1.2 Minimal ReAct Loop    ✅  c24fe68
 P1.3 Runtime Engineering   ✅  aece33e
 P1.4 Real LLM              ✅  b193d51
-P1.5 Persistence + E2E     ✅  42fdec9  ← code baseline（代码完成；真实 E2E 待凭据）
+P1.5 Persistence + E2E     ✅  42fdec9 + b26c69e  ← code baseline（代码完成；真实 E2E 待凭据）
 ```
 
 仓库形态：pnpm workspace，只有一个包 `packages/agent-core`。**无构建步骤**（`main` 指向 `src/index.ts`）、**无 CI**；运行时唯一依赖是 `@earendil-works/pi-ai@0.87.1`（ESM-only，`engines: node >=22.19`，根 `package.json` 的 engines 与 `packageManager` 已对齐），devDependencies 仅 `typescript` / `vitest` / `@types/node`。**该依赖很重**：连同 `openai`、`@anthropic-ai/sdk`、`@aws-sdk/client-bedrock-runtime`、`@google/genai`、`typebox` 等，生产闭包 80+ 个包（本仓 `.pnpm` 共约 131 MB，其中 pi-ai 生产闭包约 60 MB，其余是 dev 树）。adapter 对 pi-ai 只用 `import type`，所以 **Core 自己的模块图**运行时不会加载其中任何一个（构造 adapter 的宿主当然用的是真 pi-ai）。模块路径导入一律带 `.js` 后缀。
@@ -114,7 +114,7 @@ DoD 链路跑通（User → Model → Tool → Result → Model → Final Answer
 **数据与隔离**
 9. **Session 是 append-only event log**；`seq` / `time` 由 Session 生成，`turnId` 由调用方生成 —— 调用方不能自行指定或伪造 `seq` / `time`，事件的语义 append 顺序由 Runtime / Loop 保证。
 10. **每个完成的 model step 恰好一条 `message/assistant`**（先落日志再判分支；空 text 的 tool step 也写一条）。**被取消或失败的 step 不写**。
-11. **structural shallow isolation only**：`append` 单层浅拷贝 + `Object.freeze`；`deriveMessages` 的 assistant 分支新建数组 + 新建 `ToolCall` 对象。**`ToolCall.input` 保持原引用，不做 deep clone，不递归 deepFreeze**。
+11. **structural shallow isolation only**：`append` 复制信封、`data` 一层，以及 `message/assistant` 的 `toolCalls` 数组与其中的 call 记录；`Object.freeze` 加在同一批对象上。**`ToolCall.input` 保持原引用，不做 deep clone，不递归 deepFreeze**（`deriveMessages` 的 assistant 分支同样新建数组与 `ToolCall` 对象，`input` 按引用）。
 12. **`message/assistant` 事件自携带 `toolCalls`**，使 `deriveMessages()` 成为逐事件 1:1 映射；**`tool/call` 事件不产出任何投影消息**。
 
 **模型与工具契约**
@@ -136,6 +136,9 @@ DoD 链路跑通（User → Model → Tool → Result → Model → Final Answer
 27. **`ToolSchema` 是独立类型**，不是 `Tool` 的子集。
 
 **运行时纪律**
+
+（编号沿用历任裁决，故 12 之后直接是 14 —— 原 #13 已被推翻删除，不留痕。）
+
 28. **`MAX_STEPS = 12` 是常量**。一次 step = 一次 model 调用 + 它请求的 tool 派发；预算在 model 调用之前检查；**abort 检查在预算检查之前**。
 29. **`MAX_MODEL_ATTEMPTS = 3`**（1 次 + 2 次重试），重试不消耗 step 预算：单 turn 最多 12 × 3 = 36 次 provider 调用。
 30. **重试条件只有一个：该次尝试尚未产出 text**。tool call 在 step 完成前既不入日志也不 emit，所以可以整体丢弃重试。**空输出算可重试失败**。
@@ -146,7 +149,7 @@ DoD 链路跑通（User → Model → Tool → Result → Model → Final Answer
 35. **`turn/end` 记录 `TurnOutcome.error`（有则写）**，`SessionEvent` 与 `RuntimeEvent` 两个类型同时具备。
 36. **`RuntimeEvent` 保持四种，不加 `assistant/message`**。
 37. **`stream()` 的消费者提前 break 不 abort turn**：turn 继续跑到闭合；要中止必须 abort signal。
-38. **`ToolResult.ok = false` 用于「未执行」**。
+38. **`ToolResult.ok = false` 同时覆盖「执行了但失败」与「没执行」**：unknown tool / tool 抛错 / 取消导致的未派发都记成失败结果（`content` 分别是错误消息与 `"tool not executed: the turn was cancelled"`），模型据此可以纠正或解释。
 
 **P1.4 新增（provider 边界）**
 
@@ -248,10 +251,10 @@ MAX_MODEL_ATTEMPTS = 3    // 每个 model step 的尝试上限（1 + 2 次重试
 
 ```bash
 pnpm typecheck    # tsc --noEmit -p tsconfig.json  → 0 错
-pnpm test         # vitest run                     → 129 passed, 2 skipped (15 files)
+pnpm test         # vitest run                     → 130 passed, 2 skipped (15 files)
 ```
 
-测试分布：session 12 / tool-registry 16 / context-builder 6 / derive-messages 10 / agent-loop 7 / agent-runtime 2 / react-loop 3 / agent-loop-limits 15 / agent-runtime-stream 10 / pi-ai-client 17 / pi-ai-integration 8 / session-restore 7 / session-store 10 / calculator-roundtrip 6。
+测试分布：session 13 / tool-registry 16 / context-builder 6 / derive-messages 10 / agent-loop 7 / agent-runtime 2 / react-loop 3 / agent-loop-limits 15 / agent-runtime-stream 10 / pi-ai-client 17 / pi-ai-integration 8 / session-restore 7 / session-store 10 / calculator-roundtrip 6。
 
 注意：编译期断言（穷尽 switch、`never` 赋值、`Tool<string,number>` 可赋值性）只在 `typecheck` 下生效，`test` 单独跑不覆盖 —— 将来加 CI 必须两条命令都跑。
 
@@ -262,13 +265,7 @@ pnpm test         # vitest run                     → 129 passed, 2 skipped (15
 DEEPSEEK_API_KEY=... npx vitest run packages/agent-core/tests/real-provider.e2e.test.ts
 ```
 
-2026-09-28 在本机运行（`deepseek/deepseek-flash`，`https://api.deepseek.com`，OpenAI-compatible）：两个用例（纯文本 smoke、真实模型 + calculator 往返）都真的发出了请求并返回
-
-```text
-401: {"message":"Authentication Fails, Your api key: ****mlbo is invalid", ...}
-```
-
-同一凭据直接用 pi-ai 调用（不经过本仓库任何代码）得到同样的 401，所以**不是 adapter 或 E2E 的问题**，是本机配置的 key 已失效（另有 `~/.dsh` 之外的其他工具配置未清点，未使用）。已经可以确认的是：请求构造、真实 HTTPS 往返、失败映射、Core 的 3 次重试、以及 E2E 自己的断言链都在真实端点上跑通了（turn 以 `error` 闭合，错误原文保留）。**一次成功的真实补全从未发生过**，因此 Phase 1 = PARTIAL：SPEC §10 的「真实 LLM + Calculator Tool → 42」闭环没有任何一次通过记录。
+2026-09-28 在本机运行（`deepseek/deepseek-flash`，`https://api.deepseek.com`，OpenAI-compatible）：两个用例（纯文本 smoke、真实模型 + calculator 往返）都真的发出了请求，端点返回 `401 Authentication Fails`，并回显了被 provider 自己掩码的 key 片段（不在本文档复制）。同一凭据直接用 pi-ai 调用（不经过本仓库任何代码）得到同样的 401，所以**不是 adapter 或 E2E 的问题**，是本机配置的 key 已失效（未使用其他工具的凭据）。已经可以确认的是：请求构造、真实 HTTPS 往返、失败映射、Core 的 3 次重试都执行到了 —— E2E 的断言链也因此执行到了失败点（`reason` 是 `error` 而不是 `completed`）。**一次成功的真实补全从未发生过**，因此 Phase 1 = PARTIAL：SPEC §10 的「真实 LLM + Calculator Tool → 42」闭环没有任何一次通过记录。
 
 ---
 
@@ -276,9 +273,10 @@ DEEPSEEK_API_KEY=... npx vitest run packages/agent-core/tests/real-provider.e2e.
 
 ### 阻塞 Phase 1 完成的一项
 
-- **一次成功的真实补全**：用有效凭据（`DEEPSEEK_API_KEY` 或 `E2E_PROVIDER` / `E2E_MODEL` 指向别的 provider）跑
-  `npx vitest run packages/agent-core/tests/real-provider.e2e.test.ts`。两个用例都必须绿：
+- **一次成功的真实补全**：用有效凭据跑
+  `DEEPSEEK_API_KEY=... npx vitest run packages/agent-core/tests/real-provider.e2e.test.ts`。两个用例都必须绿：
   纯文本 smoke，以及「真实模型 → `calculator({a,b})` → `42`」的 DoD 闭环。在此之前 Phase 1 = **PARTIAL**，不进入 Phase 2。
+  注意：跳过闸门只看 `DEEPSEEK_API_KEY`，而且这同一个值被当作 request credential 传给 adapter —— 所以**即使要用 `E2E_PROVIDER` / `E2E_MODEL` 指向别的 provider，key 也必须放进 `DEEPSEEK_API_KEY`**，否则用例会静默 skip（看起来像「没运行」）。
   首次运行时若失败，先分清三类原因：adapter/协议问题、模型没按 `description` 调用工具（可能要给 system prompt 或改 description）、以及 provider 侧的模型 id / 限流。
 
 ### Later
