@@ -308,8 +308,17 @@ function toolResultContent(result: ToolExecutionResult): string {
   if (typeof result.value === "string") return result.value;
 
   try {
-    return JSON.stringify(result.value) ?? String(result.value);
+    return JSON.stringify(result.value, bigintAsString) ?? String(result.value);
   } catch {
     return "<unserializable tool result>";
   }
+}
+
+/**
+ * `JSON.stringify(1n)` throws, so without this a tool that counted in bigints
+ * would have its *successful* result rendered as an unserializable failure. A
+ * bigint travels as its decimal text, which is also the only shape JSON has for it.
+ */
+function bigintAsString(_key: string, value: unknown): unknown {
+  return typeof value === "bigint" ? value.toString() : value;
 }

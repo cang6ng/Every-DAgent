@@ -207,6 +207,10 @@ describe("AgentLoop tool result rendering", () => {
 
     const cases: readonly { readonly name: string; readonly output: unknown; readonly content: string }[] = [
       { name: "object", output: { ok: 1 }, content: '{"ok":1}' },
+      // JSON has no notation for a bigint: without the replacer a successful result
+      // would be rendered as an unserializable failure.
+      { name: "bigint", output: { total: 10n }, content: '{"total":"10"}' },
+      { name: "bigint-only", output: 10n, content: '"10"' },
       { name: "unserializable", output: circular, content: "<unserializable tool result>" },
     ];
 

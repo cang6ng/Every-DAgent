@@ -5,8 +5,9 @@
   "type": "module",
   "description": "Every-DAgent — extensible personal AI agent. Phase 1: minimal single-agent ReAct runtime core.",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19.0"
   },
+  "packageManager": "pnpm@11.8.0",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run"

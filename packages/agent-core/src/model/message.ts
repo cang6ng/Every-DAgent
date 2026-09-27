@@ -2,9 +2,10 @@
  * Provider-neutral conversation content.
  *
  * These shapes are what the Core reasons about; mapping them onto a specific
- * provider's wire format is the ModelClient adapter's job. In particular
- * `role: "tool"` becomes OpenAI's own `tool` role but Anthropic's `user` role
- * carrying `tool_result` blocks — a distinction the Core must not know about.
+ * provider's wire format is the ModelClient adapter's job. A provider that takes
+ * tool results as their own role and one that folds them into the next user turn
+ * are served by the same neutral `role: "tool"` — a distinction the Core must not
+ * know about.
  */
 
 /** A tool invocation requested by the model. */

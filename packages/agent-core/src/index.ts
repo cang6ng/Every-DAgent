@@ -19,6 +19,8 @@ export type { Session } from "./session/session.js";
 
 export type { ModelMessage, ToolCall, ToolResult } from "./model/message.js";
 export type { ModelClient, ModelEvent, ModelRequest, ToolSchema } from "./model/model-client.js";
+export { createPiAiModelClient } from "./model/pi-ai-client.js";
+export type { PiAiModelClientOptions, PiAiStreamSource } from "./model/pi-ai-client.js";
 
 export type { Tool, ToolExecutionResult } from "./tools/tool.js";
 export { createToolRegistry } from "./tools/tool-registry.js";
