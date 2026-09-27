@@ -1,0 +1,9 @@
+{
+  "name": "@every-dagent/agent-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal single-agent ReAct runtime core: runtime / loop / context / tools / session.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts"
+}

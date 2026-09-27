@@ -13,9 +13,5 @@
     "noUncheckedIndexedAccess": false,
     "types": ["node"]
   },
-  "include": ["apps", "plugins", "profiles", "scripts", "tests"],
-  // The React surface is its own project (apps/desktop/tsconfig.json — DOM
-  // lib + jsx). The node suite only pulls in the pure store modules that the
-  // tests import; the reducer chain is DOM-free.
-  "exclude": ["apps/desktop/src"]
+  "include": ["packages"]
 }
