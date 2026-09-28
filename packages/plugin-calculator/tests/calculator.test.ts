@@ -1,8 +1,7 @@
+import type { RuntimeContext, Tool } from "@every-dagent/agent-core";
 import { describe, expect, it } from "vitest";
 
-import type { RuntimeContext } from "../src/runtime/runtime-context.js";
-import { createCalculatorTool } from "../src/tools/calculator.js";
-import type { Tool } from "../src/tools/tool.js";
+import { createCalculatorTool } from "../src/index.js";
 
 const context: RuntimeContext = { sessionId: "s-1", signal: new AbortController().signal };
 

@@ -1,4 +1,4 @@
-import type { Tool } from "./tool.js";
+import type { Tool } from "@every-dagent/agent-core";
 
 export interface CalculatorInput {
   readonly a: number;
@@ -6,13 +6,14 @@ export interface CalculatorInput {
 }
 
 /**
- * Phase 1's one real tool: it multiplies two numbers.
+ * The plugin system's one real tool: it multiplies two numbers.
  *
- * It is production code rather than a fixture, because the phase's acceptance is a
- * real model calling a real tool, and it is deliberately narrow: `inputSchema` is
- * what the model sees when deciding to call it, and a wrong argument set is thrown
- * rather than tolerated — the registry turns a throw into an observation, which is
- * what gives the model a chance to correct itself.
+ * It is production code rather than a fixture, because the acceptance path is a
+ * real model calling a tool that a plugin registered, and it is deliberately
+ * narrow: `inputSchema` is what the model sees when deciding to call it, and a
+ * wrong argument set is thrown rather than tolerated — the registry turns a
+ * throw into an observation, which is what gives the model a chance to correct
+ * itself.
  */
 export function createCalculatorTool(): Tool<CalculatorInput, number> {
   return {

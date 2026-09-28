@@ -10,13 +10,13 @@ import { describe, expect, it } from "vitest";
 import {
   createAgentLoop,
   createAgentRuntime,
-  createCalculatorTool,
   createDefaultContextBuilder,
   createSession,
   createToolRegistry,
 } from "@every-dagent/agent-core";
 import type { AgentRuntime } from "@every-dagent/agent-core";
 import { createPiAiModelClient } from "@every-dagent/model-pi-ai";
+import { createCalculatorTool } from "@every-dagent/plugin-calculator";
 
 import { unsettledToolCalls } from "../helpers/session-lifecycle.js";
 

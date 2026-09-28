@@ -16,6 +16,8 @@
     "@earendil-works/pi-ai": "0.87.1",
     "@every-dagent/agent-core": "workspace:*",
     "@every-dagent/model-pi-ai": "workspace:*",
+    "@every-dagent/plugin-calculator": "workspace:*",
+    "@every-dagent/plugin-system": "workspace:*",
     "@types/node": "^24.0.0",
     "typescript": "^5.8.0",
     "vitest": "^3.2.0"

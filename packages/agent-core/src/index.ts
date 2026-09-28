@@ -25,7 +25,6 @@ export type { ModelClient, ModelEvent, ModelRequest, ToolSchema } from "./model/
 export type { Tool, ToolExecutionResult } from "./tools/tool.js";
 export { createToolRegistry } from "./tools/tool-registry.js";
 export type { ToolRegistry } from "./tools/tool-registry.js";
-export { createCalculatorTool } from "./tools/calculator.js";
 
 export { createDefaultContextBuilder } from "./context/context-builder.js";
 export type { ContextBuilder, ContextBuilderInput } from "./context/context-builder.js";

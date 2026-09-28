@@ -17,6 +17,12 @@ importers:
       '@every-dagent/model-pi-ai':
         specifier: workspace:*
         version: link:packages/model-pi-ai
+      '@every-dagent/plugin-calculator':
+        specifier: workspace:*
+        version: link:packages/plugin-calculator
+      '@every-dagent/plugin-system':
+        specifier: workspace:*
+        version: link:packages/plugin-system
       '@types/node':
         specifier: ^24.0.0
         version: 24.19.0
@@ -37,6 +43,15 @@ importers:
       '@every-dagent/agent-core':
         specifier: workspace:*
         version: link:../agent-core
+
+  packages/plugin-calculator:
+    dependencies:
+      '@every-dagent/agent-core':
+        specifier: workspace:*
+        version: link:../agent-core
+      '@every-dagent/plugin-system':
+        specifier: workspace:*
+        version: link:../plugin-system
 
   packages/plugin-system:
     dependencies:

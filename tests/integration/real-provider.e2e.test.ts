@@ -4,12 +4,12 @@ import { describe, expect, it } from "vitest";
 import {
   createAgentLoop,
   createAgentRuntime,
-  createCalculatorTool,
   createDefaultContextBuilder,
   createSession,
   createToolRegistry,
 } from "@every-dagent/agent-core";
 import { createPiAiModelClient } from "@every-dagent/model-pi-ai";
+import { createCalculatorTool } from "@every-dagent/plugin-calculator";
 
 /**
  * One turn against a real provider over the network, through pi-ai.
