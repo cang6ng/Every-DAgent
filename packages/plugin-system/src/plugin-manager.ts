@@ -115,28 +115,29 @@ export function createPluginManager(options: PluginManagerOptions): PluginManage
   /**
    * Applies the permission policy for one activation. Everything a plugin
    * declared must also be granted by the host and backed by a host
-   * implementation; anything less is refused before `activate` runs.
+   * implementation; anything less is refused before `activate` runs, and a
+   * plugin that declared nothing gets nothing.
    */
-  function resolveCapabilities(entry: Entry): PluginCapabilities {
+  function resolveCapabilities(entry: Entry, scope: ActivationScope): PluginCapabilities {
     const declared = entry.manifest.permissions ?? NO_PERMISSIONS;
 
-    if (declared.includes("storage")) {
-      if (!entry.granted.includes("storage")) {
-        throw new Error(
-          `plugin "${entry.manifest.id}" declares storage but the host has not granted it`,
-        );
-      }
-      if (storageFactory === undefined) {
-        throw new Error(
-          `plugin "${entry.manifest.id}" was granted storage but the host provides no storage implementation`,
-        );
-      }
+    if (!declared.includes("storage")) {
+      return {};
+    }
+    if (!entry.granted.includes("storage")) {
       throw new Error(
-        `plugin "${entry.manifest.id}" cannot be enabled: the storage capability is not implemented yet`,
+        `plugin "${entry.manifest.id}" declares storage but the host has not granted it`,
+      );
+    }
+    if (storageFactory === undefined) {
+      throw new Error(
+        `plugin "${entry.manifest.id}" was granted storage but the host provides no storage implementation`,
       );
     }
 
-    return {};
+    // Obtained before `activate` runs: a factory failure stays a permissions
+    // failure and never leaves a half-activated plugin behind.
+    return { storage: scope.bindStorage(storageFactory(entry.manifest.id)) };
   }
 
   function createContext(
@@ -245,7 +246,7 @@ export function createPluginManager(options: PluginManagerOptions): PluginManage
     let phase: PluginFailure["phase"] = "permissions";
 
     try {
-      const capabilities = resolveCapabilities(entry);
+      const capabilities = resolveCapabilities(entry, scope);
       phase = "activate";
       const activation = entry.plugin.activate(createContext(entry, scope, capabilities));
       if (isPromiseLike(activation)) {

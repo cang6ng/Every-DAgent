@@ -3,7 +3,8 @@ import type { Tool } from "@every-dagent/agent-core";
 import { describe, expect, it } from "vitest";
 
 import { PluginBusyError, createPluginManager } from "../src/index.js";
-import type { Plugin, PluginContext } from "../src/index.js";
+import type { Plugin, PluginContext, PluginStorage } from "../src/index.js";
+import { createMemoryStorage } from "./helpers/memory-storage.js";
 
 interface Deferred {
   readonly promise: Promise<void>;
@@ -499,5 +500,124 @@ describe("sealed registration entry points", () => {
       "tools.register is sealed: this activation already finished",
     ]);
     expect(registry.list()).toEqual([]);
+  });
+});
+
+describe("storage handle lifetime", () => {
+  function storagePlugin(
+    id: string,
+    activate?: (context: PluginContext) => void | Promise<void>,
+  ): { readonly plugin: Plugin; readonly handles: PluginStorage[] } {
+    const handles: PluginStorage[] = [];
+    return {
+      handles,
+      plugin: {
+        manifest: { id, name: "Demo", version: "0.1.0", permissions: ["storage"] },
+        activate: (context) => {
+          handles.push(context.capabilities.storage as PluginStorage);
+          return activate?.(context);
+        },
+      },
+    };
+  }
+
+  function storageManager(
+    registry: ReturnType<typeof createToolRegistry>,
+    storage: ReturnType<typeof createMemoryStorage>,
+  ) {
+    return createPluginManager({
+      tools: registry,
+      grants: { demo: ["storage"] },
+      storage: storage.view,
+    });
+  }
+
+  it("keeps the handle usable while cleanup runs", async () => {
+    const storage = createMemoryStorage();
+    const registry = createToolRegistry();
+    const manager = storageManager(registry, storage);
+    const observed: (string | undefined)[] = [];
+    const { plugin } = storagePlugin("demo", (context) => {
+      context.onDispose(async () => {
+        await context.capabilities.storage?.set("closed", "yes");
+        observed.push(await context.capabilities.storage?.get("closed"));
+      });
+    });
+    manager.register(plugin);
+
+    await manager.enable("demo");
+    await manager.disable("demo");
+
+    expect(observed).toEqual(["yes"]);
+    expect(storage.entries("demo").get("closed")).toBe("yes");
+  });
+
+  it("rejects every method of a stale handle once cleanup has finished", async () => {
+    const storage = createMemoryStorage();
+    const registry = createToolRegistry();
+    const manager = storageManager(registry, storage);
+    const { plugin, handles } = storagePlugin("demo");
+    manager.register(plugin);
+
+    await manager.enable("demo");
+    const handle = handles[0] as PluginStorage;
+    await handle.set("key", "value");
+    await manager.disable("demo");
+
+    await expect(handle.get("key")).rejects.toThrow(/no longer valid/);
+    await expect(handle.set("key", "other")).rejects.toThrow(/no longer valid/);
+    await expect(handle.delete("key")).rejects.toThrow(/no longer valid/);
+    expect(storage.entries("demo").get("key")).toBe("value");
+  });
+
+  it("hands out a fresh handle on re-enable and keeps the old one invalid", async () => {
+    const storage = createMemoryStorage();
+    const registry = createToolRegistry();
+    const manager = storageManager(registry, storage);
+    const { plugin, handles } = storagePlugin("demo");
+    manager.register(plugin);
+
+    await manager.enable("demo");
+    const first = handles[0] as PluginStorage;
+    await first.set("key", "value");
+    await manager.disable("demo");
+    await manager.enable("demo");
+    const second = handles[1] as PluginStorage;
+
+    expect(second).not.toBe(first);
+    await expect(first.get("key")).rejects.toThrow(/no longer valid/);
+    expect(await second.get("key")).toBe("value");
+  });
+
+  it("rejects a stale handle after a failed activation", async () => {
+    const storage = createMemoryStorage();
+    const registry = createToolRegistry();
+    const manager = storageManager(registry, storage);
+    const { plugin, handles } = storagePlugin("demo", () => {
+      throw new Error("activate boom");
+    });
+    manager.register(plugin);
+
+    await expect(manager.enable("demo")).rejects.toThrow("activate boom");
+
+    await expect((handles[0] as PluginStorage).get("key")).rejects.toThrow(/no longer valid/);
+  });
+
+  it("rejects a stale handle after a cleanup failure", async () => {
+    const storage = createMemoryStorage();
+    const registry = createToolRegistry();
+    const manager = storageManager(registry, storage);
+    const { plugin, handles } = storagePlugin("demo", (context) => {
+      context.onDispose(() => {
+        throw new Error("dispose boom");
+      });
+    });
+    manager.register(plugin);
+
+    await manager.enable("demo");
+    await expect(manager.disable("demo")).rejects.toThrow(/cleanup failed/);
+
+    expect(manager.get("demo")?.status).toBe("error");
+    await expect((handles[0] as PluginStorage).get("key")).rejects.toThrow(/no longer valid/);
   });
 });
