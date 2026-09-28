@@ -173,6 +173,67 @@ describe("busy rejection", () => {
     expect(manager.get("demo")).toBeUndefined();
   });
 
+  it("goes from disabling to missing without a disabled window to re-enter", async () => {
+    const release = deferred();
+    const registry = createToolRegistry();
+    const manager = createPluginManager({ tools: registry });
+    const statuses: string[] = [];
+    const reentries: Promise<string>[] = [];
+    let cleanups = 0;
+
+    manager.register(
+      pluginFrom("demo", (context) => {
+        context.tools.register(toolFrom("demo-tool"));
+        context.onDispose(async () => {
+          cleanups += 1;
+          await release.promise;
+        });
+      }),
+    );
+    await manager.enable("demo");
+
+    // One probe per microtask round, re-queued from inside the chain: it runs
+    // between the manager's own continuations instead of ahead of all of them,
+    // so every boundary up to the deletion is actually observed.
+    const probe = (roundsLeft: number): void => {
+      statuses.push(manager.get("demo")?.status ?? "missing");
+      reentries.push(
+        manager.enable("demo").then(
+          () => "enabled",
+          (error: unknown) => (error instanceof PluginBusyError ? "busy" : "rejected"),
+        ),
+      );
+      if (roundsLeft > 0 && manager.get("demo") !== undefined) {
+        queueMicrotask(() => probe(roundsLeft - 1));
+      }
+    };
+    queueMicrotask(() => probe(50));
+
+    const unregistering = manager.unregister("demo");
+    expect(manager.get("demo")?.status).toBe("disabling");
+
+    release.resolve();
+    await unregistering;
+
+    // The record is never disabled on the way out, and the probes observed it
+    // gone while the chain was still running.
+    expect(statuses[0]).toBe("disabling");
+    expect(statuses).toContain("missing");
+    expect(statuses).not.toContain("disabled");
+    const firstMissing = statuses.indexOf("missing");
+    expect(new Set(statuses.slice(firstMissing))).toEqual(new Set(["missing"]));
+
+    // No re-entry succeeded at any observed boundary.
+    const outcomes = await Promise.all(reentries);
+    expect(outcomes.length).toBeGreaterThan(1);
+    expect(outcomes[0]).toBe("busy");
+    expect(outcomes.every((outcome) => outcome !== "enabled")).toBe(true);
+
+    expect(cleanups).toBe(1);
+    expect(manager.get("demo")).toBeUndefined();
+    expect(registry.list()).toEqual([]);
+  });
+
   it("lets two plugins activate independently", async () => {
     const first = deferred();
     const second = deferred();
@@ -473,6 +534,73 @@ describe("cleanup", () => {
     expect(pluginCleanup).toBe(true);
     expect(manager.get("demo")?.lastFailure?.cleanupErrors).toEqual(["tool disposer boom"]);
   });
+
+  it("attempts every cleanup callback and records every failure in cleanup order", async () => {
+    const registry = createToolRegistry();
+    const manager = createPluginManager({ tools: registry });
+    const order: string[] = [];
+
+    manager.register(
+      pluginFrom("demo", (context) => {
+        context.onDispose(() => {
+          order.push("first");
+          throw new Error("first boom");
+        });
+        context.onDispose(async () => {
+          order.push("second");
+          throw new Error("second boom");
+        });
+        context.onDispose(() => {
+          order.push("third");
+          throw new Error("third boom");
+        });
+      }),
+    );
+
+    await manager.enable("demo");
+    await expect(manager.disable("demo")).rejects.toThrow(/cleanup failed/);
+
+    const info = manager.get("demo");
+    expect(order).toEqual(["third", "second", "first"]);
+    expect(info?.status).toBe("error");
+    expect(info?.lastFailure).toEqual({
+      operation: "disable",
+      phase: "dispose",
+      message: 'cleanup failed for plugin "demo"',
+      cleanupErrors: ["third boom", "second boom", "first boom"],
+    });
+  });
+
+  it("keeps the original activation failure apart from every cleanup failure", async () => {
+    const registry = createToolRegistry();
+    const manager = createPluginManager({ tools: registry });
+    const unprintable = Object.create(null) as object;
+
+    manager.register(
+      pluginFrom("demo", (context) => {
+        context.onDispose(() => {
+          throw new Error("first dispose boom");
+        });
+        context.onDispose(() => {
+          // A throw nothing can stringify: it must neither stop the first
+          // disposer from running nor replace the activation failure.
+          throw unprintable;
+        });
+        throw new Error("activate boom");
+      }),
+    );
+
+    await expect(manager.enable("demo")).rejects.toThrow("activate boom");
+
+    const info = manager.get("demo");
+    expect(info?.status).toBe("error");
+    expect(info?.lastFailure).toEqual({
+      operation: "enable",
+      phase: "activate",
+      message: "activate boom",
+      cleanupErrors: ["<unprintable thrown value>", "first dispose boom"],
+    });
+  });
 });
 
 describe("sealed registration entry points", () => {
@@ -530,6 +658,52 @@ describe("sealed registration entry points", () => {
     expect(manager.get("demo")?.lastFailure?.cleanupErrors).toEqual([
       "tools.register is sealed: this activation already finished",
     ]);
+    expect(registry.list()).toEqual([]);
+  });
+
+  it("seals a synchronous activation before the microtask it queued", async () => {
+    const registry = createToolRegistry();
+    const manager = createPluginManager({ tools: registry });
+    const lateErrors: unknown[] = [];
+    let lateDisposeRan = false;
+    let context: PluginContext | undefined;
+
+    manager.register(
+      pluginFrom("demo", (ctx) => {
+        context = ctx;
+        ctx.tools.register(toolFrom("staged-tool"));
+        // A synchronous activation gets no extra microtask to register in: the
+        // manager seals as soon as activate returns.
+        queueMicrotask(() => {
+          try {
+            (context as PluginContext).tools.register(toolFrom("late-tool"));
+          } catch (error) {
+            lateErrors.push(error);
+          }
+          try {
+            (context as PluginContext).onDispose(() => {
+              lateDisposeRan = true;
+            });
+          } catch (error) {
+            lateErrors.push(error);
+          }
+        });
+      }),
+    );
+
+    await manager.enable("demo");
+
+    expect(lateErrors).toHaveLength(2);
+    expect((lateErrors[0] as Error).message).toMatch(/tools\.register is sealed/);
+    expect((lateErrors[1] as Error).message).toMatch(/onDispose is sealed/);
+    // The late tool never reached staging, let alone the registry.
+    expect(registry.list().map((tool) => tool.name)).toEqual(["staged-tool"]);
+
+    await manager.disable("demo");
+
+    // The late disposer never reached the cleanup stack either.
+    expect(lateDisposeRan).toBe(false);
+    expect(manager.get("demo")?.lastFailure).toBeUndefined();
     expect(registry.list()).toEqual([]);
   });
 });
