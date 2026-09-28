@@ -1,0 +1,12 @@
+{
+  "name": "@every-dagent/plugin-system",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "In-process plugin contracts and lifecycle manager: manifest / permissions / scoped tools.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@every-dagent/agent-core": "workspace:*"
+  }
+}

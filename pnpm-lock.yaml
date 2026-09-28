@@ -38,6 +38,12 @@ importers:
         specifier: workspace:*
         version: link:../agent-core
 
+  packages/plugin-system:
+    dependencies:
+      '@every-dagent/agent-core':
+        specifier: workspace:*
+        version: link:../agent-core
+
 packages:
 
   '@anthropic-ai/sdk@0.124.0':
