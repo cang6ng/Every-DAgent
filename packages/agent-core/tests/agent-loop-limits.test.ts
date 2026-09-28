@@ -16,7 +16,7 @@ import {
   failingReply,
   replyThenFail,
 } from "./helpers/fake-model-client.js";
-import { unsettledToolCalls } from "./helpers/session-lifecycle.js";
+import { unsettledToolCalls } from "../../../tests/helpers/session-lifecycle.js";
 
 const TURN = "turn-1";
 const context: RuntimeContext = { sessionId: "session-1", signal: new AbortController().signal };

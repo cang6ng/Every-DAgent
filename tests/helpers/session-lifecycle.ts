@@ -1,4 +1,4 @@
-import type { Session } from "../../src/session/session.js";
+import type { Session } from "@every-dagent/agent-core";
 
 /**
  * Tool calls the log records as requested but never settles, and results that were

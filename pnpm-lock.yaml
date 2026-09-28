@@ -8,6 +8,15 @@ importers:
 
   .:
     devDependencies:
+      '@earendil-works/pi-ai':
+        specifier: 0.87.1
+        version: 0.87.1(ws@8.22.0)
+      '@every-dagent/agent-core':
+        specifier: workspace:*
+        version: link:packages/agent-core
+      '@every-dagent/model-pi-ai':
+        specifier: workspace:*
+        version: link:packages/model-pi-ai
       '@types/node':
         specifier: ^24.0.0
         version: 24.19.0
@@ -18,11 +27,16 @@ importers:
         specifier: ^3.2.0
         version: 3.2.7(@types/node@24.19.0)
 
-  packages/agent-core:
+  packages/agent-core: {}
+
+  packages/model-pi-ai:
     dependencies:
       '@earendil-works/pi-ai':
         specifier: 0.87.1
         version: 0.87.1(ws@8.22.0)
+      '@every-dagent/agent-core':
+        specifier: workspace:*
+        version: link:../agent-core
 
 packages:
 

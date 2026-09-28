@@ -13,5 +13,5 @@
     "noUncheckedIndexedAccess": false,
     "types": ["node"]
   },
-  "include": ["packages"]
+  "include": ["packages", "tests"]
 }

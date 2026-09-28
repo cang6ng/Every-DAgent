@@ -16,17 +16,22 @@ import { stream as openAiCompletionsStream } from "@earendil-works/pi-ai/api/ope
 import { stream as anthropicMessagesStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { describe, expect, it } from "vitest";
 
-import { createDefaultContextBuilder } from "../src/context/context-builder.js";
-import { createAgentLoop } from "../src/loop/agent-loop.js";
-import { createPiAiModelClient } from "../src/model/pi-ai-client.js";
-import type { PiAiStreamSource } from "../src/model/pi-ai-client.js";
-import { createAgentRuntime } from "../src/runtime/agent-runtime.js";
-import type { AgentRuntime } from "../src/runtime/agent-runtime.js";
-import type { RuntimeEvent } from "../src/runtime/runtime-event.js";
-import { createSession } from "../src/session/session.js";
-import { createToolRegistry } from "../src/tools/tool-registry.js";
-import type { ToolRegistry } from "../src/tools/tool-registry.js";
-import type { Tool } from "../src/tools/tool.js";
+import type {
+  AgentRuntime,
+  RuntimeEvent,
+  Tool,
+  ToolRegistry,
+} from "@every-dagent/agent-core";
+import {
+  createAgentLoop,
+  createAgentRuntime,
+  createDefaultContextBuilder,
+  createSession,
+  createToolRegistry,
+} from "@every-dagent/agent-core";
+
+import { createPiAiModelClient } from "../src/pi-ai-client.js";
+import type { PiAiStreamSource } from "../src/pi-ai-client.js";
 import { TEST_MODEL } from "./helpers/fake-pi-ai-stream.js";
 
 const SYSTEM_PROMPT = "You are a calculator.";

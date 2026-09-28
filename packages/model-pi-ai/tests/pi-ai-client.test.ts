@@ -2,9 +2,9 @@ import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-work
 import type { AssistantMessageEvent, JsonObject } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
-import { createPiAiModelClient } from "../src/model/pi-ai-client.js";
-import type { ModelClient, ModelEvent, ModelRequest } from "../src/model/model-client.js";
-import type { RuntimeContext } from "../src/runtime/runtime-context.js";
+import type { ModelClient, ModelEvent, ModelRequest, RuntimeContext } from "@every-dagent/agent-core";
+
+import { createPiAiModelClient } from "../src/pi-ai-client.js";
 import {
   abortedScript,
   createScriptedPiAiStream,

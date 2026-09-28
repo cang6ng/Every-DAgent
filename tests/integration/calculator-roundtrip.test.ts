@@ -7,20 +7,20 @@ import {
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
-import { createDefaultContextBuilder } from "../src/context/context-builder.js";
-import { createAgentLoop } from "../src/loop/agent-loop.js";
-import { createPiAiModelClient } from "../src/model/pi-ai-client.js";
-import { createAgentRuntime } from "../src/runtime/agent-runtime.js";
-import type { AgentRuntime } from "../src/runtime/agent-runtime.js";
-import type { RuntimeContext } from "../src/runtime/runtime-context.js";
-import { createSession } from "../src/session/session.js";
-import { createCalculatorTool } from "../src/tools/calculator.js";
-import type { Tool } from "../src/tools/tool.js";
-import { createToolRegistry } from "../src/tools/tool-registry.js";
-import { unsettledToolCalls } from "./helpers/session-lifecycle.js";
+import {
+  createAgentLoop,
+  createAgentRuntime,
+  createCalculatorTool,
+  createDefaultContextBuilder,
+  createSession,
+  createToolRegistry,
+} from "@every-dagent/agent-core";
+import type { AgentRuntime } from "@every-dagent/agent-core";
+import { createPiAiModelClient } from "@every-dagent/model-pi-ai";
+
+import { unsettledToolCalls } from "../helpers/session-lifecycle.js";
 
 const SYSTEM_PROMPT = "You are a calculator. Use the calculator tool for arithmetic.";
-const context: RuntimeContext = { sessionId: "s-1", signal: new AbortController().signal };
 
 /** The real pi-ai registry with a scripted provider, wired to the real Core. */
 function fauxCalculatorRuntime(responses: AssistantMessage[]): {
@@ -46,45 +46,6 @@ function fauxCalculatorRuntime(responses: AssistantMessage[]): {
     }),
   };
 }
-
-describe("calculator tool", () => {
-  it("multiplies the numbers it is asked for", async () => {
-    const tool: Tool = createCalculatorTool();
-
-    await expect(tool.execute({ a: 21, b: 2 }, context)).resolves.toBe(42);
-    // A second product, so the test pins multiplication rather than "42 for {21, 2}".
-    await expect(tool.execute({ a: 5, b: 6 }, context)).resolves.toBe(30);
-  });
-
-  it("throws on anything that is not two numbers", async () => {
-    const tool: Tool = createCalculatorTool();
-
-    // Throwing is the contract for bad input: the registry turns it into an
-    // observation instead of an exception.
-    await expect(tool.execute({ a: "21", b: 2 }, context)).rejects.toThrow(
-      /expects \{ a: number, b: number \}/,
-    );
-  });
-
-  it("refuses a product it cannot hand the model as a number", async () => {
-    const tool: Tool = createCalculatorTool();
-
-    // JSON cannot represent an infinite number; a "successful" result of null would be
-    // worse than a failure the model can see.
-    await expect(tool.execute({ a: 1e308, b: 10 }, context)).rejects.toThrow(/not a finite number/);
-  });
-
-  it("declares the arguments the model has to send", () => {
-    const tool = createCalculatorTool();
-
-    expect(tool.name).toBe("calculator");
-    expect(tool.inputSchema).toMatchObject({
-      type: "object",
-      properties: { a: { type: "number" }, b: { type: "number" } },
-      required: ["a", "b"],
-    });
-  });
-});
 
 describe("calculator round trip with the faux provider (no real model)", () => {
   it("answers what the DoD asks for: 21 x 2 through a tool call", async () => {

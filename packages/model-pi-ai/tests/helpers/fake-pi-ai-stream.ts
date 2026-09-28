@@ -8,7 +8,7 @@ import type {
   StreamOptions,
 } from "@earendil-works/pi-ai";
 
-import type { PiAiStreamSource } from "../../src/model/pi-ai-client.js";
+import type { PiAiStreamSource } from "../../src/pi-ai-client.js";
 
 /**
  * A complete pi-ai `Model` for tests. The adapter only passes its metadata through

@@ -13,9 +13,15 @@ import type {
   Usage,
 } from "@earendil-works/pi-ai";
 
-import type { RuntimeContext } from "../runtime/runtime-context.js";
-import type { ModelMessage, ToolCall } from "./message.js";
-import type { ModelClient, ModelEvent, ModelRequest, ToolSchema } from "./model-client.js";
+import type {
+  ModelClient,
+  ModelEvent,
+  ModelMessage,
+  ModelRequest,
+  RuntimeContext,
+  ToolCall,
+  ToolSchema,
+} from "@every-dagent/agent-core";
 
 /**
  * The slice of pi-ai's model registry this adapter calls: one streaming request.

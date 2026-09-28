@@ -10,7 +10,7 @@ import { createMemorySessionStore } from "../src/session/session-store.js";
 import { createToolRegistry } from "../src/tools/tool-registry.js";
 import { createEchoTool } from "./helpers/fake-echo-tool.js";
 import { createFakeModelClient } from "./helpers/fake-model-client.js";
-import { unsettledToolCalls } from "./helpers/session-lifecycle.js";
+import { unsettledToolCalls } from "../../../tests/helpers/session-lifecycle.js";
 
 function answerReply(text: string): ModelEvent[] {
   return [{ type: "text-delta", text }, { type: "done" }];

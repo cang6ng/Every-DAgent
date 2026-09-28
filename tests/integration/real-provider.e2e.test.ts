@@ -1,13 +1,15 @@
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { describe, expect, it } from "vitest";
 
-import { createDefaultContextBuilder } from "../src/context/context-builder.js";
-import { createAgentLoop } from "../src/loop/agent-loop.js";
-import { createPiAiModelClient } from "../src/model/pi-ai-client.js";
-import { createAgentRuntime } from "../src/runtime/agent-runtime.js";
-import { createSession } from "../src/session/session.js";
-import { createCalculatorTool } from "../src/tools/calculator.js";
-import { createToolRegistry } from "../src/tools/tool-registry.js";
+import {
+  createAgentLoop,
+  createAgentRuntime,
+  createCalculatorTool,
+  createDefaultContextBuilder,
+  createSession,
+  createToolRegistry,
+} from "@every-dagent/agent-core";
+import { createPiAiModelClient } from "@every-dagent/model-pi-ai";
 
 /**
  * One turn against a real provider over the network, through pi-ai.
