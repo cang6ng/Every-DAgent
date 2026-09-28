@@ -142,6 +142,37 @@ describe("busy rejection", () => {
     }
   });
 
+  it("is busy while an unregister is in flight and leaves no reopenable window", async () => {
+    const gate = deferred();
+    const registry = createToolRegistry();
+    const manager = createPluginManager({ tools: registry });
+    let cleanups = 0;
+
+    manager.register(
+      pluginFrom("demo", (context) => {
+        context.tools.register(toolFrom("demo-tool"));
+        context.onDispose(async () => {
+          cleanups += 1;
+          await gate.promise;
+        });
+      }),
+    );
+    await manager.enable("demo");
+
+    const unregistering = manager.unregister("demo");
+
+    expect(manager.get("demo")?.status).toBe("disabling");
+    expect(registry.list()).toEqual([]);
+    await expect(manager.enable("demo")).rejects.toBeInstanceOf(PluginBusyError);
+    await expect(manager.unregister("demo")).rejects.toBeInstanceOf(PluginBusyError);
+
+    gate.resolve();
+    await unregistering;
+
+    expect(cleanups).toBe(1);
+    expect(manager.get("demo")).toBeUndefined();
+  });
+
   it("lets two plugins activate independently", async () => {
     const first = deferred();
     const second = deferred();
