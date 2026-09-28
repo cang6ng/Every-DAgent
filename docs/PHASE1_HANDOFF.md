@@ -14,21 +14,22 @@
 | Branch | `rewrite/runtime-lite` |
 | Code baseline | `b26c69eab3e31f9e855e7cd80f064dd57b814a1f` — `fix(core): keep recorded tool calls out of the caller's array` |
 | Remote | `origin/rewrite/runtime-lite`；code baseline 已 push |
-| 当前 milestone | P1.5 ✅ 代码已完成、已提交（含 final audit 的修复） |
-| **Phase 1 状态** | **PARTIAL** —— 唯一未满足项是**一次成功的真实补全**（§7） |
-| 下一个 milestone | 先用有效凭据跑通真实 E2E；之后才是 Phase 2 Plugin Contract + PluginManager |
-| Tests | **130 passed / 2 skipped / 15 files**（`pnpm test`；2 个 skipped 是真实 provider 用例，见 §7） |
+| 当前 milestone | P1.5 ✅ 已完成、已提交（含 final audit 的修复） |
+| **Phase 1 状态** | **COMPLETE** ✅ —— 代码、自动化测试与真实 provider E2E 全部通过（§7） |
+| 下一个 milestone | Phase 2 Plugin Contract + PluginManager（开始前先讨论 package boundary，见 §10） |
+| Tests | **130 passed / 2 skipped / 15 files**（`pnpm test`；2 个是真实 provider 用例，无凭据时 skip——有凭据时同样通过，见 §7） |
 | Typecheck | **0 错**（`pnpm typecheck`） |
 | Production LOC | `packages/agent-core/src/` 16 文件 / **1595 行**（含注释；去空行与整行注释后 945 行）—— 按含注释口径略过 SPEC §11 的 ~1500 目标，有效行只有目标的一半，远低于 ~2500 警戒 |
-| Real provider | **未通过**：真实端点可达，但本机凭据被 provider 判为 invalid（§7） |
-| 工作区 | 除 `.zcode/` 与 `.zcodeignore`（untracked，**不得提交**）外，改动均已入库 |
+| Real provider | **PASS**：真实 smoke 与「真实模型 + calculator」E2E 都由人工在有效凭据下跑通（§7） |
+| 工作区 | 除本文档本次封存改动（未提交）与 `.zcode/`、`.zcodeignore`（untracked，**不得提交**）外，改动均已入库 |
 
 ```text
 P1.1 Core Contracts        ✅  b96937d
 P1.2 Minimal ReAct Loop    ✅  c24fe68
 P1.3 Runtime Engineering   ✅  aece33e
 P1.4 Real LLM              ✅  b193d51
-P1.5 Persistence + E2E     ✅  42fdec9 + b26c69e  ← code baseline（代码完成；真实 E2E 待凭据）
+P1.5 Persistence + E2E     ✅  42fdec9 + b26c69e  ← code baseline
+Phase 1                    ✅  COMPLETE
 ```
 
 仓库形态：pnpm workspace，只有一个包 `packages/agent-core`。**无构建步骤**（`main` 指向 `src/index.ts`）、**无 CI**；运行时唯一依赖是 `@earendil-works/pi-ai@0.87.1`（ESM-only，`engines: node >=22.19`，根 `package.json` 的 engines 与 `packageManager` 已对齐），devDependencies 仅 `typescript` / `vitest` / `@types/node`。**该依赖很重**：连同 `openai`、`@anthropic-ai/sdk`、`@aws-sdk/client-bedrock-runtime`、`@google/genai`、`typebox` 等，生产闭包 80+ 个包（本仓 `.pnpm` 共约 131 MB，其中 pi-ai 生产闭包约 60 MB，其余是 dev 树）。adapter 对 pi-ai 只用 `import type`，所以 **Core 自己的模块图**运行时不会加载其中任何一个（构造 adapter 的宿主当然用的是真 pi-ai）。模块路径导入一律带 `.js` 后缀。
@@ -165,7 +166,7 @@ DoD 链路跑通（User → Model → Tool → Result → Model → Final Answer
 
 46. **恢复与记录是两个入口**：`createSession(id)` 新建，`restoreSession(id, events)` 从已记录的事件重建。理由：`append` 是**分配** `seq` / `time`，restore 是**照搬**它们；一个入口两种含义会让「谁来写这个信封」变得含糊。restore 逐条拒绝 `seq` 不连续或带空洞的日志（拒绝而不是静默重编号），并按 `append` 的方式做浅冻结。
 47. **store 属于宿主，不属于 Core**：`SessionStore` 只被 composition root 调用；Loop / Runtime / ContextBuilder 一行都不依赖它（`AgentRuntimeDeps = { loop }` 保持不变），因此**存储失败不会变成 turn 的结局**。`append(sessionId, events)` 严格 append-only，且**要么整批接受要么整批拒绝**（不会半批入库）；`load` 返回的是副本，往 loaded session 上 append 不会写回 store（宿主自己决定何时 flush）。
-48. **会话日志的隔离边界与 Session 一致**（#11 的推论）：`load` 复制信封与顶层 `data`，但 `toolCalls` 数组 / `ToolCall` / `input` 仍按引用共享。store 不额外深拷贝，因为 Core 的契约就是浅隔离；需要更强保证是 store 实现自己的决定。
+48. **会话日志的隔离边界与 Session 一致**（#11 的推论）：`load` 走 `restoreSession`，因此它重新复制事件信封、重新复制顶层 `data`、重新复制 `message/assistant` 的 `toolCalls` 数组、也重新复制每个 `ToolCall` 对象；**只有 `ToolCall.input` 这类未知嵌套 payload 仍按引用共享，不递归 deep clone、不递归 deepFreeze**。store 不额外做更深的拷贝，因为 Core 的契约就是 structural shallow isolation；需要更强保证是 store 实现自己的决定。
 49. **Phase 1 不做 SQLite**（这是裁决，不是遗漏）：SPEC §5.10 把 SQLite 列为「视进度」且明确「不得阻塞最小 ReAct Core」，而 SPEC §10 的 DoD 十项里没有任何持久化条目 —— seam 由 `MemorySessionStore` 证明。将来要做时：`node:sqlite`（Node ≥22.13 内置、零依赖，本机 v24.17 实测无 ExperimentalWarning 且 `@types/node` 已带类型）；形态是**事件表**（`(session_id, seq)` 主键 + payload），不做 migration 框架 / ORM；并且**不要从 `index.ts` 再导出它**，否则任何消费者一 import 本包就会加载 `node:sqlite`。
 50. **Calculator Tool 是生产代码**（SPEC §9 P1.5 的交付物），不是测试夹具：纯 JSON Schema 字面量（**不引 TypeBox**，那是 pi-ai 的传递依赖）、`execute` 用方法签名（#25）、坏参数抛错走 observation 路径、**乘积非有限也抛错**（JSON 无法表示 `Infinity`，`JSON.stringify` 会给模型一个「成功」的 `null`）。
 51. **假跑与真跑必须区分**：faux provider 的往返只在标题里写明「no real model」的文件里（`calculator-roundtrip.test.ts`）；真实模型的往返只在 `real-provider.e2e.test.ts`，凭据缺失时 skip（不是 pass）。**Fake 永远不能当成 Real LLM E2E 的证据。**
@@ -258,39 +259,36 @@ pnpm test         # vitest run                     → 130 passed, 2 skipped (15
 
 注意：编译期断言（穷尽 switch、`never` 赋值、`Tool<string,number>` 可赋值性）只在 `typecheck` 下生效，`test` 单独跑不覆盖 —— 将来加 CI 必须两条命令都跑。
 
-**Real provider E2E：未通过（凭据被 provider 拒绝）—— 这是 Phase 1 唯一的未满足项**
+**Real provider E2E：PASS** ✅
 
 ```bash
-# 凭据存在时才会真的调用；不存在则 skip（不会假通过）
-DEEPSEEK_API_KEY=... npx vitest run packages/agent-core/tests/real-provider.e2e.test.ts
+# 凭据有效时真的调用；无凭据时这两条用例 skip（不会假通过）
+npx vitest run packages/agent-core/tests/real-provider.e2e.test.ts
 ```
 
-2026-09-28 在本机运行（`deepseek/deepseek-flash`，`https://api.deepseek.com`，OpenAI-compatible）：两个用例（纯文本 smoke、真实模型 + calculator 往返）都真的发出了请求，端点返回 `401 Authentication Fails`，并回显了被 provider 自己掩码的 key 片段（不在本文档复制）。同一凭据直接用 pi-ai 调用（不经过本仓库任何代码）得到同样的 401，所以**不是 adapter 或 E2E 的问题**，是本机配置的 key 已失效（未使用其他工具的凭据）。已经可以确认的是：请求构造、真实 HTTPS 往返、失败映射、Core 的 3 次重试都执行到了 —— E2E 的断言链也因此执行到了失败点（`reason` 是 `error` 而不是 `completed`）。**一次成功的真实补全从未发生过**，因此 Phase 1 = PARTIAL：SPEC §10 的「真实 LLM + Calculator Tool → 42」闭环没有任何一次通过记录。
+2026-09-28 人工在有效凭据下运行通过，两条都 PASS（凭据内容、长度一概不记录）：
+
+1. **plain real-provider smoke** — `deepseek/deepseek-flash`，回答 `42`。
+2. **real model + calculator DoD E2E** — 模型发出 `calculator({"a":21,"b":2})`，tool result `42`，最终回答 `21 * 2 = 42`。
+
+即 SPEC §10 的最终闭环（真实 LLM → tool call → ToolRegistry → CalculatorTool → 42 → 真实 LLM → 最终回答 → `turn/end`）已经**真实跑通一次**。这同时也是 §8 里「真实端点上的 tool-call 往返未验证」那条的关闭证据。
 
 ---
 
 ## 8. Deferred Decisions / Technical Debt
 
-### 阻塞 Phase 1 完成的一项
+以下全部属于 **Phase 2+**，没有一项阻塞 Phase 1（Phase 1 已封存）：
 
-- **一次成功的真实补全**：用有效凭据跑
-  `DEEPSEEK_API_KEY=... npx vitest run packages/agent-core/tests/real-provider.e2e.test.ts`。两个用例都必须绿：
-  纯文本 smoke，以及「真实模型 → `calculator({a,b})` → `42`」的 DoD 闭环。在此之前 Phase 1 = **PARTIAL**，不进入 Phase 2。
-  注意：跳过闸门只看 `DEEPSEEK_API_KEY`，而且这同一个值被当作 request credential 传给 adapter —— 所以**即使要用 `E2E_PROVIDER` / `E2E_MODEL` 指向别的 provider，key 也必须放进 `DEEPSEEK_API_KEY`**，否则用例会静默 skip（看起来像「没运行」）。
-  首次运行时若失败，先分清三类原因：adapter/协议问题、模型没按 `description` 调用工具（可能要给 system prompt 或改 description）、以及 provider 侧的模型 id / 限流。
-
-### Later
-
+- **package boundary / pi-ai 依赖讨论**：`AgentRuntime` / `AgentLoop` / `ModelClient` contract 是 provider-agnostic 的，`PiAiModelClient` 是唯一的 pi-ai-specific adapter。当前问题是**物理 package 边界**：`@every-dagent/agent-core` 仍直接依赖 `@earendil-works/pi-ai`（生产闭包 80+ 包、约 60 MB，含 `openai` / `@anthropic-ai/sdk` / Bedrock / Google SDK）。Phase 2 开始前要讨论是否拆成 `@every-dagent/agent-core` + `@every-dagent/model-pi-ai`，让 core 的依赖面回到零运行时依赖。**本轮不实施拆包。**
 - **SQLite store**：Phase 1 不做（#49）。要做时按 #49 的形态（事件表、无 migration 框架、不从 `index.ts` 导出），并注意两点：`append` 的严格 seq 语义目前不幂等（重放同一次 flush 会报错，SQLite 崩溃恢复需要重新设计这一点）；若按 append 粒度落盘，崩溃可能把「有 tool call 无 result」的历史持久化下来 —— 落盘时机应与 #33 的不变量一起设计。
-- **信封没有 `sessionId`**：事件信封只有 `turnId` / `seq` / `time`，所以「把 A 会话的事件装进 B 会话」在类型与运行时都无法检测（`restoreSession` 的注释把这条写成调用方义务）。按 session 分表 / 按 `session_id` 过滤的 store 天然规避；若将来要强校验，得给信封加字段（P1.1 契约变更）。
 - **Tool input schema 校验**（TypeBox）留到 Phase 2 插件场景，位置必须是 ToolRegistry（#39）。
+- **provider 错误文本的脱敏**：`turn/end.error` 会带上 provider 的错误原文，而 provider 有时会回显凭据片段（#44）；真实 E2E 的失败分支也会把它打到 stdout。将来把日志落盘、上报或展示给他人前必须处理。
+- **信封没有 `sessionId`**：事件信封只有 `turnId` / `seq` / `time`，所以「把 A 会话的事件装进 B 会话」在类型与运行时都无法检测（`restoreSession` 的注释把这条写成调用方义务）。按 session 分表 / 按 `session_id` 过滤的 store 天然规避；若将来要强校验，得给信封加字段（P1.1 契约变更）。
 - `deriveMessages()` 目前全量重建（正确，不改）；将来若要缓存放 Session 内部，**压缩 / 裁剪永远属于 ContextBuilder**。
 - tool schema 暴露顺序（P2 插件加载序 / prompt cache；当前 Map 插入序已确定且稳定）。
 - 重名注册策略（P2 若需 last-wins）。
 - `assistantSteps` helper 在多个测试文件中逐字重复（已裁决不处理）。
 - 取消与真实错误同时发生时按 `cancelled` 记账（#31 的代价）：错误原因不进日志。
-- `turn/end.error` 会带上 provider 的错误原文，而 provider 有时会回显凭据片段（#44）；真实 E2E 的失败分支也会把它打到 stdout。将来把日志落盘、上报或展示给他人前要留意。
-- 真实端点上的 tool-call 往返仍未验证（argument delta → parsed input → tool 只有桩 socket 级证据）；真实 E2E 一旦跑通，这一条随之关闭。
 
 ---
 
@@ -301,22 +299,20 @@ Phase 1 内不做：Multi-Agent / Subagent、Planner / Plan-and-Execute / ToT、
 
 ## 10. Next Window
 
-**P1.1–P1.5 的代码都已落地；Phase 1 只剩一件事：一次成功的真实补全（§8）。**
+**Phase 1 已封存：代码、自动化测试与真实 provider E2E 全部通过（§1 / §7），本文件记录的就是 Phase 1 的最终状态。**
 
-收尾动作（不需要新的设计）：
+**Next milestone: Phase 2 Plugin Contract + PluginManager**
 
-```bash
-DEEPSEEK_API_KEY=... npx vitest run packages/agent-core/tests/real-provider.e2e.test.ts
-```
+开始 Phase 2 之前，先讨论一个架构议题（**只是讨论，本轮不实施**）：
 
-通过后：把 §1 的 Phase 1 状态改为 COMPLETE、删掉 §8 的阻塞项、更新 §7 的数字，然后进入 Phase 2。
+- **package boundary**：`AgentRuntime` / `AgentLoop` / `ModelClient` contract 是 provider-agnostic 的，`PiAiModelClient` 是唯一的 pi-ai-specific adapter。要决定的是**物理 package 边界**：`@every-dagent/agent-core` 目前仍直接依赖 `@earendil-works/pi-ai`（生产闭包 80+ 包、约 60 MB）；是否拆成 `@every-dagent/agent-core` + `@every-dagent/model-pi-ai`，让 core 回到零运行时依赖、由宿主按需选择 provider package。**只是讨论，本轮不实施拆包。**
 
-**Next milestone: Phase 2 Plugin Contract + PluginManager**（仅在上一行通过之后）。届时仍按固定顺序启动：
+Phase 2 启动顺序：
 
 1. 先读 `docs/PHASE1_AGENT_CORE_SPEC .md`（注意文件名里的空格）。
 2. 再读本文件。
 3. Explore 当前 `packages/agent-core/src` 与 `tests`，核对真实代码与本文档。
-4. **先 Plan，不直接 Implement。**
+4. **先 Plan（含上面的 package boundary 讨论），不直接 Implement。**
 
 ---
 
