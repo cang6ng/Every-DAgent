@@ -366,7 +366,7 @@ describe("plugin contract: public exports", () => {
     expect(error.message).toContain("demo");
   });
 
-  it("fails fast while the lifecycle manager is unimplemented", () => {
+  it("builds a manager through the public factory", () => {
     const storage: PluginStorage = {
       get: async () => undefined,
       set: async () => {},
@@ -378,7 +378,12 @@ describe("plugin contract: public exports", () => {
       grants: { demo: ["storage"] },
       storage: () => storage,
     };
+    const manager = pluginSystem.createPluginManager(options);
 
-    expect(() => pluginSystem.createPluginManager(options)).toThrow(/not implemented/);
+    manager.register(pluginFrom("demo"));
+
+    expect(manager.get("demo")?.status).toBe("disabled");
+    expect(manager.list().map((info) => info.manifest.id)).toEqual(["demo"]);
+    expect(registry.list()).toEqual([]);
   });
 });
