@@ -1,0 +1,14 @@
+{
+  "name": "@every-dagent/host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Every-DAgent host boundary: composition of the Core and the plugin system behind the frozen protocol contract.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@every-dagent/agent-core": "workspace:*",
+    "@every-dagent/plugin-system": "workspace:*",
+    "@every-dagent/protocol": "workspace:*"
+  }
+}

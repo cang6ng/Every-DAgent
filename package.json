@@ -15,6 +15,7 @@
   "devDependencies": {
     "@earendil-works/pi-ai": "0.87.1",
     "@every-dagent/agent-core": "workspace:*",
+    "@every-dagent/host": "workspace:*",
     "@every-dagent/model-pi-ai": "workspace:*",
     "@every-dagent/plugin-calculator": "workspace:*",
     "@every-dagent/plugin-system": "workspace:*",
