@@ -8,8 +8,11 @@
  * and over the web binding.
  */
 
-import { createHost } from "@every-dagent/host";
 import type { Host, HostOptions } from "@every-dagent/host";
+// The host's composition seam: the only way to register a test-only reverse
+// profile. It is deliberately not part of the package's public surface.
+import { composeHost, type AttachedConnection } from "@every-dagent/host/src/host.js";
+import type { ReverseProfile } from "@every-dagent/host/src/reverse.js";
 import type { ProtocolChannel } from "@every-dagent/protocol";
 
 import { createClient, type Client } from "@every-dagent/client";
@@ -25,21 +28,34 @@ export type ChannelSource = () => Promise<ProtocolChannel>;
 
 export interface HostPlatformOptions extends HostOptions {
   readonly carriers?: CarrierOptions;
+  /** Test-only reverse profiles; the production catalog is empty. */
+  readonly reverseProfiles?: readonly ReverseProfile[];
+  /** Overrides the carrier entirely, e.g. to bind a real web transport. */
+  readonly source?: ChannelSource;
 }
 
 export interface HostPlatform {
   readonly host: Host;
   /** Opens one logical connection to this host, attached and listening. */
   connect(): Promise<ProtocolChannel>;
-  /** One carrier per established connection, in order. */
+  /** One carrier per established connection, in order (empty for a custom source). */
   readonly carriers: CarrierPair[];
+  /** One entry per attached connection, with its reverse trigger. */
+  readonly attached: AttachedConnection[];
   readonly connections: number;
   shutdown(): Promise<void>;
 }
 
 /** The host plus a memory-carrier channel source. */
 export function createHostPlatform(options: HostPlatformOptions): HostPlatform {
-  const host = createHost(options);
+  const attached: AttachedConnection[] = [];
+  const composed = composeHost(options, {
+    ...(options.reverseProfiles === undefined ? {} : { reverseProfiles: options.reverseProfiles }),
+    onAttach: (connection) => {
+      attached.push(connection);
+    },
+  });
+  const host = composed.host;
   const carriers: CarrierPair[] = [];
   let connections = 0;
 
@@ -47,6 +63,7 @@ export function createHostPlatform(options: HostPlatformOptions): HostPlatform {
     host,
     async connect(): Promise<ProtocolChannel> {
       connections += 1;
+      if (options.source !== undefined) return options.source();
       const pair = createCarrierPair(options.carriers ?? {});
       carriers.push(pair);
       // The host installs its listener before the client may send anything.
@@ -54,6 +71,7 @@ export function createHostPlatform(options: HostPlatformOptions): HostPlatform {
       return pair.clientSide;
     },
     carriers,
+    attached,
     get connections(): number {
       return connections;
     },

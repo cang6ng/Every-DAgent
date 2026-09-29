@@ -21,6 +21,7 @@
     "@every-dagent/plugin-calculator": "workspace:*",
     "@every-dagent/plugin-system": "workspace:*",
     "@every-dagent/protocol": "workspace:*",
+    "@every-dagent/web": "workspace:*",
     "@types/node": "^24.0.0",
     "typescript": "^5.8.0",
     "vitest": "^3.2.0"

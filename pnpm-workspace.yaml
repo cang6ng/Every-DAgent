@@ -1,5 +1,6 @@
 packages:
   - 'packages/*'
+  - 'apps/*'
 # pnpm asks about the postinstall scripts pi-ai's dependency tree brings along.
 # Neither is needed here: the OpenAI-compatible and Anthropic paths are the only
 # ones the adapter uses, so both stay off.

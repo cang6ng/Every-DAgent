@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>transport-smoke: pending</title>
+  </head>
+  <body>
+    <h1>Every-DAgent web transport smoke</h1>
+    <p>
+      This page is not the Shell. It is the smallest thing a browser can do
+      against the binding: create a logical connection, read the downstream as a
+      stream, POST one frame upstream, and check that the frame comes back. It
+      uses the browser's own <code>fetch</code>, <code>ReadableStream</code> and
+      <code>TextDecoder</code> — no framework, no bundler, and no client core.
+    </p>
+    <pre id="result">running…</pre>
+
+    <script type="module">
+      /**
+       * The flow is the channel's flow, written out so the page has no build
+       * step: POST /connections, GET the event stream, POST one frame per
+       * request. The transport header is what makes this a deliberate
+       * cross-origin request rather than a form post.
+       */
+      const TRANSPORT_HEADER = "x-every-dagent-transport";
+      const binding = new URLSearchParams(location.search).get("binding");
+      const frame = "browser-frame-1";
+
+      async function run() {
+        const created = await fetch(`${binding}/connections`, {
+          method: "POST",
+          headers: { "content-type": "application/json", [TRANSPORT_HEADER]: "1" },
+          body: "{}",
+        });
+        const { connectionId, token } = await created.json();
+
+        const stream = await fetch(`${binding}/connections/${connectionId}/events`, {
+          headers: { authorization: `Bearer ${token}`, accept: "text/event-stream" },
+        });
+        const reader = stream.body.getReader();
+        const decoder = new TextDecoder();
+
+        const received = [];
+        let buffer = "";
+        const reading = (async () => {
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            for (;;) {
+              const end = buffer.indexOf("\n\n");
+              if (end < 0) break;
+              const record = buffer.slice(0, end);
+              buffer = buffer.slice(end + 2);
+              const data = record
+                .split("\n")
+                .filter((line) => line.startsWith("data: "))
+                .map((line) => line.slice(6));
+              if (data.length > 0) received.push(JSON.parse(data.join("\n")));
+            }
+          }
+        })();
+
+        const posted = await fetch(`${binding}/connections/${connectionId}/frames`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${token}`,
+            [TRANSPORT_HEADER]: "1",
+          },
+          body: JSON.stringify(frame),
+        });
+
+        const deadline = Date.now() + 4000;
+        while (received.length === 0 && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        reader.cancel().catch(() => undefined);
+        void reading;
+
+        const result = {
+          created: created.status,
+          stream: stream.status,
+          streamType: stream.headers.get("content-type"),
+          posted: posted.status,
+          received,
+          tokenInUrl: location.href.includes(token),
+        };
+        document.querySelector("#result").textContent = JSON.stringify(result);
+        document.title =
+          result.created === 201 &&
+          result.stream === 200 &&
+          (result.streamType ?? "").startsWith("text/event-stream") &&
+          result.posted === 204 &&
+          result.received.length === 1 &&
+          result.received[0].includes(frame) &&
+          result.received[0].includes("downstream") &&
+          result.tokenInUrl === false
+            ? "transport-smoke: PASS"
+            : "transport-smoke: FAIL";
+      }
+
+      run().catch((error) => {
+        document.querySelector("#result").textContent = JSON.stringify({ error: String(error) });
+        document.title = "transport-smoke: FAIL";
+      });
+    </script>
+  </body>
+</html>

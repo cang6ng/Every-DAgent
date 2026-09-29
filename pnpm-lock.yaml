@@ -32,6 +32,9 @@ importers:
       '@every-dagent/protocol':
         specifier: workspace:*
         version: link:packages/protocol
+      '@every-dagent/web':
+        specifier: workspace:*
+        version: link:apps/web
       '@types/node':
         specifier: ^24.0.0
         version: 24.19.0
@@ -41,6 +44,12 @@ importers:
       vitest:
         specifier: ^3.2.0
         version: 3.2.7(@types/node@24.19.0)
+
+  apps/web:
+    dependencies:
+      '@every-dagent/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
 
   packages/agent-core: {}
 
