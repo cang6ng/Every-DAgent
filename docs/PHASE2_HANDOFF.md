@@ -11,12 +11,12 @@
 | Code baseline | `c717f1087e75a7055a18c51512b27b1a1cb28c58` — `test(plugin-system): cover lifecycle regression boundaries` |
 | Phase 2 起点 / Phase 1 final docs commit | `641ca74c9b69f6dffa2671d7b38009407792d8aa` — `docs: mark Phase 1 complete in handoff` |
 | Phase 1 | **COMPLETE**；代码、自动化测试与人工真实 provider E2E 的封存证据见 Phase 1 HANDOFF |
-| Phase 2 | **代码已交付、独立复审 PASS、已 push；待 HANDOFF 轻量审查与文档封存**。本次不标记 Phase 2 COMPLETE |
+| Phase 2 | **COMPLETE**；代码已交付并 push，独立复审与 HANDOFF 轻量审查均 PASS，用户已明确确认封存完成 |
 | 当前仓库实现 | 四包均已落地：`agent-core`、`model-pi-ai`、`plugin-system`、`plugin-calculator` |
 | 独立审查 | Astra Targeted Re-review **PASS — BLOCKER 0 / MAJOR 0 / MINOR 0**；唯一 MAJOR M1 已 RESOLVED |
-| Code push | P2.1–P2.4 checkpoints 及两次测试补充共六个 commits 已推送至 `origin/rewrite/runtime-lite`；服务端分支已核验与 Code baseline 一致 |
-| 已提交的 HANDOFF 基线 | `f3ee623abe58ab204c08d39777381201c2fde1f0` — `docs: update Phase 2 handoff for P2.0`；该文档提交已 push，本次更新尚未暂存或提交 |
-| 下一步 | 仅审查本文当前事实与证据；文档 commit/push、封存状态变更须另获授权，不进入 Phase 3 |
+| Code push | P2.1–P2.4 checkpoints 及两次测试补充共六个 commits 已 push；后续文档提交不改变 Code baseline |
+| 已提交的 HANDOFF 基线 | `e9e83e32288196ccab7e4f1547961c6e0d4aa382` — `docs: mark Phase 2 complete in handoff`；服务端分支已核验为该提交，本次 COMPLETE 状态纠正尚未暂存或提交 |
+| 下一步 | Phase 2 已关闭；本次文档纠正的 commit/push 须另获授权，后续阶段按单独授权推进 |
 | 原有未跟踪项 | `.zcode/`、`.zcodeignore`，不属于提交范围，不得顺手提交 |
 
 Phase 1 文档冻结：`docs/PHASE1_AGENT_CORE_SPEC .md`（SPEC 后有空格）、`docs/PHASE1_HANDOFF.md`。
@@ -108,25 +108,25 @@ P2.1–P2.4 的实现与 Gate 已完成；代码按人工批准的 Batch Mode �
 | Milestone | 当前状态 | 交付 / checkpoint |
 | --- | --- | --- |
 | P2.0 — Package Boundary | **COMPLETE** | `cfd9c80`；adapter 迁出 Core，SDK 0.87.1。CalculatorTool 当时暂留 Core，现已在 P2.4 迁出 |
-| P2.1 — Plugin Contract | 实现 / Gate 完成，已 push | `11c9f6d` — `feat: add plugin system contracts` |
-| P2.2 — PluginManager | 实现 / strict Gate 完成，已 push | `9b3f160` — `feat: add plugin lifecycle manager` |
-| P2.3 — Storage Permission + Lifecycle Hardening | 实现 / Gate 完成，已 push | `4f09721` — `feat: add scoped plugin storage capability` |
-| P2.4 — CalculatorPlugin + E2E | 实现 / Gate 完成，已 push | `0024236` — `feat: add calculator plugin integration` |
-| P2.5 — Final Audit | Self Audit、独立复审与最终代码验证完成；文档封存待完成 | `8023a66` 补 unregister cleanup-pending 测试；`c717f10` 补 M1 四项回归，均已 push |
+| P2.1 — Plugin Contract | **COMPLETE**；实现 / Gate 完成，已 push | `11c9f6d` — `feat: add plugin system contracts` |
+| P2.2 — PluginManager | **COMPLETE**；实现 / strict Gate 完成，已 push | `9b3f160` — `feat: add plugin lifecycle manager` |
+| P2.3 — Storage Permission + Lifecycle Hardening | **COMPLETE**；实现 / Gate 完成，已 push | `4f09721` — `feat: add scoped plugin storage capability` |
+| P2.4 — CalculatorPlugin + E2E | **COMPLETE**；实现 / Gate 完成，已 push | `0024236` — `feat: add calculator plugin integration` |
+| P2.5 — Final Audit | **COMPLETE**；Self Audit、独立复审、最终代码验证及 HANDOFF 轻量审查完成，用户已确认封存 | `8023a66` 补 unregister cleanup-pending 测试；`c717f10` 补 M1 四项回归，均已 push |
 
 各 milestone 的 Goal / Deliverables / Acceptance Criteria / Non-goals 见 SPEC §9；本文不重新定义 DoD。
-当前代码无未关闭 review blocker/major/minor；这不等于本文已经通过轻量审查或 Phase 2 已获封存确认。
+当前代码无未关闭 review blocker/major/minor；HANDOFF 轻量审查已 PASS，用户已明确要求将 Phase 2 标记为 COMPLETE。阶段完成不改写真实 provider 的 NOT RUN 状态。
 
 ## 5. Next Window
 
-**下一步仅为 HANDOFF 轻量审查，不再 Plan/Implement P2.1，也不进入 Phase 3。**
+**Phase 2 COMPLETE；不再重复实施或审查已关闭的 P2.1–P2.5。**
 
-1. Read Phase 2 SPEC 与本文，核对实际 Git 的 Code baseline、分支与工作区；只接受已知的文档修改和 `.zcode*` 未跟踪项。
-2. 对照最终验证与人工提供的 targeted re-review，确认 217 offline、81 plugin-system、7 plugin-calculator、5 root integration，以及 M1 RESOLVED。
-3. 确认 real-provider 保持 NOT RUN；历史 skip / Phase 1 PASS 不得改记为 Phase 2 PASS。
-4. 轻量审查通过后，等待单独的本文 commit/push 与封存授权；不得把更新文档或代码已 push 理解为 Phase 3 开工授权。
+1. 本次仅纠正 HANDOFF 的完成状态；该纠正尚未提交，commit/push 须另获授权。
+2. 保留 Code baseline `c717f10`、217 offline、M1 RESOLVED 与独立复审 PASS 的封存证据。
+3. real-provider 保持 NOT RUN；历史 skip / Phase 1 PASS 不得改记为 Phase 2 PASS。
+4. 后续阶段按其独立文档和明确授权推进；Phase 2 COMPLETE 本身不授予 Phase 3 实施权限。
 
-本次维护仅更新本文，整合既有未提交的 P2.0 状态说明；未修改 production/tests/config/SPEC，未暂存、未 commit/push，也未操作 `.zcode/`、`.zcodeignore`。
+本次维护仅更新本文，纠正已提交版本仍保留的待审查/待封存表述；未修改 production/tests/config/SPEC，未暂存、未 commit/push，也未操作现有 Phase 3 文档或 `.zcode*` 未跟踪项。
 
 ## 6. Maintenance Rule
 
@@ -135,14 +135,7 @@ P2.1–P2.4 的实现与 Gate 已完成；代码按人工批准的 Batch Mode �
 本次 P2.1–P2.5 的 Batch 执行例外由人工明确批准：共用 Master Plan，逐 milestone Implement → Verify → Gate PASS → local checkpoint → 下一阶段；Independent Review 延后至 P2.5 Self Audit 后统一开展。
 Gate 不等于 Independent Review；本次 M1 test-only fix 后经 Astra targeted re-review PASS，再完成 Final Verification，并在另获 push 授权后推送已有 commit chain。上述授权只属于本次 Phase 2，不改写 SPEC 的技术契约，也不自动延伸到后续阶段。
 
-剩余文档交付顺序：
-
-```text
-update Handoff（本次）
-→ lightweight review
-→ docs commit/push（须另获明确授权）
-→ 封存状态确认（须人工确认；不自动进入 Phase 3）
-```
+HANDOFF 轻量审查与用户封存确认均已完成，Phase 2 状态为 **COMPLETE**。本次将该确认正确写入正文；状态纠正文档的 commit/push 仍须另获明确授权，不重复请求已经取得的阶段完成确认，也不自动启动 Phase 3。
 
 DSFlash 不自行修改 frozen architecture。遇到以下任一情况必须 STOP：
 
