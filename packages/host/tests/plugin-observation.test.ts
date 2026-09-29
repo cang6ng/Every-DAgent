@@ -16,6 +16,7 @@ import type { PluginSummary, ProtocolChannel, ProtocolChannelListener } from "@e
 
 import { observePlugin } from "../src/connection.js";
 import { samePluginSummary } from "../src/projection.js";
+import { createReverseConnectionState } from "../src/reverse.js";
 import type { ConnectionState, HostState } from "../src/state.js";
 
 import { connect, flush, scriptedModel, testHost, testPlugin, textReply } from "./helpers/harness.js";
@@ -261,6 +262,8 @@ function recordingConnection(fired: string[]): ConnectionState {
     channel,
     requestIds: new Set<string>(),
     initialized: undefined,
+    reverse: createReverseConnectionState([]),
+    detachListener: undefined,
     subscription: { streamId: "stream-observation", sequence: 0 },
     outbox: [],
     outboxBytes: 0,

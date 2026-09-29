@@ -1,10 +1,9 @@
 /**
  * The package's boundaries, checked against the source itself.
  *
- * A host is only as trustworthy as what it can reach: the composition decides
- * what goes in, and nothing else may come out. These assertions are about
- * imports, exports and the manifest — the things a reviewer would otherwise
- * have to verify by eye on every change.
+ * The client is the one place that must not be able to reach a host, a
+ * provider, a browser or a React tree: everything it may touch is a JSON frame
+ * and its own state. These assertions are the mechanical half of that claim.
  */
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -36,45 +35,33 @@ function importSpecifiers(source: string): string[] {
   return specifiers;
 }
 
-const WORKSPACE_IMPORTS = [
-  "@every-dagent/agent-core",
-  "@every-dagent/plugin-system",
-  "@every-dagent/protocol",
-];
-
 describe("dependency boundary", () => {
   it("keeps the source tree to the planned modules", () => {
     expect([...srcRelative].sort()).toEqual(
       [
+        "client.ts",
         "connection.ts",
-        "dispatch.ts",
         "errors.ts",
-        "host.ts",
+        "fold.ts",
         "index.ts",
-        "projection.ts",
-        "registry-gate.ts",
         "reverse.ts",
-        "run.ts",
-        "state.ts",
+        "store.ts",
       ].sort(),
     );
   });
 
-  it("imports only its own modules and the three workspace packages it declares", () => {
+  it("imports only its own modules and the one workspace package it declares", () => {
     const offenders: string[] = [];
     for (const file of srcFiles) {
       for (const specifier of importSpecifiers(readFileSync(file, "utf8"))) {
-        const allowed = specifier.startsWith("./") || WORKSPACE_IMPORTS.includes(specifier);
+        const allowed = specifier.startsWith("./") || specifier === "@every-dagent/protocol";
         if (!allowed) offenders.push(`${file}: ${specifier}`);
       }
     }
     expect(offenders).toEqual([]);
   });
 
-  it("carries no provider, UI, network or process-level dependency anywhere in src", () => {
-    // The import check above already rules out every package that is not one of
-    // the three declared ones; what remains are the globals and shorthands that
-    // would let the host reach a browser, a socket or a process anyway.
+  it("carries no host, provider, UI, network or process-level dependency in src", () => {
     const forbidden = [
       /\bpi-ai\b/,
       /\bReact\b/,
@@ -88,9 +75,11 @@ describe("dependency boundary", () => {
       /\bprocess\s*\./,
       /\bBuffer\b/,
       /\brequire\s*\(/,
+      /\bvalibot\b/,
       /\bas\s+never\b/,
+      /\bas\s+any\b/,
       /@ts-(ignore|expect-error|nocheck)/,
-      /@every-dagent\/(client|model-pi-ai|plugin-calculator)/,
+      /@every-dagent\/(host|agent-core|plugin-system|model-pi-ai|plugin-calculator)/,
       /\bvitest\b/,
     ];
     for (const file of srcFiles) {
@@ -101,7 +90,7 @@ describe("dependency boundary", () => {
     }
   });
 
-  it("pins the package manifest: private ESM source package with three workspace dependencies", () => {
+  it("pins the package manifest: private ESM source package with one workspace dependency", () => {
     const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as {
       name: string;
       private: boolean;
@@ -112,33 +101,59 @@ describe("dependency boundary", () => {
       dependencies: Record<string, string>;
       devDependencies?: Record<string, string>;
     };
-    expect(manifest.name).toBe("@every-dagent/host");
+    expect(manifest.name).toBe("@every-dagent/client");
     expect(manifest.private).toBe(true);
     expect(manifest.type).toBe("module");
     expect(manifest.main).toBe("./src/index.ts");
     expect(manifest.types).toBe("./src/index.ts");
     expect(manifest.exports).toBeUndefined();
-    expect(manifest.dependencies).toEqual({
-      "@every-dagent/agent-core": "workspace:*",
-      "@every-dagent/plugin-system": "workspace:*",
-      "@every-dagent/protocol": "workspace:*",
-    });
+    expect(manifest.dependencies).toEqual({ "@every-dagent/protocol": "workspace:*" });
     expect(manifest.devDependencies).toBeUndefined();
   });
 });
 
 describe("public surface", () => {
-  it("exports exactly one runtime value and its types", async () => {
-    const host = await import("../src/index.js");
+  it("exports exactly the factory and the error class", async () => {
+    const client = await import("../src/index.js");
 
-    expect(Object.keys(host).sort()).toEqual(["createHost"]);
+    expect(Object.keys(client).sort()).toEqual(["ClientError", "createClient"]);
   });
 
-  it("hands out no registry, session, manager or dispatcher", async () => {
-    const host = await import("../src/index.js");
-    const exported = Object.values(host);
+  it("does not hand out the connection, the store or the composition seam", async () => {
+    const client = await import("../src/index.js");
+    const exported = Object.keys(client);
 
-    expect(exported).toHaveLength(1);
-    expect(typeof exported[0]).toBe("function");
+    expect(exported).not.toContain("createClientWith");
+    expect(exported).not.toContain("ClientConnection");
+    expect(exported).not.toContain("createStore");
+    expect(exported).not.toContain("createReverseTable");
+  });
+
+  it("hands out nothing that could send an arbitrary request", async () => {
+    const client = await import("../src/index.js");
+    const factory = client.createClient({
+      connect: () => {
+        throw new Error("never connected");
+      },
+    });
+
+    // The facade is the twelve frozen operations, and nothing shaped like a
+    // generic request entry point.
+    expect(Object.keys(factory).sort()).toEqual([
+      "closeSubscription",
+      "connect",
+      "disconnect",
+      "getSnapshot",
+      "getState",
+      "plugins",
+      "reconnect",
+      "resync",
+      "runs",
+      "sessions",
+      "subscribe",
+    ]);
+    expect(Object.keys(factory.sessions).sort()).toEqual(["create", "get", "list"]);
+    expect(Object.keys(factory.runs).sort()).toEqual(["cancel", "get", "start"]);
+    expect(Object.keys(factory.plugins).sort()).toEqual(["disable", "enable", "list"]);
   });
 });

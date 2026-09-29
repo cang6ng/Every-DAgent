@@ -22,6 +22,8 @@ import type {
 import { encodeFrame, validateMessage } from "@every-dagent/protocol";
 
 import { ProjectionError, projectPluginInfo, samePluginSummary } from "./projection.js";
+import { createReverseConnectionState, dropAllReverse } from "./reverse.js";
+import type { ReverseProfile } from "./reverse.js";
 import type { ConnectionState, HostState, RunEntry } from "./state.js";
 
 /**
@@ -62,11 +64,16 @@ type RunScope = Extract<EventScope, { kind: "run" }>;
 type SessionScope = Extract<EventScope, { kind: "session" }>;
 type PluginScope = Extract<EventScope, { kind: "plugin" }>;
 
-export function createConnection(channel: ProtocolChannel): ConnectionState {
+export function createConnection(
+  channel: ProtocolChannel,
+  profiles: readonly ReverseProfile[],
+): ConnectionState {
   return {
     channel,
     requestIds: new Set<string>(),
     initialized: undefined,
+    reverse: createReverseConnectionState(profiles),
+    detachListener: undefined,
     subscription: undefined,
     outbox: [],
     outboxBytes: 0,
@@ -79,12 +86,16 @@ export function createConnection(channel: ProtocolChannel): ConnectionState {
  * Ends one logical connection.
  *
  * Idempotent, and it never touches a run: a client that goes away stops being
- * told about work that is already owned by the host.
+ * told about work that is already owned by the host. Everything that was
+ * waiting on this connection ends first — the reverse requests the host sent
+ * included — so nothing is still holding a promise when the transport is told
+ * to close.
  */
 export function closeConnection(state: HostState, connection: ConnectionState): void {
   if (connection.closed) return;
   connection.closed = true;
   connection.subscription = undefined;
+  dropAllReverse(connection, "closed");
   connection.outbox.length = 0;
   connection.outboxBytes = 0;
   state.connections.delete(connection);
@@ -165,6 +176,41 @@ export function assertEventBuilds(state: HostState, build: EventBuilder): void {
 }
 
 /**
+ * Sends one event to exactly one connection.
+ *
+ * The reverse seam needs this: a cancellation notice is addressed to the
+ * connection that made the request, on the stream that request lived on, and it
+ * consumes that stream's next sequence number like any other event. Broadcasting
+ * it would tell unrelated subscribers about a request they never saw.
+ */
+export function publishEventTo(
+  state: HostState,
+  connection: ConnectionState,
+  build: EventBuilder,
+): void {
+  const subscription = connection.subscription;
+  if (subscription === undefined || connection.closed) return;
+
+  const sequence = subscription.sequence + 1;
+  const encoded = encodeFrame(
+    { kind: "host-event" },
+    build({
+      kind: "host-event",
+      protocolVersion: "1",
+      hostInstanceId: state.hostInstanceId,
+      streamId: subscription.streamId,
+      sequence,
+    }),
+  );
+  if (!encoded.success) {
+    throw new ProjectionError("the event could not be encoded for a subscriber");
+  }
+
+  subscription.sequence = sequence;
+  sendFrame(state, connection, encoded.output);
+}
+
+/**
  * Sends one event to every subscribed connection.
  *
  * Each subscriber gets its own envelope with its own next sequence number, so
@@ -174,26 +220,7 @@ export function assertEventBuilds(state: HostState, build: EventBuilder): void {
  */
 export function publishEvent(state: HostState, build: EventBuilder): void {
   for (const connection of [...state.connections]) {
-    const subscription = connection.subscription;
-    if (subscription === undefined || connection.closed) continue;
-
-    const sequence = subscription.sequence + 1;
-    const encoded = encodeFrame(
-      { kind: "host-event" },
-      build({
-        kind: "host-event",
-        protocolVersion: "1",
-        hostInstanceId: state.hostInstanceId,
-        streamId: subscription.streamId,
-        sequence,
-      }),
-    );
-    if (!encoded.success) {
-      throw new ProjectionError("the event could not be encoded for a subscriber");
-    }
-
-    subscription.sequence = sequence;
-    sendFrame(state, connection, encoded.output);
+    publishEventTo(state, connection, build);
   }
 }
 
@@ -272,6 +299,22 @@ export function pluginUpdatedEvent(pluginId: string, plugin: PluginSummary): Eve
   const scope: PluginScope = Object.freeze({ kind: "plugin" as const, pluginId });
   const payload = Object.freeze({ plugin });
   return (base) => ({ ...base, scope, type: "plugin.updated", payload });
+}
+
+/**
+ * The control notice that ends one reverse request's wait.
+ *
+ * It is not conversation state: the client's dispatcher aborts the local handler
+ * for `requestId` and stops waiting for its answer, and the presentation fold
+ * only sees the stream advance.
+ */
+export function hostRequestCancelledEvent(
+  requestId: string,
+  reason: "cancelled" | "timeout",
+): EventBuilder {
+  const scope: EventScope = Object.freeze({ kind: "host" as const });
+  const payload = Object.freeze({ requestId, reason });
+  return (base) => ({ ...base, scope, type: "host.request.cancelled", payload });
 }
 
 /**

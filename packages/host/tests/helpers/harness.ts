@@ -19,11 +19,14 @@ import type { Plugin, PluginContext, PluginPermission } from "@every-dagent/plug
 import type {
   DecodedEnvelope,
   HostEvent,
+  HostRequest,
   HostResponse,
+  JsonValue,
   OperationMap,
   OperationName,
   ProtocolChannel,
   ProtocolError,
+  ProtocolErrorCode,
 } from "@every-dagent/protocol";
 import { decodeFrame, encodeFrame, validateMessage } from "@every-dagent/protocol";
 
@@ -123,12 +126,26 @@ export interface TestClient {
   detach(): void;
 }
 
+/** Answers one `host-request` the host sent this fixture. */
+export interface ReverseAnswer {
+  /** Sends the success body; the frame is validated and encoded by the protocol. */
+  respond(result: JsonValue): void;
+  /** Sends a safe error body. */
+  fail(code: ProtocolErrorCode): void;
+  /** Sends nothing at all — the request stays pending until its scope ends. */
+  ignore(): void;
+}
+
 export interface ConnectOptions {
   /**
    * Wraps the channel the host is given, so a test can make closing the
    * connection do something of its own — including calling back into the host.
    */
   readonly wrapHostChannel?: (channel: ProtocolChannel) => ProtocolChannel;
+  /** What this client declares for the reverse capability (default: false). */
+  readonly reverseRequests?: boolean;
+  /** Called for every reverse request this client receives. */
+  readonly onReverse?: (request: HostRequest, answer: ReverseAnswer) => void;
 }
 
 export function connect(host: Host, options: ConnectOptions = {}): TestClient {
@@ -140,6 +157,7 @@ export function connect(host: Host, options: ConnectOptions = {}): TestClient {
     readonly resolve: (event: HostEvent) => void;
   }[] = [];
   const pending = new Map<string, (envelope: DecodedEnvelope) => void>();
+  const declaredCapabilities = { reverseRequests: options.reverseRequests ?? false };
 
   let hostInstanceId: string | undefined;
   let closed = false;
@@ -148,6 +166,38 @@ export function connect(host: Host, options: ConnectOptions = {}): TestClient {
   const hostChannel =
     options.wrapHostChannel === undefined ? hostSide : options.wrapHostChannel(hostSide);
   const detachHost = host.attach(hostChannel);
+
+  function sendClientResponse(
+    request: HostRequest,
+    body: { readonly result: JsonValue } | { readonly error: ProtocolError },
+  ): void {
+    const candidate =
+      "result" in body
+        ? {
+            kind: "client-response",
+            protocolVersion: "1",
+            hostInstanceId: request.hostInstanceId,
+            streamId: request.streamId,
+            requestId: request.requestId,
+            result: body.result,
+          }
+        : {
+            kind: "client-response",
+            protocolVersion: "1",
+            hostInstanceId: request.hostInstanceId,
+            streamId: request.streamId,
+            requestId: request.requestId,
+            error: body.error,
+          };
+
+    const validated = validateMessage({ kind: "client-response" }, candidate);
+    if (!validated.success) {
+      throw new Error(`the fixture built an invalid client response: ${validated.failure.reason}`);
+    }
+    const encoded = encodeFrame({ kind: "client-response" }, validated.output);
+    if (!encoded.success) throw new Error("the fixture could not encode its client response");
+    clientSide.send(encoded.output);
+  }
 
   clientSide.listen({
     onFrame(frame: string): void {
@@ -163,6 +213,22 @@ export function connect(host: Host, options: ConnectOptions = {}): TestClient {
           pending.delete(envelope.requestId);
           waiter(envelope);
         }
+        return;
+      }
+
+      if (envelope.kind === "host-request") {
+        if (options.onReverse === undefined) return;
+        const validated = validateMessage({ kind: "host-request" }, envelope);
+        if (!validated.success) return;
+        options.onReverse(validated.output, {
+          respond: (result: JsonValue): void => {
+            sendClientResponse(validated.output, { result });
+          },
+          fail: (code: ProtocolErrorCode): void => {
+            sendClientResponse(validated.output, { error: { code, message: `test client: ${code}` } });
+          },
+          ignore: (): void => undefined,
+        });
         return;
       }
 
@@ -254,7 +320,7 @@ export function connect(host: Host, options: ConnectOptions = {}): TestClient {
       const response = await call("host.describe", {
         supportedProtocolVersions: ["1"],
         client: { name: "test-client", version: "0.1.0" },
-        capabilities: { reverseRequests: false },
+        capabilities: declaredCapabilities,
       }, options);
       if (response.result !== undefined) hostInstanceId = response.result.hostInstanceId;
       return response;

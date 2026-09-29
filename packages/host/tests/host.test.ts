@@ -26,9 +26,11 @@ describe("host description", () => {
         runs: true,
         plugins: true,
         subscriptions: true,
-        // The reverse seam exists in the protocol; this host makes no reverse
-        // request, so it does not advertise the capability.
-        reverseRequests: false,
+        // Backed by the generic mechanism in `reverse.ts` and its own tests:
+        // pending is installed before send, answers are correlated and validated
+        // against a profile, and every scope end clears what it owns. The
+        // business registry is still empty — no shipped method exists.
+        reverseRequests: true,
       },
       clientCapabilities: { reverseRequests: false },
       limits: { maxActiveRuns: 1 },

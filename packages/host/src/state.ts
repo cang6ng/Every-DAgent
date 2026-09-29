@@ -22,6 +22,7 @@ import type {
   CanonicalItem,
   ClientCapabilities,
   HostSnapshot,
+  JsonValue,
   LiveItem,
   PluginSummary,
   ProtocolChannel,
@@ -33,6 +34,7 @@ import type {
 } from "@every-dagent/protocol";
 
 import type { Lease, RegistryGate } from "./registry-gate.js";
+import type { ReverseOutcome, ReverseProfile, ReverseTimer } from "./reverse.js";
 
 /** A session: the Core object plus everything the protocol may show about it. */
 export interface SessionEntry {
@@ -85,6 +87,37 @@ export interface SubscriptionState {
   sequence: number;
 }
 
+/**
+ * One host→client request this connection is still waiting for.
+ *
+ * The entry is self-contained on purpose: it carries the profile's own result
+ * contract and the resolution of the caller's wait, so settling it needs no
+ * lookup beyond the connection that owns it.
+ */
+export interface ReversePendingEntry {
+  readonly requestId: string;
+  readonly method: string;
+  readonly streamId: string;
+  /** Whether an answer's `result` satisfies the profile that made this method real. */
+  readonly acceptsResult: (result: JsonValue) => boolean;
+  readonly settle: (outcome: ReverseOutcome) => void;
+  timer: ReverseTimer | undefined;
+}
+
+/**
+ * The reverse half of one connection: what may be sent, and what is in flight.
+ *
+ * `requestIds` is this direction's own ledger, kept apart from the ids the
+ * client used on the same connection — the two directions are separate accounts,
+ * and disambiguating them by `kind` is exactly what the protocol promises.
+ */
+export interface ReverseConnectionState {
+  readonly profiles: ReadonlyMap<string, ReverseProfile>;
+  readonly pending: Map<string, ReversePendingEntry>;
+  readonly requestIds: Set<string>;
+  counter: number;
+}
+
 export interface ConnectionState {
   readonly channel: ProtocolChannel;
   /** Every request id this connection has used, in either direction it sent. */
@@ -95,6 +128,9 @@ export interface ConnectionState {
     readonly version: string;
     readonly capabilities: ClientCapabilities;
   } | undefined;
+  readonly reverse: ReverseConnectionState;
+  /** Removes the frame listener; the transport itself is closed separately. */
+  detachListener: (() => void) | undefined;
   subscription: SubscriptionState | undefined;
   outbox: string[];
   outboxBytes: number;

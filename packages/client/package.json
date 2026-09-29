@@ -1,0 +1,12 @@
+{
+  "name": "@every-dagent/client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Every-DAgent react-free client: one logical connection to a host, correlated requests, an immutable presentation replica and the reverse dispatcher.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@every-dagent/protocol": "workspace:*"
+  }
+}

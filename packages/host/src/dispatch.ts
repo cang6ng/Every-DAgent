@@ -39,6 +39,7 @@ import {
   sessionCreatedEvent,
 } from "./connection.js";
 import { codeForPluginFailure, protocolError, shuttingDownError } from "./errors.js";
+import { answerReversePending, dropReverseForStream } from "./reverse.js";
 import { cancelRun, startRun } from "./run.js";
 import {
   captureHostSnapshot,
@@ -58,6 +59,7 @@ import {
 
 type EncodedFrame = ReturnType<typeof encodeFrame>;
 type ClientRequestEnvelope = Extract<DecodedEnvelope, { kind: "client-request" }>;
+type ClientResponseEnvelope = Extract<DecodedEnvelope, { kind: "client-response" }>;
 type SessionResult = OperationMap["sessions.create"]["result"];
 type RunResult = OperationMap["runs.start"]["result"];
 type PluginResult = OperationMap["plugins.enable"]["result"];
@@ -67,9 +69,13 @@ const HOST_CAPABILITIES: HostCapabilities = Object.freeze({
   runs: true,
   plugins: true,
   subscriptions: true,
-  // The reverse seam exists in the protocol, but this host has no production
-  // reverse request to make. Declaring it would be a claim nothing backs.
-  reverseRequests: false,
+  // Backed by the generic mechanism in `reverse.ts`: a connection that also
+  // declares the capability can be asked, its answer is correlated and
+  // validated against the profile that made the method real, and every pending
+  // ends with its connection, its stream or the host. The *business* registry is
+  // empty — no shipped method exists — but the mechanism itself is real and
+  // tested, which is exactly what this flag claims.
+  reverseRequests: true,
 });
 
 /**
@@ -139,16 +145,57 @@ export function handleFrame(state: HostState, connection: ConnectionState, frame
 }
 
 /**
- * Reads a response to a request this host never made.
+ * Reads one client response.
  *
- * v1 has no production reverse request, so every response is unassociated: it
- * is validated — a frame that cannot be read at all is a connection fault — and
- * then dropped, without touching the run it may have been meant for.
+ * Two kinds arrive here: an answer to a reverse request this host is still
+ * waiting for, and a frame that is associated with nothing — v1 ships no
+ * business method, so an unassociated response is validated and dropped without
+ * answering it or touching the run it may have been meant for.
+ *
+ * An associated answer has to match this connection's context before it can
+ * settle anything: the instance, the stream the request was sent on, and the
+ * profile that made the method sendable. Anything else is a peer that cannot be
+ * trusted with the wait, and the connection ends — the pending included.
  */
-function acceptClientResponse(state: HostState, connection: ConnectionState, envelope: unknown): void {
-  if (!validateMessage({ kind: "client-response" }, envelope).success) {
-    closeConnection(state, connection);
+function acceptClientResponse(
+  state: HostState,
+  connection: ConnectionState,
+  envelope: ClientResponseEnvelope,
+): void {
+  const pending = connection.reverse.pending.get(envelope.requestId);
+
+  if (pending === undefined) {
+    if (!validateMessage({ kind: "client-response" }, envelope).success) {
+      closeConnection(state, connection);
+    }
+    return;
   }
+
+  if (
+    envelope.protocolVersion !== PROTOCOL_VERSION ||
+    envelope.hostInstanceId !== state.hostInstanceId ||
+    envelope.streamId !== pending.streamId
+  ) {
+    closeConnection(state, connection);
+    return;
+  }
+
+  const validated = validateMessage({ kind: "client-response" }, envelope);
+  if (!validated.success) {
+    closeConnection(state, connection);
+    return;
+  }
+
+  const answer = validated.output;
+  if (answer.error !== undefined) {
+    answerReversePending(connection, pending, { ok: false, error: answer.error });
+    return;
+  }
+  if (!pending.acceptsResult(answer.result)) {
+    closeConnection(state, connection);
+    return;
+  }
+  answerReversePending(connection, pending, { ok: true, result: answer.result });
 }
 
 function dispatchClientRequest(
@@ -306,6 +353,13 @@ function dispatchClientRequest(
       // The cut and the response are one synchronous step: the snapshot is what
       // the catalogues hold right now, and the response is queued on this
       // connection before anything can put an event on the new stream.
+      //
+      // A replacement ends the old scope first: its reverse requests can no
+      // longer be answered, and clearing them here — before the cut — keeps
+      // their completion from landing in the middle of it.
+      const previous = connection.subscription;
+      if (previous !== undefined) dropReverseForStream(connection, previous.streamId, "stream-gone");
+
       const streamId = newId();
       const result: OperationMap["subscriptions.open"]["result"] = {
         snapshot: captureHostSnapshot(state, streamId),
@@ -326,7 +380,10 @@ function dispatchClientRequest(
     case "subscriptions.close": {
       const current = connection.subscription;
       const closed = current !== undefined && current.streamId === request.params.streamId;
-      if (closed) connection.subscription = undefined;
+      if (closed) {
+        connection.subscription = undefined;
+        dropReverseForStream(connection, request.params.streamId, "stream-gone");
+      }
       const result: OperationMap["subscriptions.close"]["result"] = { closed };
       sendSuccess(
         state,

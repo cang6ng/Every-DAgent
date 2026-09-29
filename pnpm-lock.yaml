@@ -14,6 +14,9 @@ importers:
       '@every-dagent/agent-core':
         specifier: workspace:*
         version: link:packages/agent-core
+      '@every-dagent/client':
+        specifier: workspace:*
+        version: link:packages/client
       '@every-dagent/host':
         specifier: workspace:*
         version: link:packages/host
@@ -40,6 +43,12 @@ importers:
         version: 3.2.7(@types/node@24.19.0)
 
   packages/agent-core: {}
+
+  packages/client:
+    dependencies:
+      '@every-dagent/protocol':
+        specifier: workspace:*
+        version: link:../protocol
 
   packages/host:
     dependencies:

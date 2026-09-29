@@ -29,8 +29,10 @@ import { PROTOCOL_VERSION, validateMessage } from "@every-dagent/protocol";
 import { closeConnection, createConnection, observePlugin } from "./connection.js";
 import { handleFrame } from "./dispatch.js";
 import { projectPluginInfo } from "./projection.js";
+import { createReverseTrigger } from "./reverse.js";
+import type { ReverseProfile, ReverseTrigger } from "./reverse.js";
 import { createRegistryGate } from "./registry-gate.js";
-import { captureHostSnapshot, newId, type HostState } from "./state.js";
+import { captureHostSnapshot, newId, type ConnectionState, type HostState } from "./state.js";
 
 const HOST_NAME = "every-dagent-host";
 const HOST_VERSION = "0.1.0";
@@ -62,7 +64,39 @@ export interface Host {
   shutdown(): Promise<void>;
 }
 
+/**
+ * Composition the package index deliberately does not export.
+ *
+ * The only entry here is the test-only reverse catalog: production passes none,
+ * so nothing can be sent, and a profile is the single way to make a method real.
+ * Everything else about a host is reached through `createHost`.
+ */
+export interface HostInternals {
+  /** Test-only reverse profiles; the production catalog is empty. */
+  readonly reverseProfiles?: readonly ReverseProfile[];
+  /** Test-only observer: hands out each connection's reverse trigger as it is attached. */
+  readonly onAttach?: (attached: AttachedConnection) => void;
+}
+
+/** One attached connection, seen by tests: the channel, the trigger, the disposer. */
+export interface AttachedConnection {
+  readonly channel: ProtocolChannel;
+  readonly reverse: ReverseTrigger;
+  readonly detach: () => void;
+}
+
+export interface ComposedHost {
+  readonly host: Host;
+  /** Attaches like `Host.attach` and hands back the connection's own trigger. */
+  attach(channel: ProtocolChannel): AttachedConnection;
+}
+
 export function createHost(options: HostOptions): Host {
+  return composeHost(options, {}).host;
+}
+
+/** The real composition: `createHost` is this with no internals. */
+export function composeHost(options: HostOptions, internals: HostInternals): ComposedHost {
   const registry = createToolRegistry();
   const manager = createPluginManager({
     tools: registry,
@@ -75,6 +109,7 @@ export function createHost(options: HostOptions): Host {
     tools: registry,
     contextBuilder,
   });
+  const reverseProfiles = internals.reverseProfiles ?? [];
 
   const state: HostState = {
     hostInstanceId: newId(),
@@ -108,9 +143,25 @@ export function createHost(options: HostOptions): Host {
 
   assertSelfDescription(state);
 
+  const attach = (channel: ProtocolChannel): AttachedConnection => {
+    const connection = attachConnection(state, channel, reverseProfiles);
+    const attached: AttachedConnection = {
+      channel,
+      reverse: createReverseTrigger(state, connection),
+      detach: (): void => {
+        detachConnection(state, connection);
+      },
+    };
+    internals.onAttach?.(attached);
+    return attached;
+  };
+
   return {
-    attach: (channel: ProtocolChannel): (() => void) => attach(state, channel),
-    shutdown: (): Promise<void> => shutdownHost(state),
+    host: {
+      attach: (channel: ProtocolChannel): (() => void) => attach(channel).detach,
+      shutdown: (): Promise<void> => shutdownHost(state),
+    },
+    attach,
   };
 }
 
@@ -140,18 +191,25 @@ function assertSelfDescription(state: HostState): void {
   }
 }
 
-function attach(state: HostState, channel: ProtocolChannel): () => void {
+/**
+ * Takes one logical connection and installs its listener.
+ *
+ * Dispatching from a microtask keeps a synchronous transport from re-entering a
+ * host transaction through `send`, and keeps one slow operation from holding up
+ * the frame behind it.
+ */
+function attachConnection(
+  state: HostState,
+  channel: ProtocolChannel,
+  reverseProfiles: readonly ReverseProfile[],
+): ConnectionState {
   if (state.closing) {
     throw new Error("the host is shutting down and accepts no new connections");
   }
 
-  const connection = createConnection(channel);
+  const connection = createConnection(channel, reverseProfiles);
   state.connections.add(connection);
-
-  const detachListener = channel.listen({
-    // Dispatching from a microtask keeps a synchronous transport from
-    // re-entering a host transaction through `send`, and keeps one slow
-    // operation from holding up the frame behind it.
+  connection.detachListener = channel.listen({
     onFrame: (frame: string): void => {
       queueMicrotask(() => {
         handleFrame(state, connection, frame);
@@ -162,13 +220,14 @@ function attach(state: HostState, channel: ProtocolChannel): () => void {
     },
   });
 
-  let detached = false;
-  return () => {
-    if (detached) return;
-    detached = true;
-    closeConnection(state, connection);
-    detachListener();
-  };
+  return connection;
+}
+
+function detachConnection(state: HostState, connection: ConnectionState): void {
+  if (connection.closed) return;
+  closeConnection(state, connection);
+  connection.detachListener?.();
+  connection.detachListener = undefined;
 }
 
 /**
