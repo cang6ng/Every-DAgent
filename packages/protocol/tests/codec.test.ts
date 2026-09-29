@@ -137,6 +137,23 @@ describe("encodeFrame", () => {
     expect(encoded).toMatchObject({ success: false });
   });
 
+  it("refuses a message carrying a nested sparse array before it becomes a frame", () => {
+    const sparse: unknown[] = new Array(2);
+    sparse[0] = 1;
+    const hollow: unknown[] = new Array(3);
+    for (const nested of [
+      { sessionId: "s-1", submissionId: "sub-1", text: "hello", extra: { deep: [1, sparse] } },
+      { sessionId: "s-1", submissionId: "sub-1", text: "hello", extra: { deep: [1, hollow] } },
+    ]) {
+      const encoded = encodeFrame(
+        { kind: "client-request" },
+        businessRequest("runs.start", nested) as never,
+      );
+      expect(encoded).toMatchObject({ success: false });
+      if (!encoded.success) expect(encoded.failure.reason).toBe("NON_JSON_VALUE");
+    }
+  });
+
   it("serializes the methodless error-only response for unknown methods", () => {
     const errorResponse = {
       kind: "host-response",

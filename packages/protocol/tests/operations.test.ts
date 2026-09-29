@@ -563,4 +563,24 @@ describe("host snapshot consistency (single-snapshot cross-field)", () => {
     );
     expect(duplicateRunId).toMatchObject({ success: false });
   });
+
+  it("anchors every terminal run to an existing session — settled runs are never orphans", () => {
+    for (const status of ["completed", "limited", "cancelled", "failed"] as const) {
+      const run = { ...terminalRun(status), sessionId: "s-orphan", submissionId: `sub-${status}` };
+      const response = validateMessage(
+        { kind: "host-response", method: "subscriptions.open" },
+        hostResponseSuccess({ snapshot: snapshotWith([run], [readySession(null)]) }),
+      );
+      expect(response).toMatchObject({ success: false });
+      if (!response.success) expect(response.failure.reason).toBe("INVALID_MESSAGE");
+    }
+  });
+
+  it("accepts a settled terminal run whose session exists in the snapshot", () => {
+    const response = validateMessage(
+      { kind: "host-response", method: "subscriptions.open" },
+      hostResponseSuccess({ snapshot: snapshotWith([terminalRun("completed")], [readySession(null)]) }),
+    );
+    expect(response.success).toBe(true);
+  });
 });

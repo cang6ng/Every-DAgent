@@ -97,18 +97,35 @@ function walkArray(
   if (proto !== Array.prototype && proto !== null) throw GUARD_FAILURE;
   if (Object.getOwnPropertySymbols(array).length > 0) throw GUARD_FAILURE;
 
+  // The array's declared size comes from its own `length` DESCRIPTOR — never
+  // from a `.length` read ([[Get]]). A missing or accessor length is not an
+  // array the wire can reproduce.
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(array, "length");
+  if (
+    lengthDescriptor === undefined ||
+    lengthDescriptor.get !== undefined ||
+    lengthDescriptor.set !== undefined
+  ) {
+    throw GUARD_FAILURE;
+  }
+  const length = lengthDescriptor.value;
+  if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0) {
+    throw GUARD_FAILURE;
+  }
+
   const copy: JsonValue[] = [];
   let index = 0;
   for (const name of Object.getOwnPropertyNames(array)) {
     if (name === "length") continue;
-    // A dense array's own property names are exactly its canonical indices in
-    // order; anything else — holes, reordered keys, extra non-index keys —
-    // cannot round-trip as a JSON array. The length comes from the count of
-    // index keys, so `.length` (a [[Get]]) is never read.
-    if (name !== String(index)) throw GUARD_FAILURE;
+    // A dense array's own property names are exactly its canonical indices 0
+    // .. length - 1, in order, and nothing else. This is what rejects
+    // trailing holes (`x.length = 3`), fully hollow arrays (`new Array(3)`)
+    // and stray non-index keys — none of which may be silently truncated.
+    if (index >= length || name !== String(index)) throw GUARD_FAILURE;
     copy.push(walk(ownDataValue(array, name), ancestors, memo));
     index++;
   }
+  if (index !== length) throw GUARD_FAILURE;
 
   memo.set(array, copy);
   return copy;

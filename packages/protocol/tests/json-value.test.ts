@@ -127,6 +127,38 @@ describe("strict JsonValue guard — rejected", () => {
     rejects(outer);
   });
 
+  it("accepts a genuinely dense empty array and dense nested arrays", () => {
+    accepts(new Array(0));
+    accepts([[], [1, [2]], [[[[3]]]]]);
+  });
+
+  it("rejects fully hollow arrays instead of truncating them to []", () => {
+    // Regression: own names are just ["length"]; the old walk silently
+    // produced []. The own length descriptor must demand indices 0..length-1.
+    rejects(new Array(3));
+    rejects(new Array(1));
+  });
+
+  it("rejects trailing holes created by extending length", () => {
+    const trailing: unknown[] = [1];
+    trailing.length = 3;
+    rejects(trailing);
+
+    const widened: unknown[] = [1, 2];
+    widened.length = 5;
+    rejects(widened);
+  });
+
+  it("rejects sparse arrays nested inside valid structures", () => {
+    const sparse: unknown[] = new Array(2);
+    sparse[0] = 1;
+    rejects({ outer: { inner: [1, sparse] } });
+
+    const trailing: unknown[] = [1];
+    trailing.length = 2;
+    rejects([trailing, [trailing]]);
+  });
+
   it("rejects sparse arrays and arrays with extra non-index properties", () => {
     const sparse: unknown[] = new Array(3);
     sparse[1] = 1;

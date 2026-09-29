@@ -113,8 +113,10 @@ describe("reverse seam roundtrip over a memory channel", () => {
     if (encodedRequest.success) hostSide.send(encodedRequest.output);
     expect(clientFrames.length).toBe(1);
 
-    // Client: decode the frame, validate the envelope, refine the params.
-    const validated = validateMessage({ kind: "host-request" }, JSON.parse(clientFrames[0]));
+    // Client: frame → decodeFrame → validateMessage → refine the params.
+    const decodedRequest = decodeFrame(clientFrames[0]);
+    expect(decodedRequest.success).toBe(true);
+    const validated = validateMessage({ kind: "host-request" }, decodedRequest.success ? decodedRequest.output : undefined);
     expect(validated.success).toBe(true);
     if (validated.success) {
       const hostRequestMessage = validated.output as HostRequest;
@@ -131,9 +133,14 @@ describe("reverse seam roundtrip over a memory channel", () => {
       if (encodedResponse.success) clientSide.send(encodedResponse.output);
     }
 
-    // Host side: decode, validate, correlate, refine the result.
+    // Host side: frame → decodeFrame → validateMessage → refine the result.
     expect(hostFrames.length).toBe(1);
-    const hostValidated = validateMessage({ kind: "client-response" }, JSON.parse(hostFrames[0]));
+    const decodedResponse = decodeFrame(hostFrames[0]);
+    expect(decodedResponse.success).toBe(true);
+    const hostValidated = validateMessage(
+      { kind: "client-response" },
+      decodedResponse.success ? decodedResponse.output : undefined,
+    );
     expect(hostValidated.success).toBe(true);
     if (hostValidated.success) {
       const result = refineTestEchoResult((hostValidated.output as { result: unknown }).result);
@@ -156,18 +163,29 @@ describe("reverse seam roundtrip over a memory channel", () => {
     expect(encodedRequest.success).toBe(true);
     if (encodedRequest.success) hostSide.send(encodedRequest.output);
 
-    // The client validates the envelope, finds no handler for the method, and
-    // refuses through its own response channel: a client-response error.
-    const validated = validateMessage({ kind: "host-request" }, JSON.parse(clientFrames[0]));
+    // The client decodes the frame, validates the envelope, finds no handler
+    // for the method, and refuses through its own response channel: a
+    // client-response error carrying METHOD_NOT_FOUND.
+    const decodedRequest = decodeFrame(clientFrames[0]);
+    expect(decodedRequest.success).toBe(true);
+    const validated = validateMessage({ kind: "host-request" }, decodedRequest.success ? decodedRequest.output : undefined);
     expect(validated.success).toBe(true);
-    const refusal = clientResponseError();
-    (refusal as Record<string, unknown>)["requestId"] = (JSON.parse(clientFrames[0]) as Record<string, unknown>)["requestId"];
-    (refusal as Record<string, unknown>)["error"] = { code: "METHOD_NOT_FOUND", message: "unknown reverse method" };
-    const encodedRefusal = encodeFrame({ kind: "client-response" }, refusal as never);
-    expect(encodedRefusal.success).toBe(true);
-    if (encodedRefusal.success) clientSide.send(encodedRefusal.output);
+    if (validated.success) {
+      const refusal = clientResponseError();
+      (refusal as Record<string, unknown>)["requestId"] = (validated.output as HostRequest).requestId;
+      (refusal as Record<string, unknown>)["error"] = { code: "METHOD_NOT_FOUND", message: "unknown reverse method" };
+      const encodedRefusal = encodeFrame({ kind: "client-response" }, refusal as never);
+      expect(encodedRefusal.success).toBe(true);
+      if (encodedRefusal.success) clientSide.send(encodedRefusal.output);
+    }
 
-    const hostReceived = validateMessage({ kind: "client-response" }, JSON.parse(hostFrames[0]));
+    // The host decodes the frame before correlating the refusal.
+    const decodedRefusal = decodeFrame(hostFrames[0]);
+    expect(decodedRefusal.success).toBe(true);
+    const hostReceived = validateMessage(
+      { kind: "client-response" },
+      decodedRefusal.success ? decodedRefusal.output : undefined,
+    );
     expect(hostReceived.success).toBe(true);
     if (hostReceived.success) {
       expect((hostReceived.output as { error?: { code: string } }).error?.code).toBe("METHOD_NOT_FOUND");

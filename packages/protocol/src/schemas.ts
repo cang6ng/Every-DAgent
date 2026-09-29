@@ -407,6 +407,9 @@ const hostSnapshotSchema: v.GenericSchema<HostSnapshot> = v.pipe(
       pointed.add(run.runId);
     }
     for (const run of snapshot.runs) {
+      // Every run — active OR terminal — must anchor to a session that exists
+      // in this snapshot; a settled run is history, never an orphan.
+      if (!sessionIds.has(run.sessionId)) return false;
       if ((run.status === "accepted" || run.status === "running") && !pointed.has(run.runId)) {
         return false;
       }
