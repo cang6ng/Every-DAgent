@@ -86,6 +86,33 @@ describe("decodeFrame", () => {
     const broken = decodeFrame('{"kind":"client-request","requestId":"c-8"');
     if (!broken.success) expect(broken.failure.correlation).toBeUndefined();
   });
+
+  it("keeps an unknown method decodable so the second layer can answer UNKNOWN_METHOD", () => {
+    // Regression guard for the two-layer design: if the base decode ever ran
+    // v1 request schemas, an unknown method would die here as INVALID_ENVELOPE
+    // instead of surviving to a routable UNKNOWN_METHOD.
+    const decoded = decodeFrame(JSON.stringify(
+      businessRequest("credentials.steal", {}),
+    ));
+    expect(decoded.success).toBe(true);
+    if (decoded.success) expect(decoded.output).toMatchObject({ kind: "client-request" });
+
+    const validated = validateMessage({ kind: "client-request" }, JSON.parse(JSON.stringify(businessRequest("credentials.steal", {}))));
+    expect(validated).toMatchObject({ success: false });
+    if (!validated.success) expect(validated.failure.reason).toBe("UNKNOWN_METHOD");
+  });
+
+  it("treats prototype-chain method names as unknown at both layers, without crashing", () => {
+    for (const method of ["constructor", "toString", "__proto__", "prototype"]) {
+      const frame = JSON.stringify(businessRequest(method, {}));
+      const decoded = decodeFrame(frame);
+      expect(decoded.success).toBe(true);
+
+      const validated = validateMessage({ kind: "client-request" }, JSON.parse(frame));
+      expect(validated).toMatchObject({ success: false });
+      if (!validated.success) expect(validated.failure.reason).toBe("UNKNOWN_METHOD");
+    }
+  });
 });
 
 describe("encodeFrame", () => {

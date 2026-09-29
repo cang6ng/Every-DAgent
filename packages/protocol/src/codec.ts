@@ -15,10 +15,11 @@
 import * as v from "valibot";
 
 import type { Id, JsonValue } from "./contracts.js";
-import { isStrictJsonValue, safeJsonSnapshot } from "./json-value.js";
+import { guardJsonSnapshot, isStrictJsonValue } from "./json-value.js";
 import { idSchema } from "./schemas.js";
 import {
   validateMessageCore,
+  type RequestCorrelation,
   type ValidationFailureReason,
   type ValidationTarget,
 } from "./validation.js";
@@ -178,10 +179,11 @@ export function decodeFrame(frame: string): { success: true; output: DecodedEnve
   if (typeof parsed !== "object" || parsed === null) return failure("INVALID_ENVELOPE");
 
   // `JSON.parse` can still produce non-JSON values: `1e999` becomes
-  // `Infinity`, `[-0]` keeps its sign. The guard is what makes the wire
-  // boundary honest, not the parser.
-  if (!isStrictJsonValue(parsed)) return failure("NON_JSON_VALUE");
-  const snapshot = safeJsonSnapshot(parsed);
+  // `Infinity`, `[-0]` keeps its sign, and a literal `-0` survives. The
+  // single-pass guard is what makes the wire boundary honest, not the parser.
+  const guarded = guardJsonSnapshot(parsed);
+  if (!guarded.ok) return failure("NON_JSON_VALUE");
+  const snapshot = guarded.snapshot;
 
   if (typeof snapshot !== "object" || snapshot === null || Array.isArray(snapshot)) {
     return failure("INVALID_ENVELOPE");
@@ -221,18 +223,46 @@ function correlationOf(
   return { kind, requestId };
 }
 
+/** One encode attempt's outcome. */
+type EncodeFrameResult = {
+  success: true;
+  output: string;
+} | {
+  success: false;
+  failure: { reason: ValidationFailureReason; correlation?: RequestCorrelation };
+};
+
 /**
  * Validates a message against the frozen v1 contract and serializes the
- * validated output. Overloads tie each target to the message type it accepts;
- * the methodless `host-response` target takes only the error-only response.
+ * validated output.
+ *
+ * The `host-response` overloads are enumerated per method on purpose: the
+ * target's method and the message's response type are correlated pair by
+ * pair, so `encodeFrame({ kind: "host-response", method: "runs.get" }, some
+ * HostResponse<"sessions.list">)` is a compile error — a generic `<M>`
+ * overload would let inference widen the pair and defer the mismatch to
+ * runtime. A union-typed target matches none of the overloads and must be
+ * narrowed first. The methodless overload still takes only the error-only
+ * response (the unknown-method / bootstrap path).
  */
-export function encodeFrame(target: { readonly kind: "client-request" }, message: ClientRequest): { success: true; output: string } | { success: false; failure: { reason: ValidationFailureReason; correlation?: { kind: "client-request" | "host-request"; requestId: Id } } };
-export function encodeFrame(target: { readonly kind: "host-request" }, message: HostRequest): { success: true; output: string } | { success: false; failure: { reason: ValidationFailureReason } };
-export function encodeFrame(target: { readonly kind: "client-response" }, message: ClientResponse): { success: true; output: string } | { success: false; failure: { reason: ValidationFailureReason } };
-export function encodeFrame(target: { readonly kind: "host-event" }, message: HostEvent): { success: true; output: string } | { success: false; failure: { reason: ValidationFailureReason } };
-export function encodeFrame<M extends OperationName>(target: { readonly kind: "host-response"; readonly method: M }, message: HostResponse<M>): { success: true; output: string } | { success: false; failure: { reason: ValidationFailureReason } };
-export function encodeFrame(target: { readonly kind: "host-response"; readonly method?: never }, message: HostErrorResponse): { success: true; output: string } | { success: false; failure: { reason: ValidationFailureReason } };
-export function encodeFrame(target: ValidationTarget, message: unknown): { success: true; output: string } | { success: false; failure: { reason: ValidationFailureReason; correlation?: { kind: "client-request" | "host-request"; requestId: Id } } } {
+export function encodeFrame(target: { readonly kind: "client-request" }, message: ClientRequest): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-request" }, message: HostRequest): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "client-response" }, message: ClientResponse): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-event" }, message: HostEvent): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "host.describe" }, message: HostResponse<"host.describe">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "sessions.list" }, message: HostResponse<"sessions.list">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "sessions.create" }, message: HostResponse<"sessions.create">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "sessions.get" }, message: HostResponse<"sessions.get">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "runs.start" }, message: HostResponse<"runs.start">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "runs.get" }, message: HostResponse<"runs.get">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "runs.cancel" }, message: HostResponse<"runs.cancel">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "plugins.list" }, message: HostResponse<"plugins.list">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "plugins.enable" }, message: HostResponse<"plugins.enable">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "plugins.disable" }, message: HostResponse<"plugins.disable">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "subscriptions.open" }, message: HostResponse<"subscriptions.open">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "subscriptions.close" }, message: HostResponse<"subscriptions.close">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method?: never }, message: HostErrorResponse): EncodeFrameResult;
+export function encodeFrame(target: ValidationTarget, message: unknown): EncodeFrameResult {
   const validated = validateMessageCore(target, message);
   if (!validated.success) return validated;
   try {

@@ -351,3 +351,216 @@ describe("operation responses", () => {
     if (!result.success) expect(result.failure.reason).toBe("INVALID_TARGET");
   });
 });
+
+describe("prototype-chain selectors must not resolve (own-key checks)", () => {
+  it("answers inherited Object.prototype names with UNKNOWN_METHOD, never a crash", () => {
+    for (const method of ["constructor", "toString", "__proto__", "prototype", "valueOf"]) {
+      const result = validateMessage(
+        { kind: "client-request" },
+        businessRequest(method, {}),
+      );
+      expect(result).toMatchObject({ success: false });
+      if (!result.success) {
+        expect(result.failure.reason).toBe("UNKNOWN_METHOD");
+        expect(result.failure.correlation).toEqual({ kind: "client-request", requestId: "c-2" });
+      }
+    }
+  });
+
+  it("reports INVALID_TARGET for a host-response selector that only exists on prototypes", () => {
+    const result = validateMessage(
+      { kind: "host-response", method: "toString" } as unknown as { kind: "host-response"; method?: never },
+      hostResponseError(),
+    );
+    expect(result).toMatchObject({ success: false });
+    if (!result.success) expect(result.failure.reason).toBe("INVALID_TARGET");
+  });
+
+  it("keeps plugin id params on the frozen plugin-id shape", () => {
+    for (const pluginId of ["Calculator", "", "has space", "ünicode"]) {
+      const result = validateMessage(
+        { kind: "client-request" },
+        businessRequest("plugins.enable", { pluginId }),
+      );
+      expect(result).toMatchObject({ success: false });
+    }
+  });
+});
+
+describe("canonical occurrence validation (array-level)", () => {
+  function canonicalSession(items: unknown[]): Record<string, unknown> {
+    return { sessionId: "s-1", createdAt: 1000, status: "ready", activeRunId: null, canonical: items };
+  }
+
+  const call = (invocationId: string, callId: string) => ({
+    kind: "tool-call", id: `i-${invocationId}`, turnId: "turn-1",
+    invocationId, callId, name: "calculator", input: { kind: "json", value: { a: 1 } },
+  });
+  const result = (invocationId: string, callId: string) => ({
+    kind: "tool-result", id: `r-${invocationId}`, turnId: "turn-1",
+    invocationId, callId, name: "calculator", ok: true, content: "42",
+  });
+
+  it("keeps two distinct invocations that share one empty or repeated callId", () => {
+    for (const callId of ["", "call-1"]) {
+      const session = canonicalSession([
+        { kind: "user", id: "u-1", turnId: "turn-1", text: "go" },
+        call("inv-1", callId),
+        result("inv-1", callId),
+        call("inv-2", callId),
+        result("inv-2", callId),
+      ]);
+      const response = validateMessage(
+        { kind: "host-response", method: "sessions.get" },
+        hostResponseSuccess({ session }),
+      );
+      expect(response.success).toBe(true);
+      if (response.success) {
+        // Mutation guard: a callId-deduplicating implementation would drop
+        // the second occurrence; both invocations must survive as their own
+        // call + result pair.
+        const canonical = (response.output as unknown as {
+          result: { session: { canonical: { kind: string; invocationId?: string }[] } };
+        }).result.session.canonical;
+        expect(
+          canonical.filter((item) => item.kind.startsWith("tool")).map((item) => item.invocationId),
+        ).toEqual(["inv-1", "inv-1", "inv-2", "inv-2"]);
+      }
+    }
+  });
+
+  it("rejects a tool-result with no preceding matching tool-call", () => {
+    const orphan = validateMessage(
+      { kind: "host-response", method: "sessions.get" },
+      hostResponseSuccess({ session: canonicalSession([result("inv-1", "call-1")]) }),
+    );
+    expect(orphan).toMatchObject({ success: false });
+  });
+
+  it("rejects a pair whose turnId, callId or name disagrees", () => {
+    const mismatchedCallId = canonicalSession([call("inv-1", "call-1"), result("inv-1", "other")]);
+    const mismatchedName = canonicalSession([
+      call("inv-1", "call-1"),
+      { ...result("inv-1", "call-1"), name: "other-tool" },
+    ]);
+    const mismatchedTurn = canonicalSession([
+      call("inv-1", "call-1"),
+      { ...result("inv-1", "call-1"), turnId: "turn-2" },
+    ]);
+    for (const session of [mismatchedCallId, mismatchedName, mismatchedTurn]) {
+      const response = validateMessage(
+        { kind: "host-response", method: "sessions.get" },
+        hostResponseSuccess({ session }),
+      );
+      expect(response).toMatchObject({ success: false });
+    }
+  });
+
+  it("rejects duplicate item ids and reused invocation identities", () => {
+    const duplicateItemId = canonicalSession([
+      { kind: "user", id: "u-1", turnId: "turn-1", text: "a" },
+      { kind: "user", id: "u-1", turnId: "turn-1", text: "b" },
+    ]);
+    const doubleConsume = canonicalSession([call("inv-1", "call-1"), result("inv-1", "call-1"), result("inv-1", "call-1")]);
+    const reusedInvocation = canonicalSession([call("inv-1", "call-1"), result("inv-1", "call-1"), call("inv-1", "call-2")]);
+    for (const session of [duplicateItemId, doubleConsume, reusedInvocation]) {
+      const response = validateMessage(
+        { kind: "host-response", method: "sessions.get" },
+        hostResponseSuccess({ session }),
+      );
+      expect(response).toMatchObject({ success: false });
+    }
+  });
+
+  it("accepts an empty-string tool name and an empty-string description", () => {
+    const named = canonicalSession([
+      { kind: "tool-call", id: "i-1", turnId: "t-1", invocationId: "inv-1", callId: "", name: "", input: { kind: "unavailable", reason: "not-json-safe" } },
+      { kind: "tool-result", id: "i-2", turnId: "t-1", invocationId: "inv-1", callId: "", name: "", ok: false, content: "" },
+    ]);
+    const response = validateMessage(
+      { kind: "host-response", method: "sessions.get" },
+      hostResponseSuccess({ session: named }),
+    );
+    expect(response.success).toBe(true);
+
+    const describedPlugin = { ...pluginSummary(), description: "" };
+    const plugin = validateMessage(
+      { kind: "host-response", method: "plugins.list" },
+      hostResponseSuccess({ plugins: [describedPlugin] }),
+    );
+    expect(plugin.success).toBe(true);
+  });
+});
+
+describe("host snapshot consistency (single-snapshot cross-field)", () => {
+  function snapshotWith(runs: unknown[], sessions: unknown[]): Record<string, unknown> {
+    return {
+      hostInstanceId: INSTANCE,
+      watermark: { streamId: "stream-1", sequence: 0 },
+      sessions,
+      runs,
+      plugins: [],
+    };
+  }
+
+  const readySession = (activeRunId: string | null) => ({
+    sessionId: "s-1", createdAt: 1000, status: "ready", activeRunId, canonical: [],
+  });
+  const activeRunOf = (runId: string, sessionId: string, submissionId = "sub-1") => ({
+    runId, submissionId, sessionId, text: "hello", turnId: null, cancelRequested: false,
+    status: "running", endReason: null, error: null, live: [],
+  });
+
+  it("accepts each session pointing at its own active run", () => {
+    const response = validateMessage(
+      { kind: "host-response", method: "subscriptions.open" },
+      hostResponseSuccess({ snapshot: snapshotWith(
+        [activeRunOf("r-1", "s-1", "sub-1"), activeRunOf("r-2", "s-2", "sub-2")],
+        [readySession("r-1"), { ...readySession("r-2"), sessionId: "s-2" }],
+      ) }),
+    );
+    expect(response.success).toBe(true);
+  });
+
+  it("rejects an active run that no session points at, or that a terminal run leaves dangling", () => {
+    const unpointed = validateMessage(
+      { kind: "host-response", method: "subscriptions.open" },
+      hostResponseSuccess({ snapshot: snapshotWith([activeRunOf("r-1", "s-1")], [readySession(null)]) }),
+    );
+    expect(unpointed).toMatchObject({ success: false });
+  });
+
+  it("rejects two sessions pointing at the same run, and a pointer across sessions", () => {
+    const sharedPointer = validateMessage(
+      { kind: "host-response", method: "subscriptions.open" },
+      hostResponseSuccess({ snapshot: snapshotWith([activeRunOf("r-1", "s-1")], [readySession("r-1"), { ...readySession("r-1"), sessionId: "s-2" }]) }),
+    );
+    expect(sharedPointer).toMatchObject({ success: false });
+
+    const crossSession = validateMessage(
+      { kind: "host-response", method: "subscriptions.open" },
+      hostResponseSuccess({ snapshot: snapshotWith([activeRunOf("r-1", "s-2")], [readySession("r-1")]) }),
+    );
+    expect(crossSession).toMatchObject({ success: false });
+  });
+
+  it("rejects duplicate submissionIds and duplicate run ids inside one snapshot", () => {
+    const duplicateSubmission = validateMessage(
+      { kind: "host-response", method: "subscriptions.open" },
+      hostResponseSuccess({ snapshot: snapshotWith(
+        [activeRunOf("r-1", "s-1", "sub-1"), activeRunOf("r-2", "s-2", "sub-1")],
+        [readySession("r-1"), { ...readySession("r-2"), sessionId: "s-2" }],
+      ) }),
+    );
+    expect(duplicateSubmission).toMatchObject({ success: false });
+
+    const duplicateRunId = validateMessage(
+      { kind: "host-response", method: "subscriptions.open" },
+      hostResponseSuccess({ snapshot: snapshotWith(
+        [activeRunOf("r-1", "s-1"), { ...activeRunOf("r-1", "s-2"), submissionId: "sub-2" }],
+        [readySession("r-1"), { ...readySession("r-1"), sessionId: "s-2" }],
+      ) }),
+    );
+    expect(duplicateRunId).toMatchObject({ success: false });
+  });
+});

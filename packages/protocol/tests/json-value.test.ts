@@ -40,7 +40,7 @@ describe("strict JsonValue guard — accepted", () => {
 
   it("accepts legal JSON dictionary keys that a record schema would drop", () => {
     const value = {
-      __proto__: 1,
+      ["__proto__"]: 1,
       constructor: "c",
       prototype: [2],
       toString: { deep: true },
@@ -49,10 +49,41 @@ describe("strict JsonValue guard — accepted", () => {
     expect(result.success).toBe(true);
     if (result.success) {
       expect(Object.getPrototypeOf(result.output)).toBeNull();
+      // The output keeps the own `__proto__` key; the literal on the right
+      // cannot (its `__proto__:` would set a prototype), so spell it out.
       expect(JSON.stringify(result.output)).toBe(
-        JSON.stringify({ __proto__: 1, constructor: "c", prototype: [2], toString: { deep: true } }),
+        JSON.stringify({ ["__proto__"]: 1, constructor: "c", prototype: [2], toString: { deep: true } }),
       );
     }
+  });
+
+  it("keeps a REAL own __proto__ data key as data (regression: never drop or pollute)", () => {
+    // JSON.parse is the honest way to build an own `__proto__` property: an
+    // object literal's `__proto__:` sets the prototype instead.
+    const parsed = JSON.parse('{"__proto__": {"polluted": true}, "constructor": "own", "toString": 5, "nested": {"__proto__": 7}}');
+    const result = validateJsonValue(parsed);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const output = result.output as Record<string, unknown>;
+      // The key survives as an own data property...
+      expect(Object.getOwnPropertyNames(output)).toContain("__proto__");
+      expect(Object.getOwnPropertyNames(output)).toContain("constructor");
+      expect(Object.getOwnPropertyNames(output)).toContain("toString");
+      // ...the output object itself stays clean (no prototype pollution)...
+      expect(Object.getPrototypeOf(output)).toBeNull();
+      expect((output["__proto__"] as Record<string, unknown>)["polluted"]).toBe(true);
+      expect(output["constructor"]).toBe("own");
+      expect(output["toString"]).toBe(5);
+      expect(Object.getOwnPropertyNames(output["nested"] as object)).toContain("__proto__");
+      // ...and the whole thing round-trips through JSON unchanged.
+      expect(JSON.parse(JSON.stringify(output))).toEqual(parsed);
+    }
+  });
+
+  it("rejects non-enumerable own properties (they would silently vanish in JSON)", () => {
+    const hidden = { visible: 1 };
+    Object.defineProperty(hidden, "secret", { value: 2, enumerable: false, writable: true, configurable: true });
+    rejects(hidden);
   });
 
   it("accepts null-prototype objects and frozen inputs", () => {
@@ -158,6 +189,89 @@ describe("strict JsonValue guard — rejected", () => {
       },
     );
     rejects(hostile);
+  });
+
+  it("rejects proxies whose descriptor access throws mid-walk", () => {
+    const hostile = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor(target, key) {
+          if (key === "late") throw new Error("boom");
+          return { value: 1, enumerable: true, writable: true, configurable: true };
+        },
+        ownKeys() {
+          return ["first", "late"];
+        },
+      },
+    );
+    rejects(hostile);
+  });
+
+  it("rejects a proxy descriptor chain that would inject a cycle", () => {
+    const hostile: Record<string, unknown> = new Proxy(
+      {} as Record<string, unknown>,
+      {
+        getOwnPropertyDescriptor() {
+          // The descriptor hands the guard the proxy itself: a cycle that a
+          // naive snapshot stage could still hit.
+          return { value: hostile, enumerable: true, writable: true, configurable: true };
+        },
+        ownKeys() {
+          return ["self"];
+        },
+      },
+    );
+    rejects(hostile);
+  });
+});
+
+describe("strict JsonValue guard — single-pass injection protection", () => {
+  it("never reads through [[Get]]: a value-getting proxy must stay untouched", () => {
+    let getCalls = 0;
+    const undercover = new Proxy(
+      { honest: { value: 1 } } as Record<string, unknown>,
+      {
+        get(target, key) {
+          getCalls += 1;
+          // Injection payload: what a re-reading implementation would see
+          // instead of the validated descriptor values.
+          if (key === "honest") return { value: -0 };
+          return target[key as string];
+        },
+      },
+    );
+    const result = validateJsonValue(undercover);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const nested = (result.output as Record<string, { value: number }>)["honest"];
+      expect(nested["value"]).toBe(1);
+    }
+    // The mutation guard: any check-then-re-read design would trip this.
+    expect(getCalls).toBe(0);
+  });
+
+  it("cannot have -0, NaN or new cycles injected after validation", () => {
+    let step = 0;
+    const shapeshifter = new Proxy(
+      {} as Record<string, unknown>,
+      {
+        // Deterministic per-key descriptors: one poisoned branch of each kind.
+        getOwnPropertyDescriptor(_target, key) {
+          step += 1;
+          if (key === "negative") {
+            return { value: -0, enumerable: true, writable: true, configurable: true };
+          }
+          if (key === "notNumber") {
+            return { value: Number.NaN, enumerable: true, writable: true, configurable: true };
+          }
+          return { value: 1, enumerable: true, writable: true, configurable: true };
+        },
+        ownKeys() {
+          return ["first", "negative", "notNumber"];
+        },
+      },
+    );
+    rejects(shapeshifter);
   });
 });
 

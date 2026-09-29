@@ -6,8 +6,11 @@ import {
   encodeFrame,
   validateJsonValue,
   validateMessage,
+  type ClientCapabilities,
   type ClientRequest,
+  type HostCapabilities,
   type HostEvent,
+  type HostResponse,
   type OperationName,
 } from "@every-dagent/protocol";
 
@@ -109,5 +112,50 @@ describe("public API surface", () => {
     // @ts-expect-error "no.such.method" is not an OperationName
     const failure = validateMessage({ kind: "host-response", method: "no.such.method" }, {});
     expect(failure.success).toBe(false);
+  });
+
+  it("exposes the capability shapes as type-only exports", () => {
+    const client: ClientCapabilities = { reverseRequests: true };
+    const host: HostCapabilities = {
+      sessions: true,
+      runs: true,
+      plugins: true,
+      subscriptions: true,
+      reverseRequests: true,
+    };
+    expect(client.reverseRequests).toBe(true);
+    expect(host.sessions).toBe(true);
+  });
+});
+
+describe("encodeFrame target/message correlation", () => {
+  const listResponse: HostResponse<"sessions.list"> = {
+    kind: "host-response",
+    protocolVersion: "1",
+    hostInstanceId: "host-1",
+    requestId: "c-1",
+    result: { sessions: [] },
+  };
+
+  it("encodes a correctly correlated host-response pair", () => {
+    const ok = encodeFrame({ kind: "host-response", method: "sessions.list" }, listResponse);
+    expect(ok.success).toBe(true);
+    if (ok.success) expect(JSON.parse(ok.output)).toMatchObject({ kind: "host-response" });
+  });
+
+  it("rejects a mismatched target/message pair at the type level", () => {
+    // @ts-expect-error a runs.get target cannot encode a sessions.list response
+    const mismatched = encodeFrame({ kind: "host-response", method: "runs.get" }, listResponse);
+    expect(mismatched.success).toBe(false);
+  });
+
+  it("requires narrowing a union target before encoding", () => {
+    const unionTarget: { kind: "host-response"; method: OperationName } = {
+      kind: "host-response",
+      method: "sessions.list",
+    };
+    // @ts-expect-error a union target matches no per-method overload
+    const untyped = encodeFrame(unionTarget, listResponse);
+    expect(untyped.success).toBe(true);
   });
 });

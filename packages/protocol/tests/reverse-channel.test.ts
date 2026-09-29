@@ -4,12 +4,23 @@ import {
   decodeFrame,
   encodeFrame,
   validateMessage,
+  type HostRequest,
   type ProtocolChannel,
 } from "@every-dagent/protocol";
 
 import { createMemoryChannelPair } from "./helpers/memory-channel.js";
-import { TEST_PROFILE_METHOD, refineTestEchoResult } from "./helpers/reverse-profile.js";
-import { clientResponseSuccess, hostRequest, INSTANCE, STREAM } from "./helpers/fixtures.js";
+import {
+  TEST_PROFILE_METHOD,
+  refineTestEchoParams,
+  refineTestEchoResult,
+} from "./helpers/reverse-profile.js";
+import {
+  clientResponseError,
+  clientResponseSuccess,
+  hostRequest,
+  INSTANCE,
+  STREAM,
+} from "./helpers/fixtures.js";
 
 describe("reverse request envelope", () => {
   it("validates a well-formed host-request with any method name", () => {
@@ -50,14 +61,7 @@ describe("reverse request envelope", () => {
   });
 
   it("validates the error-only client response", () => {
-    const result = validateMessage({ kind: "client-response" }, {
-      kind: "client-response",
-      protocolVersion: "1",
-      hostInstanceId: INSTANCE,
-      streamId: STREAM,
-      requestId: "h-1",
-      error: { code: "METHOD_NOT_FOUND", message: "unknown reverse method" },
-    });
+    const result = validateMessage({ kind: "client-response" }, clientResponseError());
     expect(result.success).toBe(true);
   });
 
@@ -94,32 +98,80 @@ describe("reverse request envelope", () => {
   });
 });
 
-describe("memory channel transport contract", () => {
-  it("delivers string frames both ways and never shares objects", () => {
+describe("reverse seam roundtrip over a memory channel", () => {
+  it("carries a test-only profile Host → Client → Host with real refinement", () => {
     const { clientSide, hostSide } = createMemoryChannelPair();
-    const receivedByHost: string[] = [];
-    const receivedByClient: string[] = [];
+    const clientFrames: string[] = [];
+    const hostFrames: string[] = [];
+    clientSide.listen({ onFrame: (frame) => clientFrames.push(frame), onClose: () => {} });
+    hostSide.listen({ onFrame: (frame) => hostFrames.push(frame), onClose: () => {} });
 
-    hostSide.listen({ onFrame: (frame) => receivedByHost.push(frame), onClose: () => {} });
-    clientSide.listen({ onFrame: (frame) => receivedByClient.push(frame), onClose: () => {} });
-
+    // Host → Client: the reverse request travels from the host side.
     const request = hostRequest(TEST_PROFILE_METHOD, { value: "hi" });
     const encodedRequest = encodeFrame({ kind: "host-request" }, request as never);
     expect(encodedRequest.success).toBe(true);
-    if (encodedRequest.success) clientSide.send(encodedRequest.output);
+    if (encodedRequest.success) hostSide.send(encodedRequest.output);
+    expect(clientFrames.length).toBe(1);
 
-    // The host side parses the STRING it received: JSON roundtrip is forced.
-    expect(receivedByHost.length).toBe(1);
-    const parsed = JSON.parse(receivedByHost[0] as string) as Record<string, unknown>;
-    expect(parsed["method"]).toBe(TEST_PROFILE_METHOD);
-    // What arrived is not the same object the client encoded.
-    expect(parsed).not.toBe(request);
+    // Client: decode the frame, validate the envelope, refine the params.
+    const validated = validateMessage({ kind: "host-request" }, JSON.parse(clientFrames[0]));
+    expect(validated.success).toBe(true);
+    if (validated.success) {
+      const hostRequestMessage = validated.output as HostRequest;
+      expect(hostRequestMessage.method).toBe(TEST_PROFILE_METHOD);
+      const params = refineTestEchoParams(hostRequestMessage.params);
+      expect(params.success).toBe(true);
+      const value = params.success ? params.output.value : "";
 
-    const response = clientResponseSuccess({ echoed: "hi" });
-    const encodedResponse = encodeFrame({ kind: "client-response" }, response as never);
-    expect(encodedResponse.success).toBe(true);
-    if (encodedResponse.success) hostSide.send(encodedResponse.output);
-    expect(receivedByClient.length).toBe(1);
+      // Client → Host: the response travels from the client side and MUST be
+      // a client-response — the Host is the one that reads it.
+      const response = clientResponseSuccess({ echoed: value });
+      const encodedResponse = encodeFrame({ kind: "client-response" }, response as never);
+      expect(encodedResponse.success).toBe(true);
+      if (encodedResponse.success) clientSide.send(encodedResponse.output);
+    }
+
+    // Host side: decode, validate, correlate, refine the result.
+    expect(hostFrames.length).toBe(1);
+    const hostValidated = validateMessage({ kind: "client-response" }, JSON.parse(hostFrames[0]));
+    expect(hostValidated.success).toBe(true);
+    if (hostValidated.success) {
+      const result = refineTestEchoResult((hostValidated.output as { result: unknown }).result);
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.output.echoed).toBe("hi");
+    }
+  });
+
+  it("answers an unknown HostRequest with a client-response error, never a host-response", () => {
+    const { clientSide, hostSide } = createMemoryChannelPair();
+    const clientFrames: string[] = [];
+    const hostFrames: string[] = [];
+    clientSide.listen({ onFrame: (frame) => clientFrames.push(frame), onClose: () => {} });
+    hostSide.listen({ onFrame: (frame) => hostFrames.push(frame), onClose: () => {} });
+
+    const encodedRequest = encodeFrame(
+      { kind: "host-request" },
+      hostRequest("file.pick", {}) as never,
+    );
+    expect(encodedRequest.success).toBe(true);
+    if (encodedRequest.success) hostSide.send(encodedRequest.output);
+
+    // The client validates the envelope, finds no handler for the method, and
+    // refuses through its own response channel: a client-response error.
+    const validated = validateMessage({ kind: "host-request" }, JSON.parse(clientFrames[0]));
+    expect(validated.success).toBe(true);
+    const refusal = clientResponseError();
+    (refusal as Record<string, unknown>)["requestId"] = (JSON.parse(clientFrames[0]) as Record<string, unknown>)["requestId"];
+    (refusal as Record<string, unknown>)["error"] = { code: "METHOD_NOT_FOUND", message: "unknown reverse method" };
+    const encodedRefusal = encodeFrame({ kind: "client-response" }, refusal as never);
+    expect(encodedRefusal.success).toBe(true);
+    if (encodedRefusal.success) clientSide.send(encodedRefusal.output);
+
+    const hostReceived = validateMessage({ kind: "client-response" }, JSON.parse(hostFrames[0]));
+    expect(hostReceived.success).toBe(true);
+    if (hostReceived.success) {
+      expect((hostReceived.output as { error?: { code: string } }).error?.code).toBe("METHOD_NOT_FOUND");
+    }
   });
 
   it("honours single-listener, close-once and late-send-fails semantics", () => {
@@ -132,8 +184,9 @@ describe("memory channel transport contract", () => {
     hostSide.close();
     hostSide.close();
     expect(closed).toBe(1);
+    // The host side is closed, so client → host delivery fails loudly instead
+    // of vanishing.
     expect(() => clientSide.send("{}")).toThrow();
-    void clientSide;
   });
 
   it("keeps the loopback pair assignable to the frozen ProtocolChannel type", () => {
@@ -141,30 +194,5 @@ describe("memory channel transport contract", () => {
       createMemoryChannelPair();
     expect(typeof clientSide.send).toBe("function");
     expect(typeof hostSide.listen).toBe("function");
-  });
-});
-
-describe("reverse seam boundary", () => {
-  it("decodes an unknown-method host-request the Host could answer METHOD_NOT_FOUND to", () => {
-    const encoded = encodeFrame({ kind: "host-request" }, hostRequest("file.pick", {}) as never);
-    expect(encoded.success).toBe(true);
-    if (encoded.success) {
-      const decoded = decodeFrame(encoded.output);
-      expect(decoded.success).toBe(true);
-      if (decoded.success && decoded.output.kind === "host-request") {
-        expect(decoded.output.method).toBe("file.pick");
-      }
-    }
-
-    // And the error-only response path can carry METHOD_NOT_FOUND back.
-    const refusal = {
-      kind: "host-response",
-      protocolVersion: "1",
-      hostInstanceId: INSTANCE,
-      requestId: "h-9",
-      error: { code: "METHOD_NOT_FOUND", message: "unknown method" },
-    } as const;
-    const encodedRefusal = encodeFrame({ kind: "host-response" }, refusal);
-    expect(encodedRefusal.success).toBe(true);
   });
 });

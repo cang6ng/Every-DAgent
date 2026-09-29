@@ -74,6 +74,17 @@ describe("host events", () => {
     if (!result.success) expect(result.failure.reason).toBe("UNKNOWN_EVENT");
   });
 
+  it("answers inherited Object.prototype names with UNKNOWN_EVENT, never a crash", () => {
+    for (const type of ["constructor", "toString", "__proto__", "prototype"]) {
+      const result = validateMessage(
+        { kind: "host-event" },
+        hostEvent(type, RUN_SCOPE, { text: "x" }),
+      );
+      expect(result).toMatchObject({ success: false });
+      if (!result.success) expect(result.failure.reason).toBe("UNKNOWN_EVENT");
+    }
+  });
+
   it("rejects scope/payload id mismatches per event", () => {
     const wrongSession = validateMessage(
       { kind: "host-event" },
@@ -159,6 +170,15 @@ describe("host events", () => {
     );
     expect(first.success).toBe(true);
     expect(second.success).toBe(true);
+  });
+
+  it("keeps an empty-string tool name valid in live items", () => {
+    const nameless = { ...liveToolItem(), name: "" };
+    const result = validateMessage(
+      { kind: "host-event" },
+      hostEvent("run.tool.call", RUN_SCOPE, { item: nameless }),
+    );
+    expect(result.success).toBe(true);
   });
 
   it("strips unknown fields from event payloads but not from scope discrimination", () => {

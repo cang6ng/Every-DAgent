@@ -24,3 +24,8 @@ export type TestEchoResult = v.InferOutput<typeof testEchoResultSchema>;
 export function refineTestEchoResult(result: unknown): v.SafeParseResult<typeof testEchoResultSchema> {
   return v.safeParse(testEchoResultSchema, result);
 }
+
+/** Refines an envelope-valid `host-request` params against the fake profile. */
+export function refineTestEchoParams(params: unknown): v.SafeParseResult<typeof testEchoParamsSchema> {
+  return v.safeParse(testEchoParamsSchema, params);
+}

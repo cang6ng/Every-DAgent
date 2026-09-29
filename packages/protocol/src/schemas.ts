@@ -22,6 +22,7 @@ import * as v from "valibot";
 
 import type {
   ActiveRunSnapshot,
+  CanonicalItem,
   HostDescription,
   HostSnapshot,
   JsonValue,
@@ -170,7 +171,9 @@ const pluginSummarySchema = v.object({
   id: pluginIdSchema,
   name: nonEmptyStringSchema,
   version: nonEmptyStringSchema,
-  description: v.optional(nonEmptyStringSchema),
+  // A plain string on purpose: plugin descriptions come from trusted plugin
+  // authors, and "" is as legitimate as any other text.
+  description: v.optional(v.string()),
   permissions: v.array(v.literal("storage")),
   status: v.union([
     v.literal("disabled"),
@@ -198,6 +201,8 @@ const canonicalBaseEntries = {
 
 // `callId` is a plain string on purpose: Core allows empty and repeated ids,
 // and pairing is by log order + invocationId, never by callId uniqueness.
+// Tool names are plain strings too — a tool owns its name, and "" must not be
+// tightened away by the protocol.
 const canonicalItemSchema = v.variant("kind", [
   v.object({ ...canonicalBaseEntries, kind: v.literal("user"), text: v.string() }),
   v.object({ ...canonicalBaseEntries, kind: v.literal("assistant"), text: v.string() }),
@@ -206,7 +211,7 @@ const canonicalItemSchema = v.variant("kind", [
     kind: v.literal("tool-call"),
     invocationId: idSchema,
     callId: plainStringSchema,
-    name: nonEmptyStringSchema,
+    name: plainStringSchema,
     input: displayInputSchema,
   }),
   v.object({
@@ -214,11 +219,48 @@ const canonicalItemSchema = v.variant("kind", [
     kind: v.literal("tool-result"),
     invocationId: idSchema,
     callId: plainStringSchema,
-    name: nonEmptyStringSchema,
+    name: plainStringSchema,
     ok: v.boolean(),
     content: v.string(),
   }),
 ]);
+
+/**
+ * Occurrence-level consistency of one published canonical array, checked on
+ * the whole array because pair correctness is not a per-item property.
+ *
+ * Pairing is by `invocationId` — never by `callId`, which may be empty and
+ * may repeat across invocations. One invocation is one call plus at most one
+ * result: a call may occur once, a result consumes exactly one preceding,
+ * still-open call, and a pair whose turnId/callId/name disagree is a broken
+ * projection, not bad luck to strip away.
+ */
+function canonicalOccurrencesConsistent(items: readonly CanonicalItem[]): boolean {
+  const itemIds = new Set<string>();
+  const calls = new Set<string>();
+  const results = new Set<string>();
+  const openCalls = new Map<string, { turnId: string; callId: string; name: string }>();
+  for (const item of items) {
+    if (itemIds.has(item.id)) return false;
+    itemIds.add(item.id);
+
+    if (item.kind === "tool-call") {
+      if (calls.has(item.invocationId)) return false;
+      calls.add(item.invocationId);
+      openCalls.set(item.invocationId, { turnId: item.turnId, callId: item.callId, name: item.name });
+    } else if (item.kind === "tool-result") {
+      if (results.has(item.invocationId)) return false;
+      const call = openCalls.get(item.invocationId);
+      if (call === undefined) return false;
+      if (call.turnId !== item.turnId || call.callId !== item.callId || call.name !== item.name) {
+        return false;
+      }
+      results.add(item.invocationId);
+      openCalls.delete(item.invocationId);
+    }
+  }
+  return true;
+}
 
 const sessionSummarySchema: v.GenericSchema<SessionSummary> = v.object({
   sessionId: idSchema,
@@ -227,13 +269,16 @@ const sessionSummarySchema: v.GenericSchema<SessionSummary> = v.object({
   activeRunId: v.union([v.null(), idSchema]),
 });
 
-const sessionSnapshotSchema: v.GenericSchema<SessionSnapshot> = v.object({
-  sessionId: idSchema,
-  createdAt: v.pipe(finiteNumberSchema, v.minValue(0)),
-  status: v.union([v.literal("ready"), v.literal("blocked")]),
-  activeRunId: v.union([v.null(), idSchema]),
-  canonical: v.array(canonicalItemSchema),
-});
+const sessionSnapshotSchema: v.GenericSchema<SessionSnapshot> = v.pipe(
+  v.object({
+    sessionId: idSchema,
+    createdAt: v.pipe(finiteNumberSchema, v.minValue(0)),
+    status: v.union([v.literal("ready"), v.literal("blocked")]),
+    activeRunId: v.union([v.null(), idSchema]),
+    canonical: v.array(canonicalItemSchema),
+  }),
+  v.check((snapshot) => canonicalOccurrencesConsistent(snapshot.canonical)),
+);
 
 // ---------------------------------------------------------------------------
 // Runs.
@@ -246,7 +291,7 @@ const liveToolItemObjectSchema = v.object({
   itemId: idSchema,
   invocationId: idSchema,
   callId: plainStringSchema,
-  name: nonEmptyStringSchema,
+  name: plainStringSchema,
   input: displayInputSchema,
   result: v.union([v.null(), liveToolResultSchema]),
 });
@@ -335,7 +380,12 @@ const hostSnapshotSchema: v.GenericSchema<HostSnapshot> = v.pipe(
     plugins: v.array(pluginSummarySchema),
   }),
   // Directory consistency the snapshot can prove about itself: unique ids,
-  // every run anchored to a session, every active run referenced back.
+  // unique submissions, every run anchored to a session, and the active-run
+  // pointers forming a bijection — each session points at most at its own
+  // active run, and each active run is pointed at by exactly its own session.
+  // This is per-snapshot bookkeeping, NOT a protocol limit on how many runs a
+  // whole Host may run at once; concurrency limits are Host implementation
+  // facts published through `limits.maxActiveRuns`.
   v.check((snapshot) => {
     const sessionIds = new Set(snapshot.sessions.map((session) => session.sessionId));
     if (sessionIds.size !== snapshot.sessions.length) return false;
@@ -343,16 +393,23 @@ const hostSnapshotSchema: v.GenericSchema<HostSnapshot> = v.pipe(
     if (runIds.size !== snapshot.runs.length) return false;
     const pluginIds = new Set(snapshot.plugins.map((plugin) => plugin.id));
     if (pluginIds.size !== snapshot.plugins.length) return false;
+    const submissionIds = new Set(snapshot.runs.map((run) => run.submissionId));
+    if (submissionIds.size !== snapshot.runs.length) return false;
 
-    for (const run of snapshot.runs) {
-      if (!sessionIds.has(run.sessionId)) return false;
-    }
+    const pointed = new Set<string>();
     for (const session of snapshot.sessions) {
       if (session.activeRunId === null) continue;
       const run = snapshot.runs.find((candidate) => candidate.runId === session.activeRunId);
       if (run === undefined) return false;
       if (run.sessionId !== session.sessionId) return false;
       if (run.status !== "accepted" && run.status !== "running") return false;
+      if (pointed.has(run.runId)) return false;
+      pointed.add(run.runId);
+    }
+    for (const run of snapshot.runs) {
+      if ((run.status === "accepted" || run.status === "running") && !pointed.has(run.runId)) {
+        return false;
+      }
     }
     return true;
   }),

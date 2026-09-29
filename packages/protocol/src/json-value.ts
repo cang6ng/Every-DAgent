@@ -4,9 +4,16 @@
  * The validation library (Valibot) checks *structure* — which fields a DTO
  * has and which union branch applies. It cannot see the things that make a
  * value un-JSON: accessor properties, exotic prototypes, `-0`, `NaN`,
- * `bigint`, symbols, cycles. Those are decided here, before any schema runs
- * and before anything is serialized, because a stripped or stringified value
- * can no longer prove what the sender actually held.
+ * `bigint`, symbols, cycles. Those are decided here.
+ *
+ * There is exactly ONE traversal, and it is descriptor-based end to end:
+ * validation and snapshotting happen in the same walk, and every value that
+ * enters the snapshot is the `descriptor.value` that was just checked — the
+ * walk never reads through `value[name]` / `value[i]`. That closes the
+ * injection gap a check-then-re-read design would open: a hostile Proxy can
+ * lie about its own descriptors, but it cannot show the guard one value and
+ * hand the snapshot another, and a trap that throws anywhere turns into a
+ * fixed guard failure instead of a raw exception.
  *
  * This module validates protocol values only. It never projects Core tool
  * inputs — turning an unknown internal value into `DisplayInput` is the
@@ -15,158 +22,136 @@
 
 import type { JsonValue } from "./contracts.js";
 
+/** Internal signal for "this value cannot travel the wire". Never escapes. */
+const GUARD_FAILURE: unique symbol = Symbol("every-dagent.json-guard-failure");
+
+type GuardResult = { readonly ok: true; readonly snapshot: JsonValue } | { readonly ok: false };
+
 /**
- * Whether `value` can travel the wire losslessly.
- *
- * Never throws, never reads through getters, never calls `toJSON`: every
- * property is inspected through its own descriptor. A hostile in-process
- * Proxy can still lie or throw — the `try/catch` turns that into "not
- * JSON-safe", which is honest: this is a value check, not a sandbox.
+ * Validates `value` and, on success, returns an isolated JSON-safe snapshot —
+ * in one pass. Any failure (a non-JSON shape, a cycle, or a Proxy throwing in
+ * any reflection step) resolves to `{ ok: false }`; raw exceptions never
+ * propagate.
  */
-export function isStrictJsonValue(value: unknown): boolean {
+export function guardJsonSnapshot(value: unknown): GuardResult {
   try {
-    return check(value, new Set());
-  } catch {
-    return false;
+    return { ok: true, snapshot: walk(value, new Set<object>(), new Map<object, JsonValue>()) };
+  } catch (error) {
+    // Both guard rejections and hostile-Proxy throws collapse into the same
+    // fixed outcome; nothing rethrows.
+    void error;
+    return { ok: false };
   }
 }
 
-function check(value: unknown, ancestors: Set<object>): boolean {
+/** Boolean form of the same single-pass guard. */
+export function isStrictJsonValue(value: unknown): boolean {
+  return guardJsonSnapshot(value).ok;
+}
+
+function walk(
+  value: unknown,
+  ancestors: Set<object>,
+  memo: Map<object, JsonValue>,
+): JsonValue {
   if (
     value === null ||
     typeof value === "string" ||
     typeof value === "boolean"
   ) {
-    return true;
+    return value;
   }
 
   if (typeof value === "number") {
     // JSON cannot represent either: `NaN`/`Infinity` stringify as `null`, and
     // `-0` would be read back as `0`, silently changing the sender's value.
-    return Number.isFinite(value) && !Object.is(value, -0);
+    if (!Number.isFinite(value) || Object.is(value, -0)) throw GUARD_FAILURE;
+    return value;
   }
 
   // `undefined`, `bigint`, `function`, `symbol` have no JSON form at all.
-  if (typeof value !== "object") return false;
+  if (typeof value !== "object") throw GUARD_FAILURE;
 
-  if (Array.isArray(value)) {
-    const proto = Object.getPrototypeOf(value);
-    if (proto !== Array.prototype && proto !== null) return false;
-    if (ancestors.has(value)) return false;
-    ancestors.add(value);
-    try {
-      return checkArray(value, ancestors);
-    } finally {
-      ancestors.delete(value);
-    }
-  }
+  // Completed nodes are reused by later references (shared structure stays
+  // shared); in-progress nodes are cycles. The ancestor check must come
+  // first: a node on the current path is by definition not in the memo yet.
+  if (ancestors.has(value)) throw GUARD_FAILURE;
+  const memoized = memo.get(value);
+  if (memoized !== undefined) return memoized;
 
-  // Everything else must be a plain (or null-prototype) object: this rejects
-  // class instances, Date, Map, Set, boxed primitives and any custom wrapper.
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) return false;
-  if (ancestors.has(value)) return false;
   ancestors.add(value);
   try {
-    return checkObject(value, ancestors);
+    if (Array.isArray(value)) return walkArray(value, ancestors, memo);
+    return walkObject(value, ancestors, memo);
   } finally {
     ancestors.delete(value);
   }
 }
 
-function checkArray(array: readonly unknown[], ancestors: Set<object>): boolean {
-  const names = Object.getOwnPropertyNames(array);
+function walkArray(
+  array: object,
+  ancestors: Set<object>,
+  memo: Map<object, JsonValue>,
+): JsonValue {
+  const proto = Object.getPrototypeOf(array);
+  if (proto !== Array.prototype && proto !== null) throw GUARD_FAILURE;
+  if (Object.getOwnPropertySymbols(array).length > 0) throw GUARD_FAILURE;
+
+  const copy: JsonValue[] = [];
   let index = 0;
-  for (const name of names) {
+  for (const name of Object.getOwnPropertyNames(array)) {
     if (name === "length") continue;
-    // A dense array's own property names are exactly its canonical indices.
-    // Anything else — sparse holes filled by nothing, extra non-index keys,
-    // symbol keys (checked below) — cannot round-trip as a JSON array.
-    if (name !== String(index)) return false;
+    // A dense array's own property names are exactly its canonical indices in
+    // order; anything else — holes, reordered keys, extra non-index keys —
+    // cannot round-trip as a JSON array. The length comes from the count of
+    // index keys, so `.length` (a [[Get]]) is never read.
+    if (name !== String(index)) throw GUARD_FAILURE;
+    copy.push(walk(ownDataValue(array, name), ancestors, memo));
     index++;
   }
-  if (index !== array.length) return false;
-  if (Object.getOwnPropertySymbols(array).length > 0) return false;
 
-  for (let i = 0; i < array.length; i++) {
-    if (!Object.prototype.hasOwnProperty.call(array, i)) return false;
-    if (!checkDescriptor(Object.getOwnPropertyDescriptor(array, i), ancestors)) return false;
-  }
-  return true;
-}
-
-function checkObject(object: object, ancestors: Set<object>): boolean {
-  if (Object.getOwnPropertySymbols(object).length > 0) return false;
-
-  const names = Object.getOwnPropertyNames(object);
-  for (const name of names) {
-    if (!checkDescriptor(Object.getOwnPropertyDescriptor(object, name), ancestors)) return false;
-  }
-  return true;
-}
-
-/**
- * One own property: must be a data property (never an accessor — reading one
- * could run arbitrary code and its value would not survive the wire) whose
- * value is itself JSON-safe.
- */
-function checkDescriptor(
-  descriptor: PropertyDescriptor | undefined,
-  ancestors: Set<object>,
-): boolean {
-  if (descriptor === undefined) return false;
-  if (descriptor.get !== undefined || descriptor.set !== undefined) return false;
-  return check(descriptor.value, ancestors);
-}
-
-/**
- * A deep, isolated copy of a value that `isStrictJsonValue` already accepted.
- *
- * The snapshot owns its data: later mutations of the original (which the Core
- * only shallow-isolates) cannot reach a published DTO through it. Objects are
- * built with null prototypes so every legal JSON key — including
- * `__proto__`, `constructor` and `prototype`, which a validation library's
- * `record` would silently drop — survives as a plain own property.
- *
- * Sharing without cycles is preserved as structure, not copied per reference;
- * `check`'s ancestor set has already ruled out cycles by the time this runs.
- */
-export function safeJsonSnapshot(value: unknown): JsonValue {
-  if (!isStrictJsonValue(value)) {
-    throw new Error("safeJsonSnapshot requires a value that is a strict JsonValue");
-  }
-  return snapshot(value, new Map());
-}
-
-function snapshot(value: unknown, seen: Map<object, JsonValue>): JsonValue {
-  if (
-    value === null ||
-    typeof value === "string" ||
-    typeof value === "boolean" ||
-    typeof value === "number"
-  ) {
-    return value as JsonValue;
-  }
-
-  if (Array.isArray(value)) {
-    const cached = seen.get(value);
-    if (cached !== undefined) return cached;
-    const copy: JsonValue[] = [];
-    seen.set(value, copy);
-    for (let i = 0; i < value.length; i++) {
-      copy.push(snapshot((value as unknown[])[i], seen));
-    }
-    return copy;
-  }
-
-  const cached = seen.get(value as object);
-  if (cached !== undefined) return cached;
-  // A null-prototype object makes `__proto__` an ordinary data key on
-  // assignment instead of the prototype setter.
-  const copy: Record<string, JsonValue> = Object.create(null);
-  seen.set(value as object, copy);
-  for (const name of Object.getOwnPropertyNames(value)) {
-    copy[name] = snapshot((value as Record<string, unknown>)[name], seen);
-  }
+  memo.set(array, copy);
   return copy;
+}
+
+function walkObject(
+  object: object,
+  ancestors: Set<object>,
+  memo: Map<object, JsonValue>,
+): JsonValue {
+  const proto = Object.getPrototypeOf(object);
+  if (proto !== Object.prototype && proto !== null) throw GUARD_FAILURE;
+  if (Object.getOwnPropertySymbols(object).length > 0) throw GUARD_FAILURE;
+
+  // A null-prototype copy makes every legal JSON key — including a real own
+  // `__proto__` — an ordinary data property on assignment instead of the
+  // prototype setter.
+  const copy: Record<string, JsonValue> = Object.create(null);
+  for (const name of Object.getOwnPropertyNames(object)) {
+    copy[name] = walk(ownDataValue(object, name), ancestors, memo);
+  }
+
+  memo.set(object, copy);
+  return copy;
+}
+
+/**
+ * The single source of every child value: the property's own data descriptor.
+ *
+ * Accessor properties are rejected outright (reading one could run arbitrary
+ * code, and its value would not survive the wire); non-enumerable properties
+ * are rejected because `JSON.stringify` would silently drop them; the value
+ * itself is taken from `descriptor.value`, so no `[[Get]]` ever happens.
+ */
+function ownDataValue(owner: object, name: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(owner, name);
+  if (
+    descriptor === undefined ||
+    descriptor.get !== undefined ||
+    descriptor.set !== undefined ||
+    descriptor.enumerable !== true
+  ) {
+    throw GUARD_FAILURE;
+  }
+  return descriptor.value;
 }

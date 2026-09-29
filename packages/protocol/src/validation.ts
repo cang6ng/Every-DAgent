@@ -17,7 +17,7 @@
 import * as v from "valibot";
 
 import type { Id, JsonValue } from "./contracts.js";
-import { isStrictJsonValue, safeJsonSnapshot } from "./json-value.js";
+import { guardJsonSnapshot } from "./json-value.js";
 import {
   clientRequestSchema,
   hostErrorResponseSchema,
@@ -130,8 +130,8 @@ const clientResponseSchema = v.pipe(
  * back into the caller's objects.
  */
 function guardedSnapshot(input: unknown): { ok: true; snapshot: JsonValue } | { ok: false } {
-  if (typeof input !== "object" || !isStrictJsonValue(input)) return { ok: false };
-  return { ok: true, snapshot: safeJsonSnapshot(input) };
+  if (typeof input !== "object") return { ok: false };
+  return guardJsonSnapshot(input);
 }
 
 /**
@@ -183,7 +183,9 @@ export function validateMessageCore(target: ValidationTarget, input: unknown): V
   }
   if (kind === "host-response") {
     const method = (target as { method?: unknown }).method;
-    if (method !== undefined && !(typeof method === "string" && method in requestSchemas)) {
+    // Own-key check: `in` would hit Object.prototype and let "constructor" or
+    // "toString" masquerade as a real operation selector.
+    if (method !== undefined && !(typeof method === "string" && Object.hasOwn(requestSchemas, method))) {
       // A selector naming an unknown method is a caller bug: it must not be
       // quietly treated as the methodless error path.
       return failure("INVALID_TARGET");
@@ -214,7 +216,8 @@ export function validateMessageCore(target: ValidationTarget, input: unknown): V
         return failure("INVALID_ENVELOPE");
       }
       const method = (snapshot as Record<string, JsonValue>)["method"];
-      if (typeof method !== "string" || !(method in requestSchemas)) {
+      // Own-key check — see the host-response selector above.
+      if (typeof method !== "string" || !Object.hasOwn(requestSchemas, method)) {
         return {
           success: false,
           failure: { reason: "UNKNOWN_METHOD", ...(correlation === undefined ? {} : { correlation }) },
@@ -231,7 +234,8 @@ export function validateMessageCore(target: ValidationTarget, input: unknown): V
         return failure("INVALID_ENVELOPE");
       }
       const type = (snapshot as Record<string, JsonValue>)["type"];
-      if (typeof type !== "string" || !(type in eventSchemas)) {
+      // Own-key check — `in` would accept "toString" as an event type.
+      if (typeof type !== "string" || !Object.hasOwn(eventSchemas, type)) {
         return { success: false, failure: { reason: "UNKNOWN_EVENT" } };
       }
       return run(hostEventSchema) as ValidationResult<HostEvent>;
@@ -246,11 +250,9 @@ export function validateMessageCore(target: ValidationTarget, input: unknown): V
 
 /** Validates that `input` is a strict `JsonValue`, returning an isolated snapshot. */
 export function validateJsonValue(input: unknown): ValidationResult<JsonValue> {
-  if (typeof input !== "object" && typeof input !== "string" && typeof input !== "boolean" && typeof input !== "number" && input !== null) {
-    return failure("NON_JSON_VALUE");
-  }
-  if (!isStrictJsonValue(input)) return failure("NON_JSON_VALUE");
-  return { success: true, output: safeJsonSnapshot(input) };
+  const guarded = guardJsonSnapshot(input);
+  if (!guarded.ok) return failure("NON_JSON_VALUE");
+  return { success: true, output: guarded.snapshot };
 }
 
 /**

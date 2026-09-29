@@ -31,6 +31,7 @@ import {
   idSchema,
   nonEmptyStringSchema,
   plainJsonObjectSchema,
+  pluginIdSchema,
   pluginSummarySchema,
   protocolErrorSchema,
   runSnapshotSchema,
@@ -235,8 +236,8 @@ const paramsSchemas = {
   "runs.get": runsGetParamsSchema,
   "runs.cancel": v.object({ runId: idSchema }),
   "plugins.list": emptyParamsSchema,
-  "plugins.enable": v.object({ pluginId: idSchema }),
-  "plugins.disable": v.object({ pluginId: idSchema }),
+  "plugins.enable": v.object({ pluginId: pluginIdSchema }),
+  "plugins.disable": v.object({ pluginId: pluginIdSchema }),
   "subscriptions.open": emptyParamsSchema,
   "subscriptions.close": v.object({ streamId: idSchema }),
 } as const;
