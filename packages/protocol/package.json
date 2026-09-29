@@ -1,0 +1,12 @@
+{
+  "name": "@every-dagent/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Every-DAgent wire protocol contract: DTOs, envelopes, operations, events, JSON-safe validation and transport-neutral channel types.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "dependencies": {
+    "valibot": "1.5.0"
+  }
+}
