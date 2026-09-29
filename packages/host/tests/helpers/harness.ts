@@ -123,7 +123,15 @@ export interface TestClient {
   detach(): void;
 }
 
-export function connect(host: Host): TestClient {
+export interface ConnectOptions {
+  /**
+   * Wraps the channel the host is given, so a test can make closing the
+   * connection do something of its own — including calling back into the host.
+   */
+  readonly wrapHostChannel?: (channel: ProtocolChannel) => ProtocolChannel;
+}
+
+export function connect(host: Host, options: ConnectOptions = {}): TestClient {
   const { clientSide, hostSide } = createMemoryChannelPair();
   const frames: string[] = [];
   const events: HostEvent[] = [];
@@ -137,7 +145,9 @@ export function connect(host: Host): TestClient {
   let closed = false;
   let detached = false;
 
-  const detachHost = host.attach(hostSide);
+  const hostChannel =
+    options.wrapHostChannel === undefined ? hostSide : options.wrapHostChannel(hostSide);
+  const detachHost = host.attach(hostChannel);
 
   clientSide.listen({
     onFrame(frame: string): void {

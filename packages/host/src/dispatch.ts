@@ -102,6 +102,17 @@ export function handleFrame(state: HostState, connection: ConnectionState, frame
       closeConnection(state, connection);
       return;
     }
+
+    // An id that can be read safely belongs to this connection from this
+    // moment, exactly as a well-formed request's would. Answering an invalid
+    // request without consuming its id would let a later frame spend a name
+    // this connection has already used.
+    if (connection.requestIds.has(correlation.requestId)) {
+      closeConnection(state, connection);
+      return;
+    }
+    connection.requestIds.add(correlation.requestId);
+
     replyError(
       state,
       connection,
@@ -424,11 +435,16 @@ function createHostSession(state: HostState): OperationOutcome<SessionResult> {
 /**
  * One plugin lifecycle operation, under the registry's mutation ownership.
  *
- * The manager is called first and observed immediately: its status is already
- * `enabling`/`disabling` at that point, so a slow activation is visible as one
- * rather than being invented. Whatever the observation does, the lifecycle's own
- * promise is awaited to its end — a projection failure must not release the
- * registry while a plugin is still activating or cleaning up.
+ * The task is registered before the manager is called, and the manager is
+ * called from a microtask: an activation runs synchronously up to its first
+ * await, may hand out a storage view, and may run the plugin's own code — all
+ * of which a shutdown that is already waiting has to be able to see.
+ *
+ * Once it is running, the manager is observed immediately: its status is
+ * already `enabling`/`disabling` at that point, so a slow activation is visible
+ * as one rather than being invented. Whatever the observation does, the
+ * lifecycle's own promise is awaited to its end — a projection failure must not
+ * release the registry while a plugin is still activating or cleaning up.
  */
 function operatePlugin(
   state: HostState,
@@ -446,7 +462,7 @@ function operatePlugin(
   const lease = state.gate.tryAcquire("mutation");
   if (lease === undefined) return Promise.resolve(operationFailed(protocolError("HOST_BUSY")));
 
-  const task = completePluginOperation(state, pluginId, operation, lease);
+  const task = Promise.resolve().then(() => completePluginOperation(state, pluginId, operation, lease));
   trackTask(state, task);
   return task;
 }

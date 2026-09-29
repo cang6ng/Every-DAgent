@@ -170,3 +170,45 @@ describe("subscriptions", () => {
     expect(terminal.status).toBe("completed");
   });
 });
+
+describe("subscription cut under a racing mutation", () => {
+  it("answers the open before the new stream's first event, even when a mutation is in flight", async () => {
+    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const client = connect(host);
+    await client.describe();
+
+    // Both frames are in flight before either is answered: the mutation is
+    // dispatched immediately after the open, with no await in between.
+    const openRequestId = "open-race";
+    const opened = client.call("subscriptions.open", {}, { requestId: openRequestId });
+    const created = client.call("sessions.create", {});
+    const [openResponse, createResponse] = await Promise.all([opened, created]);
+
+    const streamId = openResponse.result?.snapshot.watermark.streamId as string;
+    const sessionId = createResponse.result?.session.sessionId as string;
+
+    // The snapshot is the cut taken before the mutation, and the mutation
+    // arrives as the new stream's first event: nothing falls between them.
+    expect(openResponse.result?.snapshot.sessions).toEqual([]);
+    expect(createResponse.result?.session.sessionId).toBe(sessionId);
+
+    const first = client.events[0];
+    expect(first?.type).toBe("session.created");
+    expect(first?.sequence).toBe(1);
+    expect(streamOf(first as HostEvent)).toBe(streamId);
+
+    // The response frame — found by its own requestId, never by shape alone —
+    // is written before that event leaves the connection.
+    const frames = client.frames.map((frame) => JSON.parse(frame) as Record<string, unknown>);
+    const responseIndex = frames.findIndex(
+      (frame) => frame["kind"] === "host-response" && frame["requestId"] === openRequestId,
+    );
+    const eventIndex = frames.findIndex(
+      (frame) => frame["kind"] === "host-event" && frame["streamId"] === streamId,
+    );
+
+    expect(responseIndex).toBeGreaterThanOrEqual(0);
+    expect(eventIndex).toBeGreaterThan(responseIndex);
+    expect(frames[eventIndex]?.["sequence"]).toBe(1);
+  });
+});

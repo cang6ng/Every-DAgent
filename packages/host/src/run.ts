@@ -89,12 +89,12 @@ export function startRun(
   if (entry.published.status === "blocked") {
     return operationFailed(protocolError("SESSION_UNAVAILABLE"));
   }
-  if (entry.published.activeRunId !== null) {
-    return operationFailed(protocolError("SESSION_UNAVAILABLE"));
-  }
 
   // Waiting is not an option the contract offers, so the decision is made by
-  // execution order: either this call has the registry or it does not.
+  // execution order: either this call has the registry or it does not. A ready
+  // session that already has a run is exactly this case — the run holding it
+  // still owns the token — so the honest answer is HOST_BUSY, not a claim that
+  // the session cannot be used.
   const lease = state.gate.tryAcquire("execution");
   if (lease === undefined) return operationFailed(protocolError("HOST_BUSY"));
 
@@ -128,31 +128,39 @@ export function startRun(
     return operationFailed(protocolError("INTERNAL_ERROR"));
   }
 
+  // The run's completion handle is registered before anything that could call
+  // out of the host. Publishing an accepted event can close an over-full
+  // connection synchronously, and a shutdown that is already waiting must
+  // already be able to see this run — otherwise it would report a clean
+  // shutdown while a turn is about to start.
+  const task = Promise.resolve().then(() => drainRun(state, run));
+  trackTask(state, task);
+
+  // The commit itself: dedup, run record, session pointer. Nothing external
+  // happens between these lines.
   state.runs.set(run.runId, run);
   state.runOrder.push(run.runId);
   state.submissions.set(params.submissionId, run.runId);
   entry.published = session;
+
   publishEvent(state, build);
-
-  // The drain is registered before it can observe anything, and deferred to a
-  // microtask so the accepted state — and this operation's response — are in
-  // place before the turn produces its first event.
-  trackTask(
-    state,
-    Promise.resolve().then(() => drainRun(state, run)),
-  );
-
   return operationSucceeded({ run: accepted });
 }
 
 /**
  * Requests cancellation of one run.
  *
- * The request is recorded and announced, and the signal is then aborted — after
- * the state change, because abort listeners are arbitrary code and this path
- * runs none of it inside a commit. Nothing here waits for the turn to stop: the
- * caller gets the current snapshot, and the run's real outcome arrives when the
- * Core settles.
+ * The order is deliberate. The request becomes a fact first, the signal is
+ * aborted second — outside any state transaction, because abort listeners are
+ * arbitrary code — and only then is the change expressed as an event. Nothing
+ * waits for the turn to stop: the caller gets the current snapshot, and the
+ * run's real outcome arrives when the Core settles.
+ *
+ * A failure to express the event is not a transport problem and not a reason to
+ * pretend the cancel was never announced: it means the host cannot honestly
+ * describe this run's state any more. The run is marked faulted, the abort still
+ * happens, the stream is still drained to its end, and the settle reports
+ * `host_error` with a blocked session instead of a clean cancellation.
  */
 export function cancelRun(state: HostState, runId: string): OperationOutcome<RunResult> {
   const run = state.runs.get(runId);
@@ -160,14 +168,24 @@ export function cancelRun(state: HostState, runId: string): OperationOutcome<Run
   if (run.terminal !== undefined) return operationSucceeded({ run: run.terminal });
 
   if (!run.cancelRequested) {
+    // 1. The request, recorded synchronously and before anything can interrupt
+    //    the turn.
     run.cancelRequested = true;
+    // 2. The signal. Listeners may call back into the host; no state commit is
+    //    in progress at this point, and the snapshot below is built from state
+    //    that is already final.
+    run.controller.abort();
+    // 3. The announcement. Both steps happen in this order and in this single
+    //    synchronous block, so no settlement can slip in between and turn this
+    //    into an active-state event about a finished run.
     try {
       publishValidatedEvent(state, runUpdatedEvent(run, activeRunSnapshotOf(run)));
     } catch {
-      // The request stands whether or not it could be announced: a terminal
-      // state, or a resync, is what a client acts on.
+      // Nothing about the failure is published: the exception may carry
+      // plugin- or provider-authored text, and the fault is expressed through
+      // the run's outcome instead.
+      run.faulted = true;
     }
-    run.controller.abort();
   }
 
   return operationSucceeded({ run: runSnapshotOf(run) });
@@ -411,11 +429,20 @@ function coreTerminal(state: HostState, run: RunEntry): TerminalCommit | undefin
     if (events.length === 0) {
       throw new ProjectionError("the run settled without recording a turn");
     }
-
-    const turn = projectSettledTurn(run.sessionId, events, run.text);
     if (run.observedEnd === undefined) {
       throw new ProjectionError("the stream ended without reporting a turn end");
     }
+    if (run.turnId === null) {
+      throw new ProjectionError("the run recorded a turn it never bound");
+    }
+
+    const turn = projectSettledTurn({
+      sessionId: run.sessionId,
+      events,
+      expectedText: run.text,
+      expectedTurnId: run.turnId,
+      startSeq: entry.publishedSeq,
+    });
     if (run.observedEnd !== turn.reason) {
       throw new ProjectionError("the stream outcome disagrees with the recorded turn");
     }

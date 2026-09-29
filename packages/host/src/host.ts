@@ -171,38 +171,62 @@ function attach(state: HostState, channel: ProtocolChannel): () => void {
   };
 }
 
+/**
+ * Starts the one shutdown this host will ever run.
+ *
+ * The completion handle is installed *before* anything the host does not
+ * control. Closing a connection and aborting a run both run foreign code
+ * synchronously — a transport's close handler, an abort listener — and any of
+ * it may call back in here. A caller that arrives during that window must find
+ * the shutdown already in progress and share its outcome, not start a second
+ * cleanup that would release plugins the first one is still waiting for.
+ */
 function shutdownHost(state: HostState): Promise<void> {
-  if (state.shutdown !== undefined) return state.shutdown;
+  const running = state.shutdown;
+  if (running !== undefined) return running;
 
-  state.shutdown = (async (): Promise<void> => {
-    // Everything from here to the first await is synchronous: no operation
-    // admitted after this line can exist, and no operation admitted before it
-    // can be missed.
-    state.closing = true;
-    for (const connection of [...state.connections]) closeConnection(state, connection);
+  // 1. No new work, decided synchronously and before any external call.
+  state.closing = true;
 
-    // A request, not a stop. The run keeps the registry until its stream
-    // settles, and the wait below is what makes shutdown honest.
-    for (const run of state.runs.values()) {
-      if (run.terminal === undefined) run.controller.abort();
-    }
+  // 2. One shared completion, installed synchronously. From here on every
+  //    caller — reentrant or later — gets exactly this promise.
+  let settle!: { resolve: () => void; reject: (error: unknown) => void };
+  const completion = new Promise<void>((resolve, reject) => {
+    settle = { resolve, reject };
+  });
+  state.shutdown = completion;
 
-    // Every accepted task, including the ones registered while this loop's own
-    // awaits were running, and including tasks that never finish: those keep
-    // shutdown pending rather than letting it claim a release that did not
-    // happen.
-    while (state.pending.size > 0) {
-      await Promise.all([...state.pending]);
-    }
-    await state.gate.idle();
+  // 3. One executor. Its rejection is delivered to every caller through the
+  //    shared promise, so a failed cleanup is reported the same way to all of
+  //    them rather than being swallowed or duplicated.
+  void executeShutdown(state).then(settle.resolve, settle.reject);
 
-    const unreleased = await releasePlugins(state);
-    if (unreleased.length > 0) {
-      throw new Error(`the host could not release: ${unreleased.join(", ")}`);
-    }
-  })();
+  return completion;
+}
 
-  return state.shutdown;
+async function executeShutdown(state: HostState): Promise<void> {
+  // The readers go first: a client that is going away is not the work.
+  for (const connection of [...state.connections]) closeConnection(state, connection);
+
+  // A request, not a stop. The run keeps the registry until its stream
+  // settles, and the wait below is what makes shutdown honest.
+  for (const run of state.runs.values()) {
+    if (run.terminal === undefined) run.controller.abort();
+  }
+
+  // Every accepted task, including the ones registered while this loop's own
+  // awaits were running, and including tasks that never finish: those keep
+  // shutdown pending rather than letting it claim a release that did not
+  // happen.
+  while (state.pending.size > 0) {
+    await Promise.all([...state.pending]);
+  }
+  await state.gate.idle();
+
+  const unreleased = await releasePlugins(state);
+  if (unreleased.length > 0) {
+    throw new Error(`the host could not release: ${unreleased.join(", ")}`);
+  }
 }
 
 /**

@@ -119,8 +119,9 @@ describe("run lifecycle", () => {
     });
 
     expect(first.result?.run.status).toBe("accepted");
-    // The session already runs something: that is the more specific refusal.
-    expect(second.error?.code).toBe("SESSION_UNAVAILABLE");
+    // A ready session with a run still holds the registry token, so the refusal
+    // is the gate's: the session itself is perfectly usable.
+    expect(second.error?.code).toBe("HOST_BUSY");
 
     hold.open();
     await awaitRunTerminal(client, first.result?.run.runId as string);

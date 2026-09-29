@@ -102,20 +102,53 @@ export interface SettledTurn {
   readonly reason: TurnEndReason;
 }
 
+/** What the host knows about the turn it is about to settle. */
+export interface SettledTurnInput {
+  readonly sessionId: string;
+  /** The segment of the session log this run is responsible for. */
+  readonly events: readonly SessionEvent[];
+  /** The text this run accepted: the user record must say exactly this. */
+  readonly expectedText: string;
+  /** The turn id this run bound from the Runtime stream. */
+  readonly expectedTurnId: string;
+  /** The published cursor the segment starts at: the log's own numbering. */
+  readonly startSeq: number;
+}
+
 /**
  * Turns one settled turn's log segment into published canonical items.
  *
  * The protocol's schemas can only check each item on its own; they cannot see
- * whether a turn is *complete*. This is where that is decided, against the
- * evidence the Core actually leaves behind:
+ * whether a turn is *complete*, whether it is the turn the host thinks it is, or
+ * whether it is structurally something the Core could have written. This is
+ * where that is decided, against the evidence the Core actually leaves behind.
  *
- * - the segment is exactly one turn, opened by `turn/start` and closed by the
- *   final `turn/end`, all under one turn id;
- * - the user input is the text the host accepted, verbatim;
+ * Identity and position:
+ *
+ * - every entry in the segment carries the turn id this run bound, and the
+ *   segment opens with `turn/start` and closes with the final `turn/end`;
+ * - the sequence numbers run unbroken from the published cursor, in order: a
+ *   reversed, repeated or skipped position is a log no host can vouch for;
+ * - the user input is the text this run accepted, verbatim.
+ *
+ * Structure:
+ *
  * - every tool call an assistant message declared is followed, in order, by its
  *   own `tool/call` and `tool/result`; nothing is dispatched that was not
  *   declared and nothing declared is dropped;
  * - nothing follows the closing `turn/end`.
+ *
+ * Outcome shape, derived from the Core's own loop rather than from a guess:
+ *
+ * - `completed` is returned by `runSteps` only immediately after a
+ *   `message/assistant` with no tool calls, so a completed turn must end on
+ *   exactly that record;
+ * - `max_steps` is returned at the top of an iteration, so the turn must carry
+ *   at least one assistant record and end on the `tool/result` of the step that
+ *   spent the last of the budget;
+ * - `cancelled` and `error` are returned before any record of the step that
+ *   died — including, at the very start of a turn, before any assistant record
+ *   exists — so any prefix that is otherwise consistent is legal for them.
  *
  * Pairing is by occurrence, never by `callId`: the Core allows an empty callId
  * and allows the same one across steps, so a call id is not an identity. The
@@ -126,24 +159,32 @@ export interface SettledTurn {
  * as a host failure with a blocked session rather than becoming a plausible but
  * wrong history.
  */
-export function projectSettledTurn(
-  sessionId: string,
-  events: readonly SessionEvent[],
-  expectedText: string,
-): SettledTurn {
+export function projectSettledTurn(input: SettledTurnInput): SettledTurn {
+  const { sessionId, events, expectedText, expectedTurnId, startSeq } = input;
+
   const opened = events[0];
   if (opened === undefined || opened.type !== "turn/start") {
     throw new ProjectionError("the settled segment does not open with a turn start");
   }
   const turnId = opened.turnId;
+  if (turnId !== expectedTurnId) {
+    throw new ProjectionError("the settled segment belongs to a different turn");
+  }
 
   const closed = events[events.length - 1];
   if (closed === undefined || closed.type !== "turn/end") {
     throw new ProjectionError("the settled segment does not close with a turn end");
   }
-  for (const event of events) {
+
+  for (let index = 0; index < events.length; index++) {
+    const event = events[index];
     if (event.turnId !== turnId) {
       throw new ProjectionError("the settled segment mixes two turn ids");
+    }
+    // The log numbers its own events; the host only reads them. A segment that
+    // does not continue the cursor exactly is a window onto something else.
+    if (event.seq !== startSeq + index) {
+      throw new ProjectionError("the settled segment does not continue the published log");
     }
   }
 
@@ -242,5 +283,48 @@ export function projectSettledTurn(
     throw new ProjectionError("the settled segment has events after its closing turn end");
   }
 
+  assertOutcomeShape(events, closed.data.reason);
+
   return { turnId, items: Object.freeze(items), reason: closed.data.reason };
+}
+
+/**
+ * The closing record each outcome must have, in the shapes the Core can produce.
+ *
+ * See the note above `projectSettledTurn` for where each rule comes from. The
+ * rules are deliberately per outcome: a cancelled or failed turn may legitimately
+ * carry nothing but the user input, so a blanket "there is always an assistant
+ * record" would reject history the Core really wrote.
+ */
+function assertOutcomeShape(events: readonly SessionEvent[], reason: TurnEndReason): void {
+  const lastScoped = events[events.length - 2];
+
+  switch (reason) {
+    case "completed":
+      if (
+        lastScoped === undefined ||
+        lastScoped.type !== "message/assistant" ||
+        lastScoped.data.toolCalls.length > 0
+      ) {
+        throw new ProjectionError("a completed turn does not end with a finished assistant record");
+      }
+      return;
+
+    case "max_steps": {
+      const assistantRecords = events.filter((event) => event.type === "message/assistant").length;
+      if (assistantRecords === 0) {
+        throw new ProjectionError("a limited turn has no completed model step");
+      }
+      if (lastScoped === undefined || lastScoped.type !== "tool/result") {
+        throw new ProjectionError("a limited turn does not end on the step that spent its budget");
+      }
+      return;
+    }
+
+    case "cancelled":
+    case "error":
+      // The turn stopped before the step it died in was recorded, so any
+      // otherwise-consistent prefix is exactly what the Core writes.
+      return;
+  }
 }

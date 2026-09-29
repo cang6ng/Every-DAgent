@@ -278,3 +278,155 @@ describe("run versus reader loss", () => {
     await flush();
   });
 });
+
+describe("request id identity", () => {
+  it("consumes the id of a request the envelope layer could not read", async () => {
+    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const client = connect(host);
+    await client.describe();
+    const instanceId = client.hostInstanceId as string;
+
+    // Readable enough to correlate — kind and requestId are well-formed — and
+    // broken below that: no params at all. The answer spends the id.
+    client.sendRaw(
+      JSON.stringify({
+        kind: "client-request",
+        protocolVersion: "1",
+        requestId: "spent-invalid-id",
+        method: "sessions.list",
+        hostInstanceId: instanceId,
+      }),
+    );
+    await flush();
+    expect(client.frames.at(-1) ?? "").toContain("INVALID_REQUEST");
+    expect(client.isClosed).toBe(false);
+
+    const before = client.frames.length;
+    // The same id again, this time well-formed: a protocol fault, not a request.
+    client.sendRaw(
+      JSON.stringify({
+        kind: "client-request",
+        protocolVersion: "1",
+        requestId: "spent-invalid-id",
+        method: "sessions.list",
+        params: {},
+        hostInstanceId: instanceId,
+      }),
+    );
+    await flush();
+
+    expect(client.isClosed).toBe(true);
+    expect(client.frames.length).toBe(before);
+  });
+
+  it("consumes the id of a request that failed the method schema", async () => {
+    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const client = connect(host);
+    await client.describe();
+    const instanceId = client.hostInstanceId as string;
+
+    client.sendRaw(
+      JSON.stringify({
+        kind: "client-request",
+        protocolVersion: "1",
+        requestId: "spent-params-id",
+        method: "runs.start",
+        params: { sessionId: "s", submissionId: "sub", text: "   " },
+        hostInstanceId: instanceId,
+      }),
+    );
+    await flush();
+    expect(client.frames.at(-1) ?? "").toContain("INVALID_REQUEST");
+    expect(client.isClosed).toBe(false);
+
+    const before = client.frames.length;
+    client.sendRaw(
+      JSON.stringify({
+        kind: "client-request",
+        protocolVersion: "1",
+        requestId: "spent-params-id",
+        method: "sessions.list",
+        params: {},
+        hostInstanceId: instanceId,
+      }),
+    );
+    await flush();
+
+    expect(client.isClosed).toBe(true);
+    expect(client.frames.length).toBe(before);
+  });
+
+  it("closes when a valid request is followed by an unreadable one with its id", async () => {
+    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const client = connect(host);
+    await client.describe();
+    const instanceId = client.hostInstanceId as string;
+
+    expect((await client.call("sessions.list", {}, { requestId: "used-id" })).result).toBeDefined();
+    const before = client.frames.length;
+
+    client.sendRaw(
+      JSON.stringify({
+        kind: "client-request",
+        protocolVersion: "1",
+        requestId: "used-id",
+        method: "sessions.list",
+        hostInstanceId: instanceId,
+      }),
+    );
+    await flush();
+
+    expect(client.isClosed).toBe(true);
+    expect(client.frames.length).toBe(before);
+  });
+
+  it("closes a valid request that follows an unreadable one with its id", async () => {
+    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const client = connect(host);
+    await client.describe();
+    const instanceId = client.hostInstanceId as string;
+
+    client.sendRaw(
+      JSON.stringify({
+        kind: "client-request",
+        protocolVersion: "1",
+        requestId: "used-invalid-id",
+        method: "sessions.list",
+        hostInstanceId: instanceId,
+      }),
+    );
+    await flush();
+    const before = client.frames.length;
+
+    // A well-formed request reusing the spent id: never dispatched, never
+    // answered, and the connection does not survive the attempt.
+    client.sendRaw(
+      JSON.stringify({
+        kind: "client-request",
+        protocolVersion: "1",
+        requestId: "used-invalid-id",
+        method: "sessions.list",
+        params: {},
+        hostInstanceId: instanceId,
+      }),
+    );
+    await flush();
+
+    expect(client.isClosed).toBe(true);
+    expect(client.frames.length).toBe(before);
+  });
+
+  it("still closes a frame whose correlation cannot be recovered at all", async () => {
+    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const client = connect(host);
+    await client.describe();
+
+    const before = client.frames.length;
+    // No requestId to read: nothing can be answered, and nothing is consumed.
+    client.sendRaw(JSON.stringify({ kind: "client-request", protocolVersion: "1", method: "sessions.list" }));
+    await flush();
+
+    expect(client.isClosed).toBe(true);
+    expect(client.frames.length).toBe(before);
+  });
+});
