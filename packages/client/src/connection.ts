@@ -15,7 +15,11 @@
  * torn down first — epoch, channel, identity, stream, control ownership,
  * pending — and only then does the client say so. A listener that hears
  * "disconnected" is hearing about a client that can no longer send, reconnect on
- * a stale path, or overwrite a newer attempt.
+ * a stale path, or overwrite a newer attempt. Tearing a connection down runs
+ * foreign code — a listener disposer, an abort listener, the transport's own
+ * close — and that code may re-enter this client and say something newer; when
+ * it has, the transition that was underway publishes nothing, because the newer
+ * claim is the state.
  *
  * The third is the frame path versus everything foreign. Frames are routed
  * synchronously: a response settles its pending, an event folds, and the
@@ -284,6 +288,18 @@ export class ClientConnection {
   private readonly reverseRequestIds = new Set<string>();
   /** Every stream this connection has ended: the proof that its frames are not current. */
   private readonly retiredStreams = new Set<string>();
+  /**
+   * The public lifecycle, and which transition may next say what it is.
+   *
+   * Publishing `lost`, `disconnected` or `connecting` is a claim on that fact,
+   * and a claim is good only while it is the newest one. Every retirement and
+   * every publication runs foreign code — a listener, a disposer, an abort
+   * listener, the transport itself — and that code may re-enter this client and
+   * take the lifecycle over. When it has, an older transition has nothing left
+   * to say: the state it wanted to publish is about a connection the client has
+   * already moved past.
+   */
+  private lifecycle = 0;
 
   constructor(options: ClientOptions, reverseTable: ReverseTable) {
     this.options = options;
@@ -331,6 +347,7 @@ export class ClientConnection {
    * not be able to send on it.
    */
   disconnect(): void {
+    const claim = this.claimLifecycle();
     if (this.channel === undefined && this.attempt === undefined) {
       // Already disconnected: only the state needs saying, and only if it does.
       this.store.update({ status: "disconnected", stale: this.store.get().presentation !== null, error: null });
@@ -338,6 +355,10 @@ export class ClientConnection {
     }
     const owner = this.epoch;
     this.retireAttempt(owner, connectionLost("disconnected"));
+    // Retiring the attempt runs foreign code, and a callback that disconnected
+    // again — or reconnected — has already said what this client is now. This
+    // call's own verdict is older than that, and does not get to replace it.
+    if (!this.ownsLifecycle(claim)) return;
     this.store.update({ status: "disconnected", stale: this.store.get().presentation !== null, error: null });
   }
 
@@ -372,15 +393,21 @@ export class ClientConnection {
 
     const owner = this.epoch;
     const streamId = stream.streamId;
-    this.revokeStream(owner, streamId);
+    this.stream = undefined;
 
     // The stream is gone before the host is even told: the presentation it
     // explained is retained and stale, and the client is `ready` for nothing.
-    // The two facts are published together, because a status that outlives the
-    // stream it describes is exactly the lie this client exists to avoid.
-    if (this.owns(owner)) {
-      this.store.update({ status: "connected", stale: this.store.get().presentation !== null });
+    // The two facts are published together, in the same synchronous step, and
+    // before any foreign code runs — the abort listeners of the handlers this
+    // ends are free to read this client, and a status that outlives the stream
+    // it describes is exactly the lie this client exists to avoid.
+    if (!this.rememberRetired(owner, streamId)) {
+      // The ledger is full: the connection it belonged to has already ended, and
+      // this close has nothing left to say.
+      throw connectionLost("disconnected");
     }
+    this.store.update({ status: "connected", stale: this.store.get().presentation !== null });
+    this.abortReverseForStream(streamId);
 
     await new Promise<void>((resolve, reject) => {
       this.send<"subscriptions.close">("subscriptions.close", { streamId }, {
@@ -395,10 +422,20 @@ export class ClientConnection {
   }
 
   private beginAttempt(): Promise<void> {
+    const claim = this.claimLifecycle();
     if (this.channel !== undefined || this.attempt !== undefined) {
       // The old connection ends here: whatever it was waiting for will never be
       // answered, and the outcome is unknowable from this side.
       this.retireAttempt(this.epoch, connectionLost("disconnected"));
+      // The retirement above runs foreign code, and any of it may have re-entered
+      // this client: a callback that disconnected, or that began an attempt of its
+      // own, has already decided what this client is doing. What it decided is not
+      // this call's to build a second attempt on top of.
+      if (!this.ownsLifecycle(claim)) {
+        const running = this.attempt;
+        if (running !== undefined) return running.promise;
+        return Promise.reject(connectionLost("disconnected"));
+      }
     }
 
     const epoch = (this.epoch += 1);
@@ -451,7 +488,27 @@ export class ClientConnection {
     return !attempt.aborted && this.attempt === attempt && this.owns(attempt.epoch);
   }
 
+  /** Whether a stream a continuation began on is still the one this connection holds. */
+  private holdsStream(owner: number, stream: StreamState): boolean {
+    return this.owns(owner) && this.stream === stream;
+  }
+
+  /** Takes the lifecycle: from here on, only a newer claim may publish a status. */
+  private claimLifecycle(): number {
+    this.lifecycle += 1;
+    return this.lifecycle;
+  }
+
+  /** Whether a claim is still the newest one — the only one whose transition may still publish. */
+  private ownsLifecycle(claim: number): boolean {
+    return this.lifecycle === claim;
+  }
+
   private async runAttempt(attempt: Attempt): Promise<void> {
+    // The publication that announced this attempt ran listeners, and one of them
+    // may have ended it before the connector was asked for anything.
+    if (!this.isActive(attempt)) throw connectionLost("disconnected");
+
     let channel: ProtocolChannel;
     try {
       channel = await this.options.connect();
@@ -472,14 +529,27 @@ export class ClientConnection {
 
     this.channel = channel;
     const epoch = attempt.epoch;
-    const detach = channel.listen({
-      onFrame: (frame: string): void => {
-        if (this.owns(epoch)) this.acceptFrame(frame, epoch);
-      },
-      onClose: (): void => {
-        if (this.owns(epoch)) this.endWithLoss(epoch, "channel-closed");
-      },
-    });
+    let detach: (() => void) | undefined;
+    try {
+      detach = channel.listen({
+        onFrame: (frame: string): void => {
+          if (this.owns(epoch)) this.acceptFrame(frame, epoch);
+        },
+        onClose: (): void => {
+          if (this.owns(epoch)) this.endWithLoss(epoch, "channel-closed");
+        },
+      });
+    } catch {
+      // The channel was delivered, and from here it is this attempt's — one it
+      // cannot listen on is one it cannot be synchronized on. The attempt ends
+      // through the same path every other failure takes: its ownership is
+      // invalidated, the channel is closed exactly once, every wait is settled,
+      // and the outcome is published instead of a connection left merely
+      // `connecting` over a channel nobody may use.
+      const failure = connectionLost("connector-failed");
+      this.failAttempt(epoch, failure, "lost");
+      throw failure;
+    }
 
     if (!this.isActive(attempt)) {
       // Installing the listener is itself a chance to hear that this generation
@@ -638,18 +708,24 @@ export class ClientConnection {
     // The stream this open replaces ends here, in the same synchronous step as
     // the transition that publishes it: losing the stream and marking what it
     // explained stale are one fact, and a reader never sees "ready" with nothing
-    // left to be ready about.
-    const stream = this.stream;
-    if (stream !== undefined) this.revokeStream(owner, stream.streamId);
-    if (!this.owns(owner)) {
-      // Dropping that stream spent the connection's identity budget, which ends
-      // the connection: there is nothing left to open, and nothing this
-      // transaction may publish.
-      finish(connectionLost("disconnected"));
-      return promise;
+    // left to be ready about. The handlers that stream carried are aborted only
+    // *after* that publication, because their abort listeners are foreign code
+    // and are free to read this client — and what they must find is a client that
+    // has already stopped claiming to be ready on a stream it no longer holds.
+    const previous = this.stream;
+    if (previous !== undefined) {
+      this.stream = undefined;
+      if (!this.rememberRetired(owner, previous.streamId)) {
+        // The ledger is full: this connection can no longer prove which streams
+        // it has ended, and `rememberRetired` has already ended it. There is
+        // nothing left to open, and nothing this transaction may publish.
+        finish(connectionLost("disconnected"));
+        return promise;
+      }
     }
 
     this.store.update({ status: "syncing", stale: this.store.get().presentation !== null, error: null });
+    if (previous !== undefined) this.abortReverseForStream(previous.streamId);
 
     this.send<"subscriptions.open">(
       "subscriptions.open",
@@ -976,6 +1052,12 @@ export class ClientConnection {
       // answer may travel for this request any more.
       const cancelled = this.reversePendings.get(event.payload.requestId);
       if (cancelled !== undefined) this.abandonReverse(cancelled);
+      // Aborting a handler runs its abort listener, which is foreign code and
+      // free to re-enter this client: a listener that re-cuts the subscription,
+      // or that ends the connection, has taken this stream away. The frame then
+      // belongs to a stream the client no longer holds — it is read, and dropped,
+      // before any part of it can reach a presentation it no longer describes.
+      if (!this.holdsStream(owner, stream)) return;
     }
 
     const presentation = this.store.get().presentation;
@@ -1069,6 +1151,10 @@ export class ClientConnection {
       });
       return;
     }
+    // `accepts` is foreign code as well, and a request whose stream this client
+    // no longer holds is not one to install a handler for: its answer could only
+    // travel on a stream that is already over.
+    if (!this.holdsStream(owner, stream)) return;
     if (this.reversePendings.size >= MAX_REVERSE_PENDING) {
       this.replyReverse(owner, request.streamId, request.requestId, {
         error: Object.freeze({ code: "INTERNAL_ERROR", message: "this client is at capacity for reverse requests" }),
@@ -1230,7 +1316,13 @@ export class ClientConnection {
    */
   private failAttempt(owner: number, error: ClientError, status: ConnectionStatus): void {
     if (this.epoch !== owner) return;
+    const claim = this.claimLifecycle();
     this.retireAttempt(owner, error);
+    // Retiring runs foreign code — a disposer, an abort listener, the transport's
+    // own close — and any of it may have re-entered this client and ended or
+    // replaced the connection itself. What it established is newer than this
+    // verdict, and this verdict is about a connection that is already over.
+    if (!this.ownsLifecycle(claim)) return;
     this.store.update({ status, stale: this.store.get().presentation !== null, error });
   }
 
@@ -1288,37 +1380,23 @@ export class ClientConnection {
   }
 
   /**
-   * Drops the current stream, in one local transition.
-   *
-   * Nothing is published here. Dropping the stream is only half of a fact whose
-   * other half is the status that follows it — `syncing` for a re-cut,
-   * `connected` for a close — and the caller that drops it owns both, in one
-   * synchronous step. Publishing the two separately would show a reader a status
-   * that outlived the stream it describes.
-   */
-  private revokeStream(owner: number, streamId: string): void {
-    const stream = this.stream;
-    if (stream === undefined || stream.streamId !== streamId) return;
-
-    this.stream = undefined;
-    this.rememberRetired(owner, streamId);
-    this.abortReverseForStream(streamId);
-  }
-
-  /**
    * Remembers one ended stream, or ends the connection when the budget is spent.
    *
    * The alternative — forgetting ids — would make an already-ended stream look
    * like a new one, and its frames would be applied to a presentation that has
    * moved on.
+   *
+   * @returns false when the ledger was already full: the connection has ended,
+   *   and its caller has nothing left to publish or send.
    */
-  private rememberRetired(owner: number, streamId: string): void {
-    if (this.retiredStreams.has(streamId)) return;
+  private rememberRetired(owner: number, streamId: string): boolean {
+    if (this.retiredStreams.has(streamId)) return true;
     if (this.retiredStreams.size >= RETIRED_STREAM_BUDGET) {
       this.protocolFailure(owner, "stream-identity-budget");
-      return;
+      return false;
     }
     this.retiredStreams.add(streamId);
+    return true;
   }
 }
 

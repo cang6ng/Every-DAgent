@@ -504,3 +504,205 @@ describe("invalidation comes before publication", () => {
     expect(client.getSnapshot().status).toBe("ready");
   });
 });
+
+describe("a retirement that a callback already superseded", () => {
+  /**
+   * A channel whose retirement runs the caller's own code.
+   *
+   * Both boundaries a retirement crosses on its way out — handing back the
+   * listener, and closing the transport — are foreign code, and this fixture is
+   * the smallest way to say that one of them re-entered the client.
+   */
+  function retiringChannel(host: FakeHost, boundary: "disposer" | "close", onReenter: () => void): ProtocolChannel {
+    const base = host.channel;
+    return {
+      listen: (listener) => {
+        const dispose = base.listen(listener);
+        return () => {
+          dispose();
+          if (boundary === "disposer") onReenter();
+        };
+      },
+      send: (frame: string): void => {
+        base.send(frame);
+      },
+      close: (): void => {
+        base.close();
+        if (boundary === "close") onReenter();
+      },
+    };
+  }
+
+  for (const boundary of ["disposer", "close"] as const) {
+    it(`a disconnection made from the retirement's own ${boundary} is not overwritten`, async () => {
+      const host = createFakeHost();
+      let disconnects = 0;
+      let armed = false;
+      const client = createClient({
+        connect: async (): Promise<ProtocolChannel> =>
+          retiringChannel(host, boundary, () => {
+            if (!armed) return;
+            armed = false;
+            disconnects += 1;
+            client.disconnect();
+          }),
+      });
+
+      await client.connect();
+      armed = true;
+      host.close();
+
+      // Retiring the connection runs that code, and the disconnection it decided
+      // on is the newer fact about this client: the loss cleanup that started the
+      // retirement does not get to replace it with "lost".
+      expect(disconnects).toBe(1);
+      expect(client.getSnapshot().status).toBe("disconnected");
+    });
+  }
+
+  for (const stage of ["loss", "disconnect"] as const) {
+    it(`a reconnect made from the retirement's own disposer outlives the ${stage} that started it`, async () => {
+      const seen: string[] = [];
+      let reentered = false;
+      let fresh: Promise<unknown> | undefined;
+      let current: FakeHost | undefined;
+      const client = createClient({
+        connect: async (): Promise<ProtocolChannel> => {
+          const host = createFakeHost();
+          current = host;
+          return {
+            listen: (listener) => {
+              const dispose = host.channel.listen(listener);
+              return () => {
+                dispose();
+                if (reentered) return;
+                reentered = true;
+                fresh = client.reconnect().catch((error: unknown) => error);
+              };
+            },
+            send: (frame: string): void => {
+              host.channel.send(frame);
+            },
+            close: (): void => {
+              host.channel.close();
+            },
+          };
+        },
+      });
+      client.subscribe(() => {
+        seen.push(client.getSnapshot().status);
+      });
+
+      await client.connect();
+      if (stage === "loss") {
+        // The channel is gone, and the cleanup that hears about it runs the
+        // disposer, which reconnects before the loss can be published.
+        current?.close();
+      } else {
+        client.disconnect();
+      }
+      await fresh;
+
+      // The reconnect is the newer fact: the retirement driven by the loss, or by
+      // the disconnection, is not published over it.
+      expect(reentered).toBe(true);
+      expect(seen).not.toContain("lost");
+      expect(seen).not.toContain("disconnected");
+      expect(client.getSnapshot().status).toBe("ready");
+    });
+  }
+
+  it("a disconnection made while a reconnect retires the old connection stops that reconnect", async () => {
+    let attempts = 0;
+    let disconnects = 0;
+    const client = createClient({
+      connect: async (): Promise<ProtocolChannel> => {
+        attempts += 1;
+        return retiringChannel(createFakeHost(), "disposer", () => {
+          if (disconnects > 0) return;
+          disconnects += 1;
+          client.disconnect();
+        });
+      },
+    });
+
+    await client.connect();
+    const reconnecting = client.reconnect().catch((error: unknown) => error);
+    await flush();
+
+    // The disconnection the disposer made is the newer decision, and it wins:
+    // the reconnect that started the retirement does not ask for a channel of
+    // its own afterwards.
+    expect(disconnects).toBe(1);
+    expect(attempts).toBe(1);
+    expect(client.getSnapshot().status).toBe("disconnected");
+    await expect(reconnecting).resolves.toMatchObject({ code: "CONNECTION_LOST" });
+  });
+
+  it("a listener that ends the attempt it just heard about stops it before the connector runs", async () => {
+    let connects = 0;
+    const client = createClient({
+      connect: async (): Promise<ProtocolChannel> => {
+        connects += 1;
+        return createFakeHost().channel;
+      },
+    });
+    let ended = false;
+    client.subscribe(() => {
+      if (ended || client.getSnapshot().status !== "connecting") return;
+      ended = true;
+      client.disconnect();
+    });
+
+    const connecting = client.connect().catch((error: unknown) => error);
+    await flush();
+
+    // The publication that announced the attempt is where the listener heard
+    // about it, and the attempt it ended is not one to open a transport for.
+    expect(ended).toBe(true);
+    expect(connects).toBe(0);
+    expect(client.getSnapshot().status).toBe("disconnected");
+    await expect(connecting).resolves.toMatchObject({ code: "CONNECTION_LOST" });
+  });
+
+  it("a channel the attempt cannot listen on is closed exactly once, and is not left behind", async () => {
+    let closed = 0;
+    let refusals = 1;
+    const client = createClient({
+      connect: async (): Promise<ProtocolChannel> => {
+        if (refusals > 0) {
+          refusals -= 1;
+          return {
+            listen: (): (() => void) => {
+              throw new Error("the transport refused the listener");
+            },
+            send: (): void => undefined,
+            close: (): void => {
+              closed += 1;
+            },
+          };
+        }
+        return createFakeHost().channel;
+      },
+    });
+
+    await expect(client.connect()).rejects.toMatchObject({
+      code: "CONNECTION_LOST",
+      reason: "connector-failed",
+    });
+
+    // The channel was this attempt's from the moment it was delivered, so the
+    // failure ends the attempt the way every other failure does — ownership
+    // invalidated, the channel closed exactly once, the outcome published —
+    // rather than leaving the client `connecting` over a channel it still owns.
+    expect(closed).toBe(1);
+    expect(client.getSnapshot().status).toBe("lost");
+
+    // Nothing of that attempt holds the client any more: the next one gets a
+    // channel of its own and reaches `ready`.
+    await expect(client.connect()).resolves.toBeUndefined();
+    expect(closed).toBe(1);
+    expect(client.getSnapshot().status).toBe("ready");
+    client.disconnect();
+  });
+});

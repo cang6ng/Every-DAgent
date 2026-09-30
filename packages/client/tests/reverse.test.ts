@@ -343,6 +343,146 @@ describe("ending a handler", () => {
   });
 });
 
+/**
+ * An abort listener is foreign code, and the client has already moved on by the
+ * time it runs.
+ *
+ * Aborting a handler is part of a transition — a cancellation being read, a
+ * stream being cut, a connection being retired — and a listener is free to
+ * re-enter this client from there. Whatever the transition was doing afterwards
+ * belongs to a stream, a status and a lifecycle that the listener may just have
+ * replaced.
+ */
+describe("an abort listener is foreign code", () => {
+  it("cannot write the old frame's position over the stream a resync installed", async () => {
+    let nested: Promise<unknown> | undefined;
+    const scenario = scenarioWith([
+      echoHandler({
+        answer: (_params, context) => {
+          context.signal.addEventListener("abort", () => {
+            nested = scenario.client.resync().catch((error: unknown) => error);
+          });
+          return new Promise<ReverseHandlerOutcome>(() => undefined);
+        },
+      }),
+    ]);
+    await scenario.ready();
+    const host = scenario.host;
+    const oldStream = host.currentStreamId;
+    sendHostRequest(host, { requestId: "h-1", method: "test.echo", params: { value: "hello" } });
+    await flush();
+
+    // The cancellation aborts the handler, the abort listener re-cuts the
+    // subscription, and the cut completes before the event that caused it has
+    // finished being read.
+    host.emit({ type: "host.request.cancelled", requestId: "h-1", reason: "cancelled" });
+    await nested;
+    await flush();
+
+    // The cancelled frame belonged to the stream the client just ended: it is
+    // read and dropped, and its position is not written over the new stream's.
+    expect(host.currentStreamId).not.toBe(oldStream);
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+    expect(scenario.client.getSnapshot().presentation?.watermark).toEqual({
+      streamId: host.currentStreamId,
+      sequence: 0,
+    });
+
+    // And the new stream is positioned where it actually is: the next frame the
+    // host sends on it is applied as the first one.
+    host.emit({ type: "session.created", session: SESSION });
+    expect(scenario.client.getSnapshot().presentation?.watermark.sequence).toBe(1);
+    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(1);
+  });
+
+  for (const operation of ["resync", "close"] as const) {
+    it(`never reads a ready client after ${operation} revoked the stream it lives on`, async () => {
+      const observed: { readonly status: string; readonly stale: boolean }[] = [];
+      const scenario = scenarioWith([
+        echoHandler({
+          answer: (_params, context) => {
+            context.signal.addEventListener("abort", () => {
+              const snapshot = scenario.client.getSnapshot();
+              observed.push({ status: snapshot.status, stale: snapshot.stale });
+            });
+            return new Promise<ReverseHandlerOutcome>(() => undefined);
+          },
+        }),
+      ]);
+      await scenario.ready();
+      sendHostRequest(scenario.host, { requestId: "h-1", method: "test.echo", params: { value: "hello" } });
+      await flush();
+
+      const settling =
+        operation === "resync" ? scenario.client.resync() : scenario.client.closeSubscription();
+      if (operation === "close") {
+        scenario.host.respond(scenario.host.requestIdOf("subscriptions.close") ?? "", "subscriptions.close", {
+          closed: true,
+        });
+      }
+      await settling;
+
+      // The stream is dropped and the status that describes it is replaced in one
+      // step, before this listener runs: an observer never reads `ready` at a
+      // moment when there is nothing left to be ready about.
+      expect(observed).toEqual([{ status: operation === "resync" ? "syncing" : "connected", stale: true }]);
+    });
+  }
+
+  it("does not install a handler for a request whose stream was cut while its params were read", async () => {
+    let nested: Promise<unknown> | undefined;
+    const scenario = scenarioWith([
+      {
+        method: "test.echo",
+        // The params contract is foreign code too, and this one re-cuts the
+        // subscription before the dispatcher has decided anything.
+        accepts: (): boolean => {
+          nested = scenario.client.resync().catch((error: unknown) => error);
+          return true;
+        },
+        resultIsValid: (result: JsonValue): boolean => typeof strictObject(result)?.["echoed"] === "string",
+        handle: (): ReverseHandlerOutcome => ({ result: { echoed: "old-stream" } }),
+      },
+    ]);
+    await scenario.ready();
+    sendHostRequest(scenario.host, { requestId: "h-1", method: "test.echo", params: { value: "hello" } });
+    await nested;
+    await flush();
+
+    // The request arrived on the stream that the re-cut just ended: no handler is
+    // installed for it, and nothing is answered on a stream that is already over.
+    expect(clientAnswers(scenario, "h-1")).toHaveLength(0);
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+    expect(scenario.host.currentStreamId).toBeDefined();
+  });
+
+  it("a disconnection it makes while the connection is being retired stands", async () => {
+    let disconnects = 0;
+    const scenario = scenarioWith([
+      echoHandler({
+        answer: (_params, context) => {
+          context.signal.addEventListener("abort", () => {
+            disconnects += 1;
+            scenario.client.disconnect();
+          });
+          return new Promise<ReverseHandlerOutcome>(() => undefined);
+        },
+      }),
+    ]);
+    await scenario.ready();
+    sendHostRequest(scenario.host, { requestId: "h-1", method: "test.echo", params: { value: "hello" } });
+    await flush();
+
+    scenario.host.close();
+
+    // The abort runs inside the retirement, and the disconnection it asked for is
+    // the newer fact about this client: the loss cleanup that started the
+    // retirement does not get to replace it with "lost".
+    expect(disconnects).toBe(1);
+    expect(scenario.client.getSnapshot().status).toBe("disconnected");
+  });
+});
+
 describe("the registration table", () => {
   it("refuses two handlers for the same method", () => {
     expect(() => scenarioWith([echoHandler(), echoHandler()])).toThrowError(/registered twice/);
