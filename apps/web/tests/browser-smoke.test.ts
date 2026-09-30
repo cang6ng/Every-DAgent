@@ -36,7 +36,15 @@ const BROWSER_CANDIDATES = [
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
 ];
 
+/**
+ * Whether this machine has a browser to run the smoke in.
+ *
+ * `EVERY_DAGENT_NO_BROWSER` exists so the reporting test can exercise the
+ * missing-browser path on a machine that has one; it is a test hook, not a
+ * production switch.
+ */
 function findBrowser(): string | undefined {
+  if (process.env["EVERY_DAGENT_NO_BROWSER"] === "1") return undefined;
   for (const candidate of BROWSER_CANDIDATES) {
     try {
       readFileSync(candidate);
@@ -47,6 +55,8 @@ function findBrowser(): string | undefined {
   }
   return undefined;
 }
+
+const browser = findBrowser();
 
 async function delay(ms: number): Promise<void> {
   await new Promise((resolve) => {
@@ -155,12 +165,15 @@ afterEach(async () => {
 });
 
 describe("a real browser against the binding", () => {
-  it("creates a connection, streams downstream and posts upstream", async () => {
-    const browser = findBrowser();
-    if (browser === undefined) {
-      console.log("transport-smoke: NOT RUN (no browser found)");
-      return;
-    }
+  it.skipIf(browser === undefined)(
+    "creates a connection, streams downstream and posts upstream",
+    async () => {
+      if (browser === undefined) {
+        // Unreachable with `skipIf`, and kept so the branch is explicit: the
+        // suite reports a skip, and a skip is not a pass.
+        console.log("transport-smoke: NOT RUN (no browser found)");
+        return;
+      }
 
     // The page's own origin, which the binding has to allow explicitly.
     const page = createServer((_request, response) => {
@@ -249,15 +262,17 @@ describe("a real browser against the binding", () => {
       } finally {
         devtools.close();
       }
-    } finally {
-      child.kill();
-      await delay(200);
-      try {
-        rmSync(profile, { recursive: true, force: true });
-      } catch {
-        // A profile directory in the OS temp folder that a just-killed browser
-        // still holds open; the test's result does not depend on it.
+      } finally {
+        child.kill();
+        await delay(200);
+        try {
+          rmSync(profile, { recursive: true, force: true });
+        } catch {
+          // A profile directory in the OS temp folder that a just-killed browser
+          // still holds open; the test's result does not depend on it.
+        }
       }
-    }
-  }, 90000);
+    },
+    90000,
+  );
 });

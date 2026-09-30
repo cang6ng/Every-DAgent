@@ -8,5 +8,19 @@
   "types": "./src/index.ts",
   "dependencies": {
     "@every-dagent/protocol": "workspace:*"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./client": {
+      "types": "./src/client/http-channel.ts",
+      "default": "./src/client/http-channel.ts"
+    },
+    "./server": {
+      "types": "./src/server/http-binding.ts",
+      "default": "./src/server/http-binding.ts"
+    }
   }
 }

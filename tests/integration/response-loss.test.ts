@@ -11,7 +11,15 @@
 import { describe, expect, it } from "vitest";
 
 import { createClientOn, createHostPlatform, waitFor } from "../helpers/platform.js";
-import { demoPlugin, gatedReply, partialThenAbortReply, scriptedModel, textReply, toolReply } from "../helpers/demo-fixtures.js";
+import {
+  demoPlugin,
+  gatedReply,
+  partialThenAbortReply,
+  partialThenGatedReply,
+  scriptedModel,
+  textReply,
+  toolReply,
+} from "../helpers/demo-fixtures.js";
 
 const PLUGIN_ID = "loss-plugin";
 const TOOL_NAME = "loss-tool";
@@ -164,7 +172,7 @@ describe("a lost runs.start answer", () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const model = scriptedModel([gatedReply(gate, textReply("the end"))]);
+    const model = scriptedModel([partialThenGatedReply("the beginning", gate, " and the end")]);
     const platform = createHostPlatform({ modelClient: model.client, plugins: [] });
     const client = createClientOn(platform);
     await client.connect();
@@ -180,14 +188,31 @@ describe("a lost runs.start answer", () => {
       { what: "the run to be announced" },
     );
 
+    await waitFor(
+      () =>
+        client
+          .getSnapshot()
+          .presentation?.runs.some(
+            (candidate) => candidate.runId === started.run.runId && (candidate.live?.length ?? 0) > 0,
+          ) === true,
+      { what: "the live prefix to be visible before the disconnect" },
+    );
+    const beforeDisconnect = client
+      .getSnapshot()
+      .presentation?.runs.find((candidate) => candidate.runId === started.run.runId);
+    expect(beforeDisconnect?.live?.map((item) => (item.kind === "text" ? item.text : ""))).toEqual([
+      "the beginning",
+    ]);
+
     client.disconnect();
     await client.reconnect();
 
     // The same host keeps the live prefix, so the replica is whole again
-    // without any event replay.
+    // without any event replay — and the prefix is the text that was really
+    // there, not a placeholder.
     const run = client.getSnapshot().presentation?.runs.find((candidate) => candidate.runId === started.run.runId);
     expect(run?.status).toBe("running");
-    expect(run?.live).not.toBeNull();
+    expect(run?.live?.map((item) => (item.kind === "text" ? item.text : ""))).toEqual(["the beginning"]);
 
     release?.();
     await waitFor(

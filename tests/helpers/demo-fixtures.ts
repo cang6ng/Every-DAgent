@@ -91,6 +91,25 @@ export function gatedReply(gate: Promise<void>, then: readonly ModelEvent[]): Mo
   };
 }
 
+/**
+ * A step that says something, then waits for a gate, then says the rest.
+ *
+ * The text before the gate is what a client has already shown when it
+ * disconnects: a live prefix with real content, not an empty array.
+ */
+export function partialThenGatedReply(
+  opening: string,
+  gate: Promise<void>,
+  closing: string,
+): ModelReply {
+  return async function* (): AsyncGenerator<ModelEvent> {
+    yield { type: "text-delta", text: opening };
+    await gate;
+    yield { type: "text-delta", text: closing };
+    yield { type: "done" };
+  };
+}
+
 /** A plugin that registers one tool and counts its executions. */
 export interface DemoPlugin {
   readonly plugin: Plugin;

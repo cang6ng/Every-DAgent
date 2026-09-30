@@ -10,16 +10,17 @@
 
 import type { Host, HostOptions } from "@every-dagent/host";
 // The host's composition seam: the only way to register a test-only reverse
-// profile. It is deliberately not part of the package's public surface.
-import { composeHost, type AttachedConnection } from "@every-dagent/host/src/host.js";
-import type { ReverseProfile } from "@every-dagent/host/src/reverse.js";
+// profile. It is deliberately outside the package's public surface, so this
+// reaches the source file directly — a repository-relative path, not a package
+// subpath a consumer could use.
+import { composeHost, type AttachedConnection } from "../../packages/host/src/host.js";
+import type { ReverseProfile } from "../../packages/host/src/reverse.js";
 import type { ProtocolChannel } from "@every-dagent/protocol";
 
 import { createClient, type Client } from "@every-dagent/client";
-// The composition seam for test-only reverse profiles. It is deliberately not
-// part of the package's public surface — the production catalog is empty — so
-// the tests that need it reach the internal module directly.
-import { createClientWith, type ClientInternals } from "@every-dagent/client/src/client.js";
+// The composition seam for test-only reverse profiles, reached the same way: a
+// source path inside this repository, never a package subpath.
+import { createClientWith, type ClientInternals } from "../../packages/client/src/client.js";
 
 import { createCarrierPair, type CarrierOptions, type CarrierPair } from "./protocol-carrier.js";
 
@@ -95,17 +96,10 @@ export function createClientOn(platform: HostPlatform, options: ClientOnPlatform
     : createClientWith(optionsWithoutInternals, options.internals);
 }
 
-/** Waits until `predicate` holds, polling the client's own snapshot. */
-export async function waitFor(
-  predicate: () => boolean,
-  options: { readonly timeoutMs?: number; readonly what?: string } = {},
-): Promise<void> {
-  const deadline = Date.now() + (options.timeoutMs ?? 3000);
-  for (;;) {
-    if (predicate()) return;
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${options.what ?? "the condition"}`);
-    await new Promise((resolve) => {
-      setTimeout(resolve, 1);
-    });
-  }
-}
+/**
+ * The same wait the CLI fixture uses, from the helper that has no dependencies.
+ *
+ * Re-exported rather than reimplemented: a second copy would be a second
+ * behaviour, and the acceptance fixture must not import this module at all.
+ */
+export { waitFor } from "./wait-for.js";

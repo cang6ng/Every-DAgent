@@ -13,7 +13,7 @@ import type { CanonicalItem, HostDescription, ProtocolChannel } from "@every-dag
 
 import { createClient, type Client, type ClientSnapshot } from "@every-dagent/client";
 
-import { waitFor } from "../helpers/platform.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 export interface ClientCliScenario {
   readonly connect: () => Promise<ProtocolChannel>;

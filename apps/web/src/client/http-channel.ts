@@ -16,8 +16,19 @@
 import type { ProtocolChannel, ProtocolChannelListener } from "@every-dagent/protocol";
 
 import { createSseParser, unwrapRecord, utf8Length, wrapFrame } from "../transport/framing.js";
-import { DEFAULT_WEB_LIMITS, type WebLimits } from "../transport/limits.js";
+import { DEFAULT_WEB_LIMITS, FRAME_LIMIT_BYTES, RECORD_LIMIT_BYTES, type WebLimits } from "../transport/limits.js";
 import { createFrameQueue } from "../transport/queue.js";
+
+/** The transport primitives, re-exported so the browser entry is one import. */
+export {
+  FRAME_LIMIT_BYTES,
+  RECORD_LIMIT_BYTES,
+  createSseParser,
+  unwrapRecord,
+  utf8Length,
+  wrapFrame,
+};
+export type { SseParser } from "../transport/framing.js";
 
 export interface HttpChannelOptions {
   /** The binding's origin, e.g. `http://127.0.0.1:41234`. */

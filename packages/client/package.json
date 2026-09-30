@@ -8,5 +8,11 @@
   "types": "./src/index.ts",
   "dependencies": {
     "@every-dagent/protocol": "workspace:*"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
   }
 }

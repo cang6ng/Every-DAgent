@@ -75,6 +75,40 @@ describe("dependency boundary", () => {
     }
   });
 
+  it("keeps everything the browser entry can reach inside the browser half", () => {
+    // The entry is a real consuming path, so the check follows its imports
+    // rather than trusting that a file happened to stay small.
+    const visited = new Set<string>();
+    const queue = ["client/http-channel.ts"];
+    const offenders: string[] = [];
+
+    while (queue.length > 0) {
+      const file = queue.shift();
+      if (file === undefined || visited.has(file)) continue;
+      visited.add(file);
+      const source = readFileSync(join(srcRoot, file), "utf8");
+      for (const specifier of importSpecifiers(source)) {
+        // A browser module may reach its own files and the protocol contract —
+        // nothing else: no node builtin, no server implementation, no host.
+        const allowed = specifier === "@every-dagent/protocol" || specifier.startsWith(".");
+        if (!allowed || specifier.includes("server/")) {
+          offenders.push(`${file}: ${specifier}`);
+          continue;
+        }
+        // Only relative specifiers name a file to follow; the protocol package is
+        // a leaf this walk does not need to open.
+        if (!specifier.startsWith(".")) continue;
+        const resolved = join(file, "..", specifier).replace(/\\/g, "/").replace(/\.js$/, ".ts");
+        queue.push(resolved);
+      }
+    }
+
+    expect(offenders).toEqual([]);
+    // The graph really was walked: the transport primitives are in it.
+    expect([...visited].some((file) => file.startsWith("transport/"))).toBe(true);
+    expect([...visited].some((file) => file.includes("server"))).toBe(false);
+  });
+
   it("carries no host, provider, UI or framework dependency in src", () => {
     const forbidden = [
       /\bpi-ai\b/,
@@ -105,7 +139,7 @@ describe("dependency boundary", () => {
       type: string;
       main: string;
       types: string;
-      exports?: unknown;
+      exports?: Record<string, { readonly default?: string }>;
       dependencies: Record<string, string>;
       devDependencies?: Record<string, string>;
     };
@@ -114,7 +148,11 @@ describe("dependency boundary", () => {
     expect(manifest.type).toBe("module");
     expect(manifest.main).toBe("./src/index.ts");
     expect(manifest.types).toBe("./src/index.ts");
-    expect(manifest.exports).toBeUndefined();
+    // Three entries, and the two halves are separable: a browser imports
+    // `@every-dagent/web/client` and never sees the server's modules.
+    expect(Object.keys(manifest.exports ?? {}).sort()).toEqual([".", "./client", "./server"]);
+    expect(manifest.exports?.["./client"]?.default).toBe("./src/client/http-channel.ts");
+    expect(manifest.exports?.["./server"]?.default).toBe("./src/server/http-binding.ts");
     expect(manifest.dependencies).toEqual({ "@every-dagent/protocol": "workspace:*" });
     expect(manifest.devDependencies).toBeUndefined();
   });

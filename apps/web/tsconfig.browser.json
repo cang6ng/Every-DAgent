@@ -4,5 +4,5 @@
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "types": []
   },
-  "include": ["src/client", "src/transport"]
+  "include": ["src/client/http-channel.ts"]
 }
