@@ -97,7 +97,7 @@ describe("dependency boundary", () => {
       type: string;
       main: string;
       types: string;
-      exports?: unknown;
+      exports?: Record<string, unknown>;
       dependencies: Record<string, string>;
       devDependencies?: Record<string, string>;
     };
@@ -106,7 +106,9 @@ describe("dependency boundary", () => {
     expect(manifest.type).toBe("module");
     expect(manifest.main).toBe("./src/index.ts");
     expect(manifest.types).toBe("./src/index.ts");
-    expect(manifest.exports).toBeUndefined();
+    // One entry point, and no other: a consumer cannot reach the composition
+    // seam or any internal module by package subpath.
+    expect(Object.keys(manifest.exports ?? {})).toEqual(["."]);
     expect(manifest.dependencies).toEqual({ "@every-dagent/protocol": "workspace:*" });
     expect(manifest.devDependencies).toBeUndefined();
   });
