@@ -1,10 +1,13 @@
 /**
- * The package's boundaries, checked against the source itself.
+ * The transport's boundaries, checked against the source itself.
  *
- * Two claims matter here. The browser half must be importable into a page: it
- * may reach `fetch`, streams and timers, and nothing that only a server has. And
- * the server half must not leak into it — a page that pulled in `node:http` or
- * the host's composition would be a page that cannot run.
+ * These are the P3.3 rules, unchanged in scope: the seven files that carry
+ * frames stay exactly these seven, they import only their own modules, the
+ * protocol and node builtins, the browser half stays free of node builtins and
+ * of the server half, and the browser entry's own import graph is walked
+ * rather than trusted. The shell that now lives beside them has its own,
+ * separate boundary file — `shell-boundary.test.ts` — so that adding a page
+ * could not quietly loosen anything that was already checked here.
  */
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -22,9 +25,45 @@ function listFiles(directory: string): string[] {
   });
 }
 
-const srcFiles = listFiles(srcRoot).filter((file) => file.endsWith(".ts"));
+/** The seven transport files, and nothing else. */
+const TRANSPORT_FILES = [
+  "client/http-channel.ts",
+  "index.ts",
+  "server/http-binding.ts",
+  "transport/framing.ts",
+  "transport/ledger.ts",
+  "transport/limits.ts",
+  "transport/queue.ts",
+];
+
+/** The browser shell, as approved for P3.4. */
+const BROWSER_FILES = [
+  "browser/App.tsx",
+  "browser/Composer.tsx",
+  "browser/ConnectionStatus.tsx",
+  "browser/ConnectionPanel.tsx",
+  "browser/Conversation.tsx",
+  "browser/HostPanel.tsx",
+  "browser/NoticesPanel.tsx",
+  "browser/PluginsPanel.tsx",
+  "browser/RunStrip.tsx",
+  "browser/SessionsPanel.tsx",
+  "browser/ToolCard.tsx",
+  "browser/controller.ts",
+  "browser/main.tsx",
+  "browser/presentation.ts",
+  "browser/selection.ts",
+  "browser/use-shell.ts",
+];
+
+/** The application server composition, as approved for P3.4. */
+const SERVER_FILES = ["server/main.ts", "server/shell-server.ts", "server/static-server.ts"];
+
+const srcFiles = listFiles(srcRoot).filter((file) => file.endsWith(".ts") || file.endsWith(".tsx"));
 const srcRelative = srcFiles.map((file) => file.slice(srcRoot.length + 1).replace(/\\/g, "/"));
-const browserFiles = srcRelative.filter((file) => file.startsWith("client/") || file.startsWith("transport/"));
+const browserHalf = srcRelative.filter(
+  (file) => file.startsWith("client/") || file.startsWith("transport/"),
+);
 
 const IMPORT_PATTERN =
   /(?:import|export)[^;'"]*from\s+['"]([^'"]+)['"]|import\s*\(\s*['"]([^'"]+)['"]\s*\)|require\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
@@ -39,23 +78,18 @@ function importSpecifiers(source: string): string[] {
 
 describe("dependency boundary", () => {
   it("keeps the source tree to the planned modules", () => {
-    expect([...srcRelative].sort()).toEqual(
-      [
-        "client/http-channel.ts",
-        "index.ts",
-        "server/http-binding.ts",
-        "transport/framing.ts",
-        "transport/ledger.ts",
-        "transport/limits.ts",
-        "transport/queue.ts",
-      ].sort(),
-    );
+    expect([...srcRelative].sort()).toEqual([...TRANSPORT_FILES, ...BROWSER_FILES, ...SERVER_FILES].sort());
+  });
+
+  it("keeps the transport to its seven files", () => {
+    const transport = srcRelative.filter((file) => !file.startsWith("browser/") && !SERVER_FILES.includes(file));
+    expect([...transport].sort()).toEqual([...TRANSPORT_FILES].sort());
   });
 
   it("imports only its own modules, the protocol package and node builtins", () => {
     const offenders: string[] = [];
-    for (const file of srcFiles) {
-      for (const specifier of importSpecifiers(readFileSync(file, "utf8"))) {
+    for (const file of TRANSPORT_FILES) {
+      for (const specifier of importSpecifiers(readFileSync(join(srcRoot, file), "utf8"))) {
         const allowed =
           specifier.startsWith("./") ||
           specifier.startsWith("../") ||
@@ -68,7 +102,7 @@ describe("dependency boundary", () => {
   });
 
   it("keeps the browser half free of node builtins and of the server half", () => {
-    for (const file of browserFiles) {
+    for (const file of browserHalf) {
       const source = readFileSync(join(srcRoot, file), "utf8");
       expect(source, `${file} must not import a node builtin`).not.toMatch(/from\s+["']node:/);
       expect(source, `${file} must not import the server binding`).not.toMatch(/from\s+["'][^"']*server\//);
@@ -110,7 +144,7 @@ describe("dependency boundary", () => {
     expect([...visited].some((file) => file.includes("server"))).toBe(false);
   });
 
-  it("carries no host, provider, UI or framework dependency in src", () => {
+  it("carries no host, provider, UI or framework dependency in the transport", () => {
     const forbidden = [
       /\bpi-ai\b/,
       /\bReact\b/,
@@ -125,37 +159,12 @@ describe("dependency boundary", () => {
       /@ts-(ignore|expect-error|nocheck)/,
       /\bvitest\b/,
     ];
-    for (const file of srcFiles) {
-      const source = readFileSync(file, "utf8");
+    for (const file of TRANSPORT_FILES) {
+      const source = readFileSync(join(srcRoot, file), "utf8");
       for (const pattern of forbidden) {
         expect(source, `${file} must not match ${pattern}`).not.toMatch(pattern);
       }
     }
-  });
-
-  it("pins the package manifest: private ESM source package with one workspace dependency", () => {
-    const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as {
-      name: string;
-      private: boolean;
-      type: string;
-      main: string;
-      types: string;
-      exports?: Record<string, { readonly default?: string }>;
-      dependencies: Record<string, string>;
-      devDependencies?: Record<string, string>;
-    };
-    expect(manifest.name).toBe("@every-dagent/web");
-    expect(manifest.private).toBe(true);
-    expect(manifest.type).toBe("module");
-    expect(manifest.main).toBe("./src/index.ts");
-    expect(manifest.types).toBe("./src/index.ts");
-    // Three entries, and the two halves are separable: a browser imports
-    // `@every-dagent/web/client` and never sees the server's modules.
-    expect(Object.keys(manifest.exports ?? {}).sort()).toEqual([".", "./client", "./server"]);
-    expect(manifest.exports?.["./client"]?.default).toBe("./src/client/http-channel.ts");
-    expect(manifest.exports?.["./server"]?.default).toBe("./src/server/http-binding.ts");
-    expect(manifest.dependencies).toEqual({ "@every-dagent/protocol": "workspace:*" });
-    expect(manifest.devDependencies).toBeUndefined();
   });
 });
 

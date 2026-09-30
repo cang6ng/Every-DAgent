@@ -9,8 +9,10 @@
   },
   "packageManager": "pnpm@11.8.0",
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run"
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p apps/web/tsconfig.browser.json",
+    "test": "vitest run",
+    "build:web": "pnpm --filter @every-dagent/web run build",
+    "test:web:browser": "node apps/web/scripts/verify-browser.mjs"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.87.1",
@@ -23,6 +25,9 @@
     "@every-dagent/protocol": "workspace:*",
     "@every-dagent/web": "workspace:*",
     "@types/node": "^24.0.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "esbuild": "0.28.2",
     "typescript": "^5.8.0",
     "vitest": "^3.2.0"
   }

@@ -13,5 +13,6 @@
     "noUncheckedIndexedAccess": false,
     "types": ["node"]
   },
-  "include": ["packages", "apps", "tests"]
+  "include": ["packages", "apps", "tests"],
+  "exclude": ["apps/web/src/browser", "apps/web/tests/shell-rendering.test.tsx", "apps/web/dist"]
 }
