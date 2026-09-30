@@ -57,6 +57,13 @@ export interface SseParser {
   feed(chunk: string): readonly string[];
   /** True once a record exceeded the limit: this stream cannot be trusted further. */
   readonly overflowed: boolean;
+  /**
+   * Whether a record has started and not finished.
+   *
+   * Its lines may all be complete — a record ends with a blank line, not with
+   * the last newline — so this is about the record, not about the buffer.
+   */
+  readonly open: boolean;
   /** Drops whatever was incomplete: a record that never finished is never delivered. */
   reset(): void;
   readonly pendingLength: number;
@@ -90,6 +97,10 @@ export function createSseParser(limitBytes: number): SseParser {
   return {
     get overflowed(): boolean {
       return overflowed;
+    },
+
+    get open(): boolean {
+      return buffer.length > 0 || data.length > 0;
     },
 
     get pendingLength(): number {

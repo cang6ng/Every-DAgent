@@ -157,7 +157,7 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
 
   /** Watches one record that has started and not finished, however many chunks arrive. */
   function watchRecord(): void {
-    if (parser.pendingLength === 0) {
+    if (!parser.open) {
       if (recordWatch !== undefined) clearTimeout(recordWatch);
       recordWatch = undefined;
       return;
