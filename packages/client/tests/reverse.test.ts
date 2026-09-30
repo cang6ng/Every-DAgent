@@ -483,6 +483,149 @@ describe("an abort listener is foreign code", () => {
   });
 });
 
+/**
+ * The params contract is the first foreign code the dispatcher runs, and the
+ * last thing before it answers or installs anything.
+ *
+ * `accepts` may refuse the payload, and it may re-enter this client — a `resync`
+ * or a `closeSubscription` from inside it is legal. A verdict on a request whose
+ * stream is gone by the time the verdict is known is a verdict on nothing: no
+ * answer travels, and no handler is installed, for either outcome.
+ */
+describe("the params contract is foreign code too", () => {
+  it("a refusal cannot answer the stream its own contract just re-cut", async () => {
+    const dispatched: string[] = [];
+    let nested: Promise<unknown> | undefined;
+    const scenario = scenarioWith([
+      {
+        method: "test.echo",
+        accepts: (): boolean => {
+          nested = scenario.client.resync().catch((error: unknown) => error);
+          return false;
+        },
+        resultIsValid: (result: JsonValue): boolean => typeof strictObject(result)?.["echoed"] === "string",
+        handle: (): ReverseHandlerOutcome => {
+          dispatched.push("ran");
+          return { result: { echoed: "old-stream" } };
+        },
+      },
+    ]);
+    await scenario.ready();
+    const host = scenario.host;
+    const oldStream = host.currentStreamId;
+    sendHostRequest(host, { requestId: "h-1", method: "test.echo", params: { value: "hello" } });
+    await nested;
+    await flush();
+
+    // The refusal belongs to a stream the contract itself ended: it travels
+    // nowhere, and no handler is installed for the request.
+    expect(host.currentStreamId).not.toBe(oldStream);
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+    expect(clientAnswers(scenario, "h-1")).toHaveLength(0);
+    expect(dispatched).toHaveLength(0);
+
+    // The stream that replaced it is healthy and still positioned at its start.
+    host.emit({ type: "session.created", session: SESSION });
+    expect(scenario.client.getSnapshot().presentation?.watermark.sequence).toBe(1);
+  });
+
+  it("a refusal cannot answer the stream its own contract just closed", async () => {
+    const dispatched: string[] = [];
+    let closing: Promise<unknown> | undefined;
+    const scenario = scenarioWith([
+      {
+        method: "test.echo",
+        accepts: (): boolean => {
+          closing = scenario.client.closeSubscription().catch((error: unknown) => error);
+          return false;
+        },
+        resultIsValid: (result: JsonValue): boolean => typeof strictObject(result)?.["echoed"] === "string",
+        handle: (): ReverseHandlerOutcome => {
+          dispatched.push("ran");
+          return { result: { echoed: "old-stream" } };
+        },
+      },
+    ]);
+    await scenario.ready();
+    sendHostRequest(scenario.host, { requestId: "h-1", method: "test.echo", params: { value: "hello" } });
+    await flush();
+
+    // The stream the request arrived on is already invalidated, and the refusal
+    // is not sent to it: the only frame the host hears about this is the close
+    // the contract asked for.
+    expect(scenario.client.getSnapshot().status).toBe("connected");
+    expect(scenario.client.getSnapshot().stale).toBe(true);
+    expect(clientAnswers(scenario, "h-1")).toHaveLength(0);
+    expect(dispatched).toHaveLength(0);
+
+    scenario.host.respond(scenario.host.requestIdOf("subscriptions.close") ?? "", "subscriptions.close", {
+      closed: true,
+    });
+    await closing;
+  });
+
+  it("a contract that throws cannot answer the stream it just re-cut", async () => {
+    const dispatched: string[] = [];
+    let nested: Promise<unknown> | undefined;
+    const scenario = scenarioWith([
+      {
+        method: "test.echo",
+        accepts: (): boolean => {
+          nested = scenario.client.resync().catch((error: unknown) => error);
+          throw new Error("the params contract blew up");
+        },
+        resultIsValid: (result: JsonValue): boolean => typeof strictObject(result)?.["echoed"] === "string",
+        handle: (): ReverseHandlerOutcome => {
+          dispatched.push("ran");
+          return { result: { echoed: "old-stream" } };
+        },
+      },
+    ]);
+    await scenario.ready();
+    const host = scenario.host;
+    sendHostRequest(host, { requestId: "h-1", method: "test.echo", params: { value: "hello" } });
+    await nested;
+    await flush();
+
+    // Nor does a contract that fails to run get a say about a stream it took
+    // away itself: the frame is delivered, the request is dropped with it.
+    expect(clientAnswers(scenario, "h-1")).toHaveLength(0);
+    expect(dispatched).toHaveLength(0);
+
+    host.emit({ type: "session.created", session: SESSION });
+    expect(scenario.client.getSnapshot().presentation?.watermark.sequence).toBe(1);
+  });
+
+  it("a contract that throws while its stream still stands is answered as a failure", async () => {
+    const dispatched: string[] = [];
+    const scenario = scenarioWith([
+      {
+        method: "test.echo",
+        accepts: (): boolean => {
+          throw new Error("the params contract blew up");
+        },
+        resultIsValid: (result: JsonValue): boolean => typeof strictObject(result)?.["echoed"] === "string",
+        handle: (): ReverseHandlerOutcome => {
+          dispatched.push("ran");
+          return { result: { echoed: "old-stream" } };
+        },
+      },
+    ]);
+    await scenario.ready();
+    sendHostRequest(scenario.host, { requestId: "h-1", method: "test.echo", params: { value: "hello" } });
+    await flush();
+
+    // A registration that cannot judge a payload is this client's failure, and
+    // the host is told so rather than being blamed for its params — while the
+    // request itself is never dispatched.
+    const [answer] = clientAnswers(scenario, "h-1");
+    expect(answer?.["error"]).toMatchObject({ code: "INTERNAL_ERROR" });
+    expect(answer?.["result"]).toBeUndefined();
+    expect(dispatched).toHaveLength(0);
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+  });
+});
+
 describe("the registration table", () => {
   it("refuses two handlers for the same method", () => {
     expect(() => scenarioWith([echoHandler(), echoHandler()])).toThrowError(/registered twice/);

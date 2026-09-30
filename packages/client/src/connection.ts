@@ -1145,16 +1145,38 @@ export class ClientConnection {
       });
       return;
     }
-    if (!handler.accepts(request.params)) {
+    // The params contract is foreign code, and it is the last thing that runs
+    // before this dispatcher touches anything at all: it may reject the payload,
+    // it may re-enter this client — a `resync` or a `closeSubscription` from
+    // inside it is legal — and it may throw. Whatever it does, nothing travels
+    // for this request until the stream it arrived on is confirmed still to be
+    // this client's: a contract that re-cut the subscription, closed it, or ended
+    // the connection has taken that stream away, and the request is abandoned
+    // with it — no answer, no handler, no pending — exactly like a request that
+    // arrived on a stream this client no longer holds.
+    let accepted: boolean | undefined;
+    try {
+      accepted = handler.accepts(request.params);
+    } catch {
+      // A contract that throws has not judged the payload: the registration is
+      // broken, and that is a fact about this client, never one to blame on the
+      // payload it was handed.
+      accepted = undefined;
+    }
+    if (!this.holdsStream(owner, stream)) return;
+
+    if (accepted === false) {
       this.replyReverse(owner, request.streamId, request.requestId, {
         error: Object.freeze({ code: "INVALID_REQUEST", message: "the payload did not match the method's contract" }),
       });
       return;
     }
-    // `accepts` is foreign code as well, and a request whose stream this client
-    // no longer holds is not one to install a handler for: its answer could only
-    // travel on a stream that is already over.
-    if (!this.holdsStream(owner, stream)) return;
+    if (accepted !== true) {
+      this.replyReverse(owner, request.streamId, request.requestId, {
+        error: Object.freeze({ code: "INTERNAL_ERROR", message: "the handler's params contract failed" }),
+      });
+      return;
+    }
     if (this.reversePendings.size >= MAX_REVERSE_PENDING) {
       this.replyReverse(owner, request.streamId, request.requestId, {
         error: Object.freeze({ code: "INTERNAL_ERROR", message: "this client is at capacity for reverse requests" }),
