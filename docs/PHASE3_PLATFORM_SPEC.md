@@ -1,6 +1,6 @@
 # Every-DAgent Phase 3 — Platform Architecture SPEC
 
-> 状态：P3.0 Architecture Explore / SPEC COMPLETE；本文冻结 Phase 3 的目标契约，Phase 3 implementation 未开始。
+> 状态：P3.0 Architecture Explore / SPEC COMPLETE；本文冻结 Phase 3 的目标契约，规范内容不随阶段推进改写；阶段状态（P3.0–P3.3）见 [PHASE3_HANDOFF.md](./PHASE3_HANDOFF.md)。
 > 范围：Protocol + Host + React-free Client + Generic Web Shell。
 > 前置基线：Phase 1 COMPLETE、Phase 2 COMPLETE；当前 Git 基线与阶段入口见 Phase 3 HANDOFF。
 > 本文不是 Implementation Master Plan。阶段状态见 [PHASE3_HANDOFF.md](./PHASE3_HANDOFF.md)。
