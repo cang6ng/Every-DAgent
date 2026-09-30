@@ -9,11 +9,14 @@
 
 import { describe, expect, it } from "vitest";
 
+import type { TerminalRunSnapshot } from "@every-dagent/protocol";
+
 import { createScenario, openWith } from "./helpers/scenario.js";
 import {
   activeRun,
   completedRun,
   pluginSummary,
+  runIn,
   runningRun,
   sessionIn,
   sessionSnapshot,
@@ -302,12 +305,138 @@ describe("the terminal correction", () => {
     await openWith(scenario, { sessions: [SESSION] });
     const ending = { type: "run.ended" as const, run: completedRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }), session: sessionSnapshot({ sessionId: "s-1" }) };
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+    scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
     scenario.host.emit(ending);
 
     scenario.host.emit(ending);
 
     expect(scenario.client.getSnapshot().status).toBe("protocol-error");
   });
+
+  /** The run identity these terminal tests end. */
+  const RUN = {
+    runId: "r-1",
+    sessionId: "s-1",
+    submissionId: "sub-1",
+    text: "hello",
+    turnId: "turn-1",
+    cancelRequested: false,
+  } as const;
+
+  /** The successful terminal outcomes. */
+  function terminal(status: "completed" | "limited" | "cancelled"): TerminalRunSnapshot {
+    switch (status) {
+      case "completed":
+        return { ...RUN, status: "completed", endReason: "completed", error: null, live: null };
+      case "limited":
+        return { ...RUN, status: "limited", endReason: "max_steps", error: null, live: null };
+      case "cancelled":
+        return { ...RUN, status: "cancelled", endReason: "cancelled", error: null, live: null };
+    }
+  }
+
+  /** A failed run: the Core's own error, or the host's fault before the Core started. */
+  function failed(endReason: "error" | "host_error"): TerminalRunSnapshot {
+    return {
+      ...RUN,
+      status: "failed",
+      endReason,
+      error: { code: "INTERNAL_ERROR", message: "the run failed" },
+      live: null,
+    };
+  }
+
+  // The spec's machine allows exactly one terminal move out of `accepted`: the
+  // host's own failure, for a run the Core never started. These three outcomes
+  // all require the running publication the client has to have seen.
+  for (const status of ["completed", "limited", "cancelled"] as const) {
+    it(`refuses a ${status} ending for a run the client never saw running`, async () => {
+      const scenario = createScenario({ host: { auto: false } });
+      await openWith(scenario, { sessions: [SESSION] });
+      scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+      const published = scenario.client.getSnapshot().presentation;
+
+      scenario.host.emit({
+        type: "run.ended",
+        run: terminal(status),
+        session: sessionSnapshot({ sessionId: "s-1" }),
+      });
+
+      // Nothing of the frame was published — not the run, not the session, not
+      // the stream position — and the connection does not survive it.
+      const snapshot = scenario.client.getSnapshot();
+      expect(snapshot.status).toBe("protocol-error");
+      expect(snapshot.error?.reason).toBe("invalid-event");
+      expect(snapshot.presentation).toBe(published);
+      expect(runIn(published?.runs ?? [], "r-1")?.status).toBe("accepted");
+      expect(snapshot.presentation?.watermark.sequence).toBe(published?.watermark.sequence);
+    });
+  }
+
+  it("accepts the host's own failure as the terminal move out of accepted", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+    scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+
+    let notifications = 0;
+    scenario.client.subscribe(() => {
+      notifications += 1;
+    });
+    scenario.host.emit({
+      type: "run.ended",
+      run: failed("host_error"),
+      session: sessionSnapshot({ sessionId: "s-1", status: "blocked" }),
+    });
+
+    expect(notifications).toBe(1);
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+    const presentation = scenario.client.getSnapshot().presentation;
+    expect(runIn(presentation?.runs ?? [], "r-1")?.status).toBe("failed");
+    expect(runIn(presentation?.runs ?? [], "r-1")?.live).toBeNull();
+    expect(sessionIn(presentation?.sessions ?? [], "s-1")?.activeRunId).toBeNull();
+  });
+
+  // The rule is about stages, not about end reasons: a failure the host writes
+  // down as the Core's is still the one terminal move out of `accepted`, and
+  // refusing a legal terminal would end a connection over a name.
+  it("accepts a failed ending for a run that never started, whatever the host calls the failure", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+    scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+
+    scenario.host.emit({ type: "run.ended", run: failed("error"), session: sessionSnapshot({ sessionId: "s-1" }) });
+
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+    expect(runIn(scenario.client.getSnapshot().presentation?.runs ?? [], "r-1")?.status).toBe("failed");
+  });
+
+  for (const status of ["completed", "limited", "cancelled"] as const) {
+    it(`accepts a ${status} ending once the run has been published as running`, async () => {
+      const scenario = createScenario({ host: { auto: false } });
+      await openWith(scenario, { sessions: [SESSION] });
+      scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+      scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+
+      let notifications = 0;
+      scenario.client.subscribe(() => {
+        notifications += 1;
+      });
+      scenario.host.emit({
+        type: "run.ended",
+        run: terminal(status),
+        session: sessionSnapshot({ sessionId: "s-1" }),
+      });
+
+      // One notification, carrying the terminal run and the settled session
+      // already applied together.
+      expect(notifications).toBe(1);
+      expect(scenario.client.getSnapshot().status).toBe("ready");
+      const presentation = scenario.client.getSnapshot().presentation;
+      expect(runIn(presentation?.runs ?? [], "r-1")?.status).toBe(status);
+      expect(runIn(presentation?.runs ?? [], "r-1")?.live).toBeNull();
+      expect(sessionIn(presentation?.sessions ?? [], "s-1")?.activeRunId).toBeNull();
+    });
+  }
 });
 
 describe("unknown events", () => {

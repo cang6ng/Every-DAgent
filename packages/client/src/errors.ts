@@ -14,6 +14,8 @@
 
 import type { ProtocolError, ProtocolErrorCode } from "@every-dagent/protocol";
 
+import { deepFreeze } from "./fold.js";
+
 export type ClientErrorCode =
   | ProtocolErrorCode
   | "CONNECTION_LOST"
@@ -116,9 +118,12 @@ export class ClientError extends Error {
     this.code = fields.code;
     this.outcome = fields.outcome;
     this.reason = fields.reason;
-    this.protocolError = fields.protocolError;
     // A published error is part of the client's state: an error a caller could
-    // edit is an error the client would then be reporting.
+    // edit is an error the client would then be reporting. The shell is not
+    // enough — a wire error is a JSON subtree, and the caller who caught the
+    // same object as a rejection could rewrite what the snapshot reports
+    // through it, so it is frozen all the way down.
+    this.protocolError = fields.protocolError === undefined ? undefined : deepFreeze(fields.protocolError);
     Object.freeze(this);
   }
 }

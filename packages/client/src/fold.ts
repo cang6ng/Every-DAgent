@@ -27,6 +27,7 @@ import type {
   LiveItem,
   PluginSummary,
   RunSnapshot,
+  RunStatus,
   SessionSnapshot,
   TerminalRunSnapshot,
   Watermark,
@@ -78,6 +79,32 @@ function activeRunOf(runs: readonly RunSnapshot[], sessionId: string, exceptRunI
   return runs.find(
     (run) => run.sessionId === sessionId && run.runId !== exceptRunId && run.live !== null,
   );
+}
+
+/**
+ * The one rule about a run's stages, for every snapshot this module publishes.
+ *
+ * The spec's state machine is `accepted → running → { completed | limited |
+ * cancelled | failed }`, plus `accepted → failed` for a host fault that lands
+ * before the Core ever started. What breaks it is not something a later
+ * snapshot may assert: a run that ended without the running publication the
+ * client has to have seen to explain content, a move out of a terminal stage
+ * that would rewrite history the client already presented, or an `accepted` a
+ * running run never returns to — once running is published, the acceptance is
+ * over for good.
+ *
+ * The end reason is the host's own account of *why* a failure happened, not a
+ * stage the client tracks, so it is not part of this rule.
+ */
+function runStageAllows(from: RunStatus, to: RunStatus): boolean {
+  switch (from) {
+    case "accepted":
+      return to === "accepted" || to === "running" || to === "failed";
+    case "running":
+      return to !== "accepted";
+    default:
+      return false;
+  }
 }
 
 function withWatermark(base: Omit<HostSnapshot, "watermark">, watermark: Watermark): HostSnapshot {
@@ -244,11 +271,9 @@ function foldRunUpdated(
   } else {
     const existing = previous.runs[runIndex];
     if (existing === undefined) return { ok: false, reason: "invalid-event" };
-    // A terminal run is final; a run's identity is fixed for its life; accepted
-    // never comes back once running has been published; and the timeline only
-    // ever grows.
-    if (existing.live === null) return { ok: false, reason: "invalid-event" };
-    if (existing.status === "running" && run.status === "accepted") {
+    // A run's stage only moves forward, and only a run that still has a
+    // timeline has one to extend; its identity is fixed for its life.
+    if (existing.live === null || !runStageAllows(existing.status, run.status)) {
       return { ok: false, reason: "invalid-event" };
     }
     if (!sameRunIdentity(existing, run) || !turnIdFits(existing.turnId, run.turnId)) {
@@ -396,7 +421,9 @@ function foldRunEnded(
   }
 
   const existing = previous.runs[runIndex];
-  if (existing === undefined || existing.live === null) return { ok: false, reason: "invalid-event" };
+  if (existing === undefined || !runStageAllows(existing.status, run.status)) {
+    return { ok: false, reason: "invalid-event" };
+  }
   if (!sameRunIdentity(existing, run)) return { ok: false, reason: "run-identity" };
   if (!turnIdFits(existing.turnId, run.turnId)) return { ok: false, reason: "run-identity" };
 
