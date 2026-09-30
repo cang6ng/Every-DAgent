@@ -53,6 +53,25 @@ export function encodeSseComment(text: string): string {
  */
 const RECORD_ALLOWANCE_BYTES = 16;
 
+/**
+ * The UTF-8 length of a line that is still arriving.
+ *
+ * A line is measured the same way whether it has finished or not, and the same
+ * way whether it ends in `\n` or in `\r\n`: CRLF is one terminator, so the CR
+ * that closes a line is not content. A pending line that ends in CR may be
+ * holding exactly that CR — the LF is one byte away — and charging it as
+ * content would make the same byte stream overflow or not depending on where
+ * the chunk boundary fell.
+ *
+ * Only the last CR is held back, so the bound still holds: a stream of nothing
+ * but CRs is measured one byte short of its length, never unbounded, and the CR
+ * stops being exempt the moment any byte follows it.
+ */
+function pendingLineBytes(line: string): number {
+  const bytes = utf8Length(line);
+  return line.endsWith("\r") ? bytes - 1 : bytes;
+}
+
 export interface SseParser {
   /** Feeds one decoded chunk and returns every complete record it produced. */
   feed(chunk: string): readonly string[];
@@ -184,7 +203,7 @@ export function createSseParser(limitBytes: number): SseParser {
         // because this binding never resumes a stream.
       }
 
-      if (utf8Length(buffer) > lineLimit) return overflow(records);
+      if (pendingLineBytes(buffer) > lineLimit) return overflow(records);
       return records;
     },
 

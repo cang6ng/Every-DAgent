@@ -162,6 +162,14 @@ describe("the SSE reader", () => {
       { name: "a record exactly at the limit", stream: `data: ${"z".repeat(64)}\n\n`, limit: 64 },
       { name: "a record one byte past it", stream: `data: ${"z".repeat(65)}\n\n`, limit: 64 },
       { name: "CRLF line ends", stream: 'data: "crlf"\r\n\r\n', limit: 64 },
+      // CRLF is one terminator, and which half of it a chunk ends on is not a
+      // property of the stream. The line below is exactly at the limit without
+      // its CR, so a parser that charges the CR as content overflows on one
+      // chunking and not on another.
+      { name: "a line ending in CRLF exactly at the limit", stream: `: ${"x".repeat(22)}\r\n\r\n`, limit: 8 },
+      { name: "a CRLF line one byte past the limit", stream: `: ${"x".repeat(23)}\r\n\r\n`, limit: 8 },
+      { name: "a line whose CR is followed by something else", stream: `: ${"x".repeat(22)}\ry\n\n`, limit: 8 },
+      { name: "a blank CRLF line after a comment", stream: `: ${"x".repeat(6)}\r\n\r\n: ${"y".repeat(6)}\r\n\r\n`, limit: 8 },
       { name: "a record with no terminator", stream: 'data: "unfinished', limit: 64 },
       { name: "an oversized line with no terminator", stream: `data: ${"q".repeat(40)}`, limit: 8 },
       { name: "multi-byte payloads", stream: 'data: "é中🚀"\n\n', limit: 64 },
@@ -181,6 +189,39 @@ describe("the SSE reader", () => {
           overflowed: whole.overflowed,
         });
       }
+    }
+  });
+
+  it("does not overflow a line whose CR has arrived but whose LF has not", () => {
+    // The counterexample, byte for byte: a comment line of exactly the line
+    // limit, terminated by CRLF, inside a record of its own. Every chunking of
+    // these 28 bytes is the same stream, so every chunking gets the same
+    // verdict — including the one that splits the terminator in half.
+    const raw = `: ${"x".repeat(22)}\r\n\r\n`;
+    expect(utf8Length(raw)).toBe(28);
+
+    expect(judged(raw, 8, raw.length + 1), "whole").toMatchObject({ records: [], overflowed: false });
+    expect(judged(raw, 8, 25), "split between the CR and its LF").toMatchObject({ records: [], overflowed: false });
+    for (let size = 1; size <= [...raw].length; size += 1) {
+      expect(judged(raw, 8, size), `chunks of ${size}`).toMatchObject({ records: [], overflowed: false });
+    }
+  });
+
+  it("keeps a line bounded that never receives its LF", () => {
+    // Holding back a trailing CR is holding back one byte, not suspending the
+    // limit: a stream that is nothing but CRs, or that ends on one, is measured
+    // like any other and refused once it is past the bound.
+    expect(judged(": " + "x".repeat(22) + "\r", 8, 1000)).toMatchObject({ records: [], overflowed: false });
+    expect(judged(": " + "x".repeat(23) + "\r", 8, 1000)).toMatchObject({ records: [], overflowed: true });
+    expect(judged("\r".repeat(64), 8, 1000)).toMatchObject({ records: [], overflowed: true });
+  });
+
+  it("refuses an oversized line that ends in CR, however it is cut", () => {
+    // The CR is only held back while it could still be half of a terminator:
+    // the line below is past the limit with or without it.
+    const raw = `: ${"x".repeat(24)}\r\n\r\n`;
+    for (let size = 1; size <= [...raw].length; size += 1) {
+      expect(judged(raw, 8, size), `chunks of ${size}`).toMatchObject({ records: [], overflowed: true });
     }
   });
 
