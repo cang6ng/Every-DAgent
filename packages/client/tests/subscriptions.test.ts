@@ -346,9 +346,80 @@ describe("control transactions are taken before anything observable", () => {
     expect(host.requests.filter((request) => request.method === "subscriptions.open")).toHaveLength(2);
     expect(scenario.client.getSnapshot().status).toBe("syncing");
   });
+
+  it("a listener that reacts to a caller's cut joins it instead of cutting again", async () => {
+    const scenario = createScenario();
+    await scenario.ready();
+    const host = scenario.host;
+
+    let reentered = false;
+    let nested: Promise<unknown> | undefined;
+    scenario.client.subscribe(() => {
+      if (reentered || !scenario.client.getSnapshot().stale) return;
+      reentered = true;
+      nested = scenario.client.resync().catch((error: unknown) => error);
+    });
+
+    await scenario.client.resync();
+    await nested;
+
+    // Dropping the old stream, publishing that it is gone and taking the new cut
+    // are one transaction: the reentrant call rode along with it instead of
+    // opening a third stream underneath it.
+    expect(reentered).toBe(true);
+    expect(host.requests.filter((request) => request.method === "subscriptions.open")).toHaveLength(2);
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+  });
+
+  it("a listener that reacts to a gap-driven cut joins that cut", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+    const host = scenario.host;
+
+    let reentered = false;
+    let nested: Promise<unknown> | undefined;
+    scenario.client.subscribe(() => {
+      if (reentered || scenario.client.getSnapshot().status !== "syncing") return;
+      reentered = true;
+      nested = scenario.client.resync().catch((error: unknown) => error);
+    });
+
+    host.sendRaw(badEvent(host, 4, "s-skipped"));
+    await flush();
+    host.serveOpen({ sessions: [SESSION] });
+    await nested;
+    await flush();
+
+    expect(reentered).toBe(true);
+    expect(host.requests.filter((request) => request.method === "subscriptions.open")).toHaveLength(2);
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+  });
 });
 
 describe("losing the stream marks the presentation stale", () => {
+  it("a cut never publishes a status its own stream could not back", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+    const host = scenario.host;
+    const observed: { readonly status: string; readonly stale: boolean }[] = [];
+    scenario.client.subscribe(() => {
+      const snapshot = scenario.client.getSnapshot();
+      observed.push({ status: snapshot.status, stale: snapshot.stale });
+    });
+
+    const resyncing = scenario.client.resync();
+    await flush();
+    host.serveOpen({ sessions: [SESSION] });
+    await resyncing;
+
+    // The stream is gone and the presentation is stale in the same publication:
+    // a reader is never told "ready" at a moment when there is nothing to be
+    // ready about, and the presentation it kept is never silently current.
+    expect(observed).not.toContainEqual({ status: "ready", stale: true });
+    expect(observed[0]).toEqual({ status: "syncing", stale: true });
+    expect(observed[observed.length - 1]).toEqual({ status: "ready", stale: false });
+  });
+
   it("a caller's resync marks what is retained as stale", async () => {
     const scenario = createScenario({ host: { auto: false } });
     await openWith(scenario, { sessions: [SESSION] });
@@ -474,6 +545,48 @@ describe("which non-current streams are noise and which are a fence", () => {
       await resyncing;
     });
   }
+
+  it("a spent retirement budget is a debt of that connection, not of the next one", async () => {
+    const scenario = createScenario();
+    await scenario.ready();
+    const host = scenario.host;
+    const lastStream = host.currentStreamId ?? "";
+
+    // Retiring streams within one connection is bounded, and the bound is real:
+    // a connection that can no longer prove which streams it has ended says so
+    // instead of forgetting one.
+    for (let index = 0; index < 256; index += 1) await scenario.client.resync();
+    await expect(scenario.client.resync()).rejects.toMatchObject({ code: "CONNECTION_LOST" });
+
+    expect(scenario.client.getSnapshot().status).toBe("protocol-error");
+    expect(scenario.client.getSnapshot().error?.reason).toBe("stream-identity-budget");
+    expect(host.isClosed).toBe(true);
+
+    // A new connection remembers its own streams: what the ended generation
+    // retired cannot be a debt the next one has to pay.
+    await scenario.client.reconnect();
+    await expect(scenario.client.resync()).resolves.toBeUndefined();
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+
+    // What the ledger exists for is untouched: a stream this client has moved on
+    // from is still dropped, not applied to a presentation that moved with it.
+    const before = scenario.client.getSnapshot();
+    scenario.host.sendRaw(
+      JSON.stringify({
+        kind: "host-event",
+        protocolVersion: "1",
+        hostInstanceId: scenario.host.hostInstanceId,
+        streamId: lastStream,
+        sequence: 1,
+        type: "session.created",
+        scope: { kind: "session", sessionId: "late" },
+        payload: { session: sessionSnapshot({ sessionId: "late" }) },
+      }),
+    );
+
+    expect(scenario.client.getSnapshot()).toBe(before);
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+  });
 });
 
 describe("a gap never reaches the presentation, not even for a moment", () => {

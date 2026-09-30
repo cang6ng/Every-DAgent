@@ -15,7 +15,7 @@ import type { ProtocolChannel } from "@every-dagent/protocol";
 import { createClient } from "../src/index.js";
 
 import { createScenario, flush, openWith, statusTransitions } from "./helpers/scenario.js";
-import { createFakeHost } from "./helpers/fake-host.js";
+import { createFakeHost, type FakeHost } from "./helpers/fake-host.js";
 import { sessionSnapshot } from "./helpers/values.js";
 
 const SESSION = sessionSnapshot({ sessionId: "s-1" });
@@ -341,5 +341,166 @@ describe("invalidation comes before publication", () => {
     expect(scenario.client.getSnapshot()).toBe(before);
     expect(notifications).toBe(0);
     expect(current.isClosed).toBe(false);
+  });
+
+  it("a listener that disconnects when the channel comes up keeps the client disconnected", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    let ended = false;
+    scenario.client.subscribe(() => {
+      if (ended || scenario.client.getSnapshot().status !== "connected") return;
+      ended = true;
+      scenario.client.disconnect();
+    });
+
+    const connecting = scenario.client.connect().catch((error: unknown) => error);
+    await flush();
+
+    // The bootstrap that heard "connected" must not resume into a describe and a
+    // status of its own: the generation that owns it is gone, and the listener
+    // asked for exactly this.
+    expect(ended).toBe(true);
+    expect(scenario.client.getSnapshot().status).toBe("disconnected");
+    expect(scenario.host.requests).toHaveLength(0);
+    await expect(connecting).resolves.toMatchObject({ code: "CONNECTION_LOST", outcome: "unknown" });
+  });
+
+  it("a listener that disconnects from a stale presentation stops the cut it was reading", async () => {
+    const scenario = createScenario();
+    await scenario.ready();
+    let ended = false;
+    scenario.client.subscribe(() => {
+      if (ended || !scenario.client.getSnapshot().stale) return;
+      ended = true;
+      scenario.client.disconnect();
+    });
+
+    await expect(scenario.client.resync()).rejects.toMatchObject({ code: "CONNECTION_LOST" });
+    await flush();
+
+    // The cut's own continuation cannot say anything about a client its owner
+    // has already disconnected: no "lost", no "syncing", no second open.
+    expect(ended).toBe(true);
+    expect(scenario.client.getSnapshot().status).toBe("disconnected");
+    expect(scenario.host.requests.filter((request) => request.method === "subscriptions.open")).toHaveLength(1);
+  });
+
+  it("a channel that closes while its listener is installed is disposed of as well", async () => {
+    let disposed = 0;
+    const sent: string[] = [];
+    const client = createClient({
+      connect: async () => ({
+        listen: (listener) => {
+          listener.onClose();
+          return () => {
+            disposed += 1;
+          };
+        },
+        send: (frame: string): void => {
+          sent.push(frame);
+        },
+        close: (): void => undefined,
+      }),
+    });
+
+    await expect(client.connect()).rejects.toMatchObject({ code: "CONNECTION_LOST" });
+
+    // The generation that heard its own channel close owns the disposer too:
+    // dropping it would leave a listener the transport still believes in.
+    expect(disposed).toBe(1);
+    expect(sent).toHaveLength(0);
+    expect(client.getSnapshot().status).toBe("lost");
+    client.disconnect();
+  });
+
+  it("a protocol failure cannot retire a connection opened while it was being reported", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+    const failed = scenario.host;
+
+    let reconnected = false;
+    let fresh: Promise<unknown> | undefined;
+    scenario.client.subscribe(() => {
+      if (reconnected || scenario.client.getSnapshot().status !== "protocol-error") return;
+      reconnected = true;
+      fresh = scenario.client.reconnect().catch((error: unknown) => error);
+    });
+
+    const resyncing = scenario.client.resync().catch((error: unknown) => error);
+    await flush();
+    failed.sendRaw(
+      JSON.stringify({
+        kind: "host-response",
+        protocolVersion: "1",
+        hostInstanceId: failed.hostInstanceId,
+        requestId: failed.requestIdOf("subscriptions.open", 1) ?? "",
+        result: { wrong: "shape" },
+      }),
+    );
+
+    // The violation belonged to the connection that received it; the one a
+    // listener opened while hearing about it is not that failure's to end.
+    await expect(resyncing).resolves.toMatchObject({ kind: "protocol", reason: "invalid-response" });
+    await flush();
+    scenario.host.serveDescribe();
+    await flush();
+    scenario.host.serveOpen({ sessions: [SESSION] });
+    await fresh;
+
+    expect(reconnected).toBe(true);
+    expect(failed.isClosed).toBe(true);
+    expect(scenario.host.isClosed).toBe(false);
+    expect(scenario.attempts).toBe(2);
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+  });
+
+  it("a transport that fails a send after delivering a violation cannot end the replacement", async () => {
+    const hosts: FakeHost[] = [];
+    let failNext = false;
+    const client = createClient({
+      connect: async (): Promise<ProtocolChannel> => {
+        const host = createFakeHost();
+        hosts.push(host);
+        const base = host.channel;
+        return {
+          listen: (listener) => base.listen(listener),
+          close: (): void => {
+            base.close();
+          },
+          send: (frame: string): void => {
+            if (failNext) {
+              failNext = false;
+              // A transport that answers the frame with a violation of its own,
+              // and then fails the very send that carried it.
+              host.sendRaw("{");
+              throw new Error("the transport refused the frame");
+            }
+            base.send(frame);
+          },
+        };
+      },
+    });
+
+    await client.connect();
+    const replaced = hosts[0]!;
+    let reconnected = false;
+    let fresh: Promise<unknown> | undefined;
+    client.subscribe(() => {
+      if (reconnected || client.getSnapshot().status !== "protocol-error") return;
+      reconnected = true;
+      fresh = client.reconnect().catch((error: unknown) => error);
+    });
+
+    failNext = true;
+    const listing = client.sessions.list().catch((error: unknown) => error);
+    await fresh;
+
+    // Cleaning up after a transport that failed must not reach into the
+    // connection that replaced the one which failed.
+    expect(reconnected).toBe(true);
+    await expect(listing).resolves.toMatchObject({ kind: "protocol", reason: "invalid-frame" });
+    expect(replaced.isClosed).toBe(true);
+    expect(hosts).toHaveLength(2);
+    expect(hosts[1]?.isClosed).toBe(false);
+    expect(client.getSnapshot().status).toBe("ready");
   });
 });
