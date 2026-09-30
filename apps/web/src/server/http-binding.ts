@@ -35,13 +35,31 @@ export interface HttpBindingOptions {
   readonly onConnection: (channel: ProtocolChannel) => void;
   readonly limits?: Partial<WebLimits>;
   /**
-   * Exact origins allowed to create a connection. Empty by default: a browser
-   * page from anywhere else is refused, and a non-browser client (no `Origin`
-   * at all) is trusted only because this endpoint listens on loopback.
+   * Exact origins allowed to create a connection, on top of the binding's own
+   * origin. A browser page from anywhere else is refused; a non-browser client
+   * (no `Origin` at all) is trusted only because this endpoint listens on
+   * loopback and only ever answers a loopback peer.
    */
   readonly originAllowlist?: readonly string[];
+  /** The loopback address to listen on. Anything else is refused. */
   readonly address?: string;
   readonly port?: number;
+}
+
+/** Whether an address is loopback; anything else would be reachable off the machine. */
+function isLoopbackAddress(address: string): boolean {
+  return address === "127.0.0.1" || address === "localhost" || address === "::1";
+}
+
+/** Whether a peer address is loopback, in the spellings Node reports. */
+function isLoopbackPeer(remote: string | undefined): boolean {
+  if (remote === undefined) return false;
+  return (
+    remote === "127.0.0.1" ||
+    remote === "::1" ||
+    remote === "::ffff:127.0.0.1" ||
+    remote.startsWith("127.")
+  );
 }
 
 export interface HttpBinding {
@@ -62,6 +80,10 @@ interface LogicalConnection {
   listener: ProtocolChannelListener | undefined;
   readonly outbox: FrameQueue;
   readonly inbound: FrameQueue;
+  /** Whether the one close this connection will ever report has been handed to its owner. */
+  closeDelivered: boolean;
+  /** Whether a close is owed to an owner that was not listening when it happened. */
+  closeOwed: boolean;
   paused: boolean;
   /** Bytes of a record the socket accepted but has not flushed yet. */
   inFlightBytes: number;
@@ -74,9 +96,24 @@ interface LogicalConnection {
 
 const TRANSPORT_HEADER = "x-every-dagent-transport";
 
+/**
+ * Compares one presented token with the one this connection was created with.
+ *
+ * The comparison is on bytes, and it is length-checked on bytes: two strings of
+ * the same length in JavaScript can be different lengths in UTF-8, and
+ * `timingSafeEqual` throws on that — which must stay a failed authentication
+ * rather than an exception that takes the process down.
+ */
 function tokenMatches(expected: string, provided: string | undefined): boolean {
-  if (provided === undefined || provided.length !== expected.length) return false;
-  return timingSafeEqual(Buffer.from(expected), Buffer.from(provided));
+  if (provided === undefined) return false;
+  const expectedBytes = Buffer.from(expected, "utf8");
+  const providedBytes = Buffer.from(provided, "utf8");
+  if (expectedBytes.length !== providedBytes.length) return false;
+  try {
+    return timingSafeEqual(expectedBytes, providedBytes);
+  } catch {
+    return false;
+  }
 }
 
 function bearerOf(request: IncomingMessage): string | undefined {
@@ -87,8 +124,13 @@ function bearerOf(request: IncomingMessage): string | undefined {
 
 export async function startHttpBinding(options: HttpBindingOptions): Promise<HttpBinding> {
   const limits: WebLimits = { ...DEFAULT_WEB_LIMITS, ...options.limits };
-  const allowlist = new Set(options.originAllowlist ?? []);
   const address = options.address ?? "127.0.0.1";
+  if (!isLoopbackAddress(address)) {
+    // A binding that could be reached from another machine is a different
+    // security proposition, and v1 does not pretend to make it.
+    throw new Error("the web binding listens on loopback only");
+  }
+  const allowlist = new Set(options.originAllowlist ?? []);
 
   const connections = new Map<string, LogicalConnection>();
   let createTokens = limits.createBurst;
@@ -109,13 +151,9 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
 
     // The owner hears about it exactly once, and before the response is torn
     // down: a host that learns of a dead connection after its socket is gone has
-    // no way left to react.
-    try {
-      connection.listener?.onClose();
-    } catch {
-      // The owner's reaction is its own business.
-    }
-    connection.listener = undefined;
+    // no way left to react. A connection that ended before its owner listened
+    // hands the close over when it does.
+    deliverClose(connection);
 
     try {
       connection.response?.end();
@@ -258,6 +296,14 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
       listen(listener: ProtocolChannelListener): () => void {
         if (connection.listener !== undefined) throw new Error("the channel already has a listener");
         connection.listener = listener;
+        // A connection that ended before this listener existed still owes it the
+        // one close it will ever get.
+        if (connection.closeOwed || connection.closeDelivered) {
+          deliverClose(connection);
+          return (): void => {
+            if (connection.listener === listener) connection.listener = undefined;
+          };
+        }
         // Frames that arrived before the listener: never lost, and never
         // reordered — they are handed over now, oldest first.
         deliverInbound(connection);
@@ -271,11 +317,44 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
     };
   }
 
-  function allowOrigin(request: IncomingMessage): boolean {
+  /**
+   * Hands the one close to the owner, now or when it starts listening.
+   *
+   * A connection that ended before anyone was listening is not a connection
+   * whose close can be skipped: the owner would be holding a channel that looks
+   * alive and never tells it otherwise.
+   */
+  function deliverClose(connection: LogicalConnection): void {
+    if (connection.closeDelivered) return;
+    const listener = connection.listener;
+    if (listener === undefined) {
+      connection.closeOwed = true;
+      return;
+    }
+    connection.closeDelivered = true;
+    try {
+      listener.onClose();
+    } catch {
+      // The owner's reaction is its own business.
+    }
+  }
+
+  /**
+   * Whether this request may act on the binding, judged by its `Origin`.
+   *
+   * A page is allowed when it comes from the binding's own origin or from the
+   * configured allowlist — exact matches, never a suffix or a wildcard. An
+   * opaque origin (`null`) is refused outright: it is what a sandboxed or
+   * `data:` document has, and it is not a deployment this binding serves. A
+   * request with no `Origin` at all is not a browser, and the loopback peer
+   * check is what stands behind it.
+   */
+  function allowOrigin(request: IncomingMessage, port: number): boolean {
     const origin = request.headers.origin;
-    if (origin === undefined) return true; // Not a browser: loopback is the boundary.
-    if (typeof origin !== "string") return false;
-    return allowlist.has(origin);
+    if (origin === undefined) return true;
+    if (typeof origin !== "string" || origin === "null") return false;
+    if (allowlist.has(origin)) return true;
+    return origin === `http://${address}:${port}` || origin === `http://127.0.0.1:${port}` || origin === `http://localhost:${port}`;
   }
 
   function hostIsMine(request: IncomingMessage, port: number): boolean {
@@ -292,9 +371,9 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
    * is how the browser ends up refusing it. There is no wildcard and no
    * credentials: the token is the credential.
    */
-  function corsHeaders(request: IncomingMessage): Record<string, string> {
+  function corsHeaders(request: IncomingMessage, port: number): Record<string, string> {
     const origin = request.headers.origin;
-    if (typeof origin !== "string" || !allowlist.has(origin)) return {};
+    if (typeof origin !== "string" || !allowOrigin(request, port)) return {};
     return {
       "access-control-allow-origin": origin,
       "access-control-allow-headers": `content-type, authorization, ${TRANSPORT_HEADER}`,
@@ -311,11 +390,12 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
     body?: unknown,
   ): void {
     const payload = body === undefined ? "" : JSON.stringify(body);
+    const port = (server.address() as AddressInfo | null)?.port ?? 0;
     response.writeHead(status, {
       "content-type": "application/json",
       "content-length": Buffer.byteLength(payload),
       "cache-control": "no-store",
-      ...corsHeaders(request),
+      ...corsHeaders(request, port),
     });
     response.end(payload);
   }
@@ -392,7 +472,18 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
     // application failure to report.
     request.on("error", () => undefined);
     response.on("error", () => undefined);
-    void handle(request, response);
+    void handle(request, response).catch(() => {
+      // One request failing is one request: it ends safely, and the binding
+      // keeps serving. Nothing about the failure travels back to the caller.
+      try {
+        if (!response.headersSent) {
+          response.writeHead(500, { "content-type": "application/json" });
+        }
+        response.end();
+      } catch {
+        // The response is already gone; there is nothing left to end.
+      }
+    });
   });
 
   // The same for the socket itself: a vanished peer is a connection ending, not
@@ -414,12 +505,17 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
       respond(request, response, 421, { error: "unexpected host" });
       return;
     }
+    if (!isLoopbackPeer(request.socket.remoteAddress)) {
+      // Listening on loopback is not the same as answering only loopback.
+      respond(request, response, 403, { error: "loopback only" });
+      return;
+    }
 
     const url = new URL(request.url ?? "/", `http://${address}:${port}`);
     const segments = url.pathname.split("/").filter((segment) => segment.length > 0);
 
     if (request.method === "OPTIONS") {
-      const headers = corsHeaders(request);
+      const headers = corsHeaders(request, port);
       if (Object.keys(headers).length === 0) {
         respond(request, response, 403, { error: "origin not allowed" });
         return;
@@ -456,7 +552,8 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
   }
 
   function createConnection(request: IncomingMessage, response: ServerResponse): void {
-    if (!allowOrigin(request)) {
+    const port = (server.address() as AddressInfo | null)?.port ?? 0;
+    if (!allowOrigin(request, port)) {
       respond(request, response, 403, { error: "origin not allowed" });
       return;
     }
@@ -490,6 +587,8 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
       listener: undefined,
       outbox: createFrameQueue({ maxFrames: limits.queueFrames, maxBytes: limits.queueBytes }),
       inbound: createFrameQueue({ maxFrames: limits.queueFrames, maxBytes: limits.queueBytes }),
+      closeDelivered: false,
+      closeOwed: false,
       paused: false,
       inFlightBytes: 0,
       pumping: false,
@@ -507,7 +606,8 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
   }
 
   function claimConnection(request: IncomingMessage, response: ServerResponse, id: string): void {
-    if (!allowOrigin(request)) {
+    const port = (server.address() as AddressInfo | null)?.port ?? 0;
+    if (!allowOrigin(request, port)) {
       respond(request, response, 403, { error: "origin not allowed" });
       return;
     }
@@ -522,6 +622,12 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
       respond(request, response, 409, { error: "the connection already has a stream" });
       return;
     }
+    if (establishedCount() >= limits.maxConnections) {
+      // Declared but unclaimed connections do not hold a slot; claiming one does.
+      // The check and the move happen together, so two claims cannot both pass.
+      respond(request, response, 503, { error: "at capacity" });
+      return;
+    }
 
     connection.status = "attaching";
     if (connection.ttl !== undefined) {
@@ -534,7 +640,7 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
       "cache-control": "no-store",
       connection: "keep-alive",
       "x-accel-buffering": "no",
-      ...corsHeaders(request),
+      ...corsHeaders(request, port),
     });
     connection.response = response;
     connection.status = "established";
@@ -563,7 +669,8 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
   }
 
   async function acceptFrame(request: IncomingMessage, response: ServerResponse, id: string): Promise<void> {
-    if (!allowOrigin(request)) {
+    const port = (server.address() as AddressInfo | null)?.port ?? 0;
+    if (!allowOrigin(request, port)) {
       respond(request, response, 403, { error: "origin not allowed" });
       return;
     }

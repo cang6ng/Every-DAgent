@@ -58,6 +58,14 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
   const extra = options.headers ?? {};
   const origin = options.origin.replace(/\/$/, "");
 
+  // One deadline for the whole establishment: the create, the claim, and the
+  // first byte of the stream. A connector that hangs anywhere in that sequence
+  // has not connected at all.
+  const connectAbort = new AbortController();
+  const connectDeadline = setTimeout(() => {
+    connectAbort.abort();
+  }, limits.connectTimeoutMs);
+
   const created = await fetch(`${origin}/connections`, {
     method: "POST",
     headers: { "content-type": "application/json", [TRANSPORT_HEADER]: "1", ...extra },
@@ -65,6 +73,7 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
     credentials: "omit",
     redirect: "error",
     cache: "no-store",
+    signal: connectAbort.signal,
   }).then(async (response) => {
     if (response.status !== 201) throw new Error(`the binding refused the connection: ${response.status}`);
     return createdConnectionOf(await response.json());
@@ -84,23 +93,40 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
   /** The frame a POST is carrying right now: counted until its answer arrives. */
   let inFlight: { readonly bytes: number } | undefined;
   let upstreamRunning = false;
+  /** Aborted when the connection ends, so an in-flight POST does not outlive it. */
+  const shutdown = new AbortController();
   let closed = false;
   let closeNotified = false;
+  /** Whether the one close has already been handed to a listener. */
+  let closeDelivered = false;
   let readerDone: () => void = () => undefined;
   let lastChunkAt = Date.now();
   let idleWatch: ReturnType<typeof setInterval> | undefined;
+  /** Guards the deadline of one record that has started but not finished. */
+  let recordWatch: ReturnType<typeof setTimeout> | undefined;
 
   function notifyClose(): void {
     if (closeNotified) return;
+    const listener = listenerBox.current;
+    // A connection that ended before anyone listened still owes its one close;
+    // it is handed over when a listener arrives.
+    if (listener === undefined) {
+      closeDelivered = true;
+      return;
+    }
     closeNotified = true;
     try {
-      listenerBox.current?.onClose();
+      listener.onClose();
     } catch {
       // The owner's own failure to react is not this transport's to report.
     }
   }
 
-  /** Ends the logical connection at both ends: the stream and every queued frame. */
+  /**
+   * Ends the logical connection at both ends: the stream, every queued frame and
+   * an upstream request that is still in flight. Neither direction is left
+   * running on its own.
+   */
   function endConnection(): void {
     if (closed) return;
     closed = true;
@@ -110,9 +136,27 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
     buffered.clear();
     if (idleWatch !== undefined) clearInterval(idleWatch);
     idleWatch = undefined;
+    if (recordWatch !== undefined) clearTimeout(recordWatch);
+    recordWatch = undefined;
     streamAbort.abort();
+    shutdown.abort();
     notifyClose();
     readerDone();
+  }
+
+  /** Watches one record that has started and not finished, however many chunks arrive. */
+  function watchRecord(): void {
+    if (parser.pendingLength === 0) {
+      if (recordWatch !== undefined) clearTimeout(recordWatch);
+      recordWatch = undefined;
+      return;
+    }
+    if (recordWatch !== undefined) return;
+    recordWatch = setTimeout(() => {
+      // Heartbeats are comments: they keep the connection warm without making
+      // progress on the record that is stuck, and this deadline is absolute.
+      endConnection();
+    }, limits.recordTimeoutMs);
   }
 
   /** One POST at a time, in order: the upstream is a FIFO, not a race. */
@@ -138,7 +182,7 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
           credentials: "omit",
           redirect: "error",
           cache: "no-store",
-          signal: AbortSignal.timeout(limits.postTimeoutMs),
+          signal: AbortSignal.any([AbortSignal.timeout(limits.postTimeoutMs), shutdown.signal]),
         });
         inFlight = undefined;
         if (response.status !== 204) {
@@ -161,7 +205,7 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
     credentials: "omit",
     redirect: "error",
     cache: "no-store",
-    signal: streamAbort.signal,
+    signal: AbortSignal.any([streamAbort.signal, connectAbort.signal]),
   });
   if (response.status !== 200 || response.body === null) {
     endConnection();
@@ -191,6 +235,7 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
         const chunk = await reader.read();
         if (chunk.done) break;
         lastChunkAt = Date.now();
+        if (closeDelivered) break;
         for (const record of parser.feed(decoder.decode(chunk.value, { stream: true }))) {
           if (record.length === 0) continue;
           const frame = unwrapRecord(record);
@@ -219,6 +264,7 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
             // The owner's frame handling is its own business.
           }
         }
+        watchRecord();
         if (parser.overflowed) {
           // A record that does not fit the limit means this stream's framing is
           // no longer trustworthy: the connection ends rather than resynchronize
@@ -249,6 +295,7 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
     throw error instanceof Error ? error : new Error("the stream did not start");
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
+    clearTimeout(connectDeadline);
   }
 
   // The downstream is kept alive by the binding's heartbeat, so silence past the
@@ -284,6 +331,21 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
     listen(listener: ProtocolChannelListener): () => void {
       if (listenerBox.current !== undefined) throw new Error("the channel already has a listener");
       listenerBox.current = listener;
+
+      // The connection may have ended while nobody was listening; that close is
+      // owed exactly once, and this is where it is paid.
+      if (closeDelivered && !closeNotified) {
+        closeNotified = true;
+        try {
+          listener.onClose();
+        } catch {
+          // As above: the owner's reaction is not this transport's to report.
+        }
+        return (): void => {
+          if (listenerBox.current === listener) listenerBox.current = undefined;
+        };
+      }
+
       for (;;) {
         const frame = buffered.shift();
         if (frame === undefined) break;

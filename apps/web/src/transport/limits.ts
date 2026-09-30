@@ -30,6 +30,10 @@ export interface WebLimits {
   readonly pendingTtlMs: number;
   /** How long one upstream request may take, in total. */
   readonly postTimeoutMs: number;
+  /** How long establishing a logical connection may take, in total. */
+  readonly connectTimeoutMs: number;
+  /** How long one SSE record may stay unfinished, however busy the stream looks. */
+  readonly recordTimeoutMs: number;
   /** Downstream keep-alive, and how long the client tolerates silence. */
   readonly heartbeatMs: number;
   readonly idleTimeoutMs: number;
@@ -57,6 +61,8 @@ export const DEFAULT_WEB_LIMITS: WebLimits = Object.freeze({
   createBurst: 4,
   pendingTtlMs: 5000,
   postTimeoutMs: 10000,
+  connectTimeoutMs: 10000,
+  recordTimeoutMs: 30000,
   heartbeatMs: 15000,
   idleTimeoutMs: 45000,
   drainTimeoutMs: 15000,
@@ -64,4 +70,3 @@ export const DEFAULT_WEB_LIMITS: WebLimits = Object.freeze({
   headerTimeoutMs: 5000,
   maxSockets: 64,
 });
-
