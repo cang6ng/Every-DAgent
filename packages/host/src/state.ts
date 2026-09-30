@@ -101,6 +101,8 @@ export interface ReversePendingEntry {
   /** Whether an answer's `result` satisfies the profile that made this method real. */
   readonly acceptsResult: (result: JsonValue) => boolean;
   readonly settle: (outcome: ReverseOutcome) => void;
+  /** Whether the request itself ever reached the wire; a notice is only owed for one that did. */
+  sent: boolean;
   timer: ReverseTimer | undefined;
 }
 

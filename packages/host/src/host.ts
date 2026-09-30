@@ -209,7 +209,7 @@ function attachConnection(
 
   const connection = createConnection(channel, reverseProfiles);
   state.connections.add(connection);
-  connection.detachListener = channel.listen({
+  const detach = channel.listen({
     onFrame: (frame: string): void => {
       queueMicrotask(() => {
         handleFrame(state, connection, frame);
@@ -220,14 +220,29 @@ function attachConnection(
     },
   });
 
+  // A channel that closes while being listened to has already ended this
+  // connection; the disposer it just handed back still has to be used.
+  if (connection.closed) {
+    try {
+      detach();
+    } catch {
+      // Same as everywhere else: a channel that cannot remove a listener is gone.
+    }
+  } else {
+    connection.detachListener = detach;
+  }
+
   return connection;
 }
 
+/**
+ * Detaches one connection the way the host's own close path does.
+ *
+ * There is deliberately one path, not two: `closed` says the connection is over,
+ * and the listener bookkeeping is handled where the connection actually ends.
+ */
 function detachConnection(state: HostState, connection: ConnectionState): void {
-  if (connection.closed) return;
   closeConnection(state, connection);
-  connection.detachListener?.();
-  connection.detachListener = undefined;
 }
 
 /**

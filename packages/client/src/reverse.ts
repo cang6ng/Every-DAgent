@@ -36,6 +36,14 @@ export interface ReverseHandlerRegistration {
   readonly method: string;
   /** The strict contract for this method's params; `false` is answered INVALID_REQUEST. */
   readonly accepts: (params: JsonValue) => boolean;
+  /**
+   * The strict contract for this method's result, checked before anything is
+   * sent. A handler's own idea of its answer is not evidence that the answer is
+   * the one this profile promised: a JSON-safe value that does not satisfy the
+   * profile is answered with a safe INTERNAL_ERROR instead of being passed off
+   * as a success.
+   */
+  readonly resultIsValid: (result: JsonValue) => boolean;
   readonly handle: (
     params: JsonValue,
     context: ReverseHandlerContext,
@@ -57,6 +65,11 @@ export function createReverseTable(
     }
     if (table.has(registration.method)) {
       throw new Error(`the reverse method "${registration.method}" is registered twice`);
+    }
+    if (typeof registration.accepts !== "function" || typeof registration.resultIsValid !== "function") {
+      // A profile that cannot say what its params and results look like is not a
+      // profile: without it the dispatcher would be answering on a maybe.
+      throw new Error(`the reverse method "${registration.method}" must declare its params and result contracts`);
     }
     table.set(registration.method, registration);
   }

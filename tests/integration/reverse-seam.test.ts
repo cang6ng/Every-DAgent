@@ -43,6 +43,7 @@ function clientHandlers(observed: { readonly aborted: number[]; readonly started
     {
       method: ECHO,
       accepts: (params: JsonValue): boolean => typeof fieldOf(params, "value") === "string",
+      resultIsValid: (result: JsonValue): boolean => typeof fieldOf(result, "echoed") === "string",
       handle: (params: JsonValue, context: ReverseHandlerContext): ReverseHandlerOutcome | Promise<ReverseHandlerOutcome> => {
         observed.started.push(1);
         const value = fieldOf(params, "value");

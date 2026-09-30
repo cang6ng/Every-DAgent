@@ -9,7 +9,7 @@
  * — ends the local handler with it.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { JsonValue } from "@every-dagent/protocol";
 import { decodeFrame, encodeFrame, validateMessage } from "@every-dagent/protocol";
@@ -37,6 +37,7 @@ function echoHandler(options: { readonly answer?: Answer } = {}): ReverseHandler
   return {
     method: "test.echo",
     accepts: (params: JsonValue): boolean => typeof strictObject(params)?.["value"] === "string",
+    resultIsValid: (result: JsonValue): boolean => typeof strictObject(result)?.["echoed"] === "string",
     handle: (params: JsonValue, context: ReverseHandlerContext): ReturnType<Answer> => answer(params, context),
   };
 }
@@ -349,5 +350,125 @@ describe("the registration table", () => {
 
   it("refuses a handler without a method", () => {
     expect(() => scenarioWith([{ ...echoHandler(), method: "" }])).toThrowError(/must name a method/);
+  });
+
+  it("refuses a handler that declares no contracts", () => {
+    const bare = { method: "test.bare", handle: () => ({ result: {} }) };
+    expect(() =>
+      scenarioWith([bare as unknown as ReturnType<typeof echoHandler>]),
+    ).toThrowError(/must declare its params and result contracts/);
+  });
+});
+
+describe("a handler belongs to the connection it arrived on", () => {
+  /** Releases the pending handler at `index`, once it exists. */
+  function releasing(): { readonly answers: ((value: ReverseHandlerOutcome) => void)[] } {
+    return { answers: [] };
+  }
+
+  it("cannot answer a request that arrived on a later connection", async () => {
+    const control = releasing();
+    const scenario = createScenario({
+      internals: {
+        reverseHandlers: [
+          {
+            method: "test.echo",
+            accepts: () => true,
+            resultIsValid: (result: JsonValue): boolean => typeof strictObject(result)?.["echoed"] === "string",
+            handle: () =>
+              new Promise<ReverseHandlerOutcome>((resolve) => {
+                control.answers.push(resolve);
+              }),
+          },
+        ],
+      },
+    });
+    await scenario.ready();
+
+    const first = scenario.host;
+    sendHostRequest(first, { requestId: "h-reused", method: "test.echo", params: { value: "old" } });
+    await flush();
+
+    // A new connection, and the same request id: hosts number their own
+    // requests, and a new connection starts that count again.
+    await scenario.client.reconnect();
+    const current = scenario.host;
+    sendHostRequest(current, { requestId: "h-reused", method: "test.echo", params: { value: "new" } });
+    await flush();
+
+    control.answers[0]?.({ result: { echoed: "OLD-EPOCH" } });
+    await flush();
+    expect(clientAnswers(scenario, "h-reused")).toHaveLength(0);
+
+    control.answers[1]?.({ result: { echoed: "NEW-EPOCH" } });
+    await flush();
+    const answers = clientAnswers(scenario, "h-reused");
+    expect(answers).toHaveLength(1);
+    expect(answers[0]?.["result"]).toEqual({ echoed: "NEW-EPOCH" });
+  });
+
+  it("cannot end a later connection's request when its own deadline expires", async () => {
+    vi.useFakeTimers();
+    try {
+      const signals: AbortSignal[] = [];
+      const scenario = createScenario({
+        internals: {
+          reverseHandlers: [
+            {
+              method: "test.echo",
+              accepts: () => true,
+              resultIsValid: (result: JsonValue): boolean => typeof strictObject(result)?.["echoed"] === "string",
+              handle: (_params, context) => {
+                signals.push(context.signal);
+                return new Promise<ReverseHandlerOutcome>(() => undefined);
+              },
+            },
+          ],
+        },
+      });
+      await scenario.ready();
+
+      sendHostRequest(scenario.host, {
+        requestId: "h-reused",
+        method: "test.echo",
+        params: { value: "old" },
+        timeoutMs: 50,
+      });
+      await Promise.resolve();
+
+      await scenario.client.reconnect();
+      sendHostRequest(scenario.host, {
+        requestId: "h-reused",
+        method: "test.echo",
+        params: { value: "new" },
+        timeoutMs: 500,
+      });
+      await Promise.resolve();
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      // The old deadline fired and ended its own handler; the new one is still
+      // waiting, and nothing was answered.
+      expect(signals[0]?.aborted).toBe(true);
+      expect(signals[1]?.aborted).toBe(false);
+      expect(clientAnswers(scenario, "h-reused")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refuses a result that is valid JSON but not this method's contract", async () => {
+    const scenario = scenarioWith([
+      echoHandler({ answer: () => ({ result: { echoed: 42 } }) }),
+    ]);
+    await scenario.ready();
+
+    sendHostRequest(scenario.host, { requestId: "h-1", method: "test.echo", params: { value: "hello" } });
+    await flush();
+
+    const answer = clientAnswers(scenario, "h-1")[0];
+    expect(answer?.["error"]).toMatchObject({ code: "INTERNAL_ERROR" });
+    expect(answer?.["result"]).toBeUndefined();
+    expect(scenario.client.getSnapshot().status).toBe("ready");
   });
 });

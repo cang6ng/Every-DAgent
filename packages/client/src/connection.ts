@@ -144,6 +144,10 @@ interface PendingRequest {
 interface ReversePending {
   readonly requestId: string;
   readonly streamId: string;
+  /** The connection attempt this request arrived on; an older one is inert. */
+  readonly epoch: number;
+  /** This profile's own result contract: what may travel back as a success. */
+  readonly resultIsValid: (result: JsonValue) => boolean;
   readonly controller: AbortController;
   timer: { cancel(): void } | undefined;
   finished: boolean;
@@ -900,7 +904,8 @@ export class ClientConnection {
     if (event.type === "host.request.cancelled") {
       // The host stopped waiting: the local handler must stop too, and no
       // answer may travel for this request any more.
-      this.abandonReverse(event.payload.requestId);
+      const cancelled = this.reversePendings.get(event.payload.requestId);
+      if (cancelled !== undefined) this.abandonReverse(cancelled);
     }
 
     const presentation = this.store.get().presentation;
@@ -1005,13 +1010,17 @@ export class ClientConnection {
     const pending: ReversePending = {
       requestId: request.requestId,
       streamId: request.streamId,
+      epoch: this.epoch,
+      resultIsValid: handler.resultIsValid,
       controller,
       timer: undefined,
       finished: false,
     };
     this.reversePendings.set(request.requestId, pending);
+    // The deadline belongs to this entry, not to its id: a later connection may
+    // legitimately receive the same id, and this timer must never end that one.
     pending.timer = scheduleDeadline(Date.now() + request.timeoutMs, () => {
-      this.abandonReverse(request.requestId);
+      this.abandonReverse(pending);
     });
 
     const context: ReverseHandlerContext = {
@@ -1028,35 +1037,44 @@ export class ClientConnection {
       .then(() => handler.handle(params, context))
       .then(
         (outcome) => {
-          this.finishReverse(request.requestId, outcome);
+          this.finishReverse(pending, outcome);
         },
         () => {
-          this.finishReverse(request.requestId, {
+          this.finishReverse(pending, {
             error: Object.freeze({ code: "INTERNAL_ERROR", message: "the handler failed" }),
           });
         },
       );
   }
 
-  private finishReverse(requestId: string, outcome: ReverseHandlerOutcome): void {
-    const pending = this.reversePendings.get(requestId);
-    // Gone already: a timeout, a cancellation or the end of its stream. A late
-    // answer is dropped, and never replayed.
-    if (pending === undefined) return;
+  /**
+   * Finishes one handler, if it still owns its request.
+   *
+   * The lookup is by identity, not by id: the same request id can legitimately
+   * arrive again on a later connection, and a handler from the previous one —
+   * which may have ignored its abort — must not answer it.
+   */
+  private finishReverse(pending: ReversePending, outcome: ReverseHandlerOutcome): void {
+    if (this.reversePendings.get(pending.requestId) !== pending) return;
+    if (this.epoch !== pending.epoch) return;
 
-    this.reversePendings.delete(requestId);
+    this.reversePendings.delete(pending.requestId);
     pending.finished = true;
     pending.timer?.cancel();
     pending.timer = undefined;
-    this.replyReverse(pending.streamId, requestId, expressible(outcome));
+    this.replyReverse(pending.streamId, pending.requestId, expressible(outcome, pending.resultIsValid));
   }
 
-  /** Ends one reverse request without an answer. The local signal is the only notice. */
-  private abandonReverse(requestId: string): void {
-    const pending = this.reversePendings.get(requestId);
-    if (pending === undefined) return;
+  /**
+   * Ends one reverse request without an answer.
+   *
+   * The entry is matched by identity for the same reason its completion is: an
+   * expired deadline belongs to the request that armed it.
+   */
+  private abandonReverse(pending: ReversePending): void {
+    if (this.reversePendings.get(pending.requestId) !== pending) return;
 
-    this.reversePendings.delete(requestId);
+    this.reversePendings.delete(pending.requestId);
     pending.finished = true;
     pending.timer?.cancel();
     pending.timer = undefined;
@@ -1065,7 +1083,7 @@ export class ClientConnection {
 
   private abortReverseForStream(streamId: string): void {
     for (const pending of [...this.reversePendings.values()]) {
-      if (pending.streamId === streamId) this.abandonReverse(pending.requestId);
+      if (pending.streamId === streamId) this.abandonReverse(pending);
     }
   }
 
@@ -1238,12 +1256,28 @@ export class ClientConnection {
   }
 }
 
-/** A handler's answer, reduced to something the wire can carry. */
-function expressible(outcome: ReverseHandlerOutcome): ReverseHandlerOutcome {
+/**
+ * A handler's answer, reduced to something this profile promised.
+ *
+ * Two rejections, one answer: a value the wire cannot carry at all, and a value
+ * that is perfectly good JSON but not what this method's contract says. Neither
+ * is a success, and neither is allowed to travel as one.
+ */
+function expressible(
+  outcome: ReverseHandlerOutcome,
+  resultIsValid: (result: JsonValue) => boolean,
+): ReverseHandlerOutcome {
   if ("error" in outcome) return outcome;
   const validated = validateJsonValue(outcome.result);
-  if (validated.success) return { result: validated.output };
-  return {
-    error: Object.freeze({ code: "INTERNAL_ERROR", message: "the handler produced a value the wire cannot carry" }),
-  };
+  if (!validated.success) {
+    return {
+      error: Object.freeze({ code: "INTERNAL_ERROR", message: "the handler produced a value the wire cannot carry" }),
+    };
+  }
+  if (!resultIsValid(validated.output)) {
+    return {
+      error: Object.freeze({ code: "INTERNAL_ERROR", message: "the handler produced a result this method does not define" }),
+    };
+  }
+  return { result: validated.output };
 }

@@ -166,18 +166,28 @@ export function createReverseTrigger(
         streamId: subscription.streamId,
         acceptsResult: profile.acceptsResult,
         settle,
-        timer: scheduleDeadline(Date.now() + timeoutMs, () => {
-          cancelReversePending(state, connection, requestId, "timeout");
-        }),
+        sent: false,
+        timer: undefined,
       };
+      // The entry exists before the wait does: a deadline that has already
+      // passed fires inside `scheduleDeadline`, and it has to find something
+      // terminable rather than leaving a request nobody owns.
       connection.reverse.pending.set(requestId, pending);
+      pending.timer = scheduleDeadline(Date.now() + timeoutMs, () => {
+        cancelReversePending(state, connection, pending, "timeout");
+      });
 
-      sendFrame(state, connection, encoded.output);
+      if (connection.reverse.pending.get(requestId) === pending) {
+        // Still waiting: only now is there a request to send, and a wait to
+        // protect it. An entry that expired during setup is never sent at all.
+        pending.sent = true;
+        sendFrame(state, connection, encoded.output);
+      }
 
       return {
         outcome,
         cancel: (): void => {
-          cancelReversePending(state, connection, requestId, "cancelled");
+          cancelReversePending(state, connection, pending, "cancelled");
         },
       };
     },
@@ -212,20 +222,26 @@ export function answerReversePending(
 export function cancelReversePending(
   state: HostState,
   connection: ConnectionState,
-  requestId: string,
+  pending: ReversePendingEntry,
   notification: ReverseNotification,
 ): void {
-  const pending = connection.reverse.pending.get(requestId);
-  if (pending === undefined) return;
+  // The entry is matched by identity: a deadline armed for one request must
+  // never end another that happens to share its id.
+  if (connection.reverse.pending.get(pending.requestId) !== pending) return;
 
-  connection.reverse.pending.delete(requestId);
+  connection.reverse.pending.delete(pending.requestId);
   pending.timer?.cancel();
   pending.timer = undefined;
 
   const subscription = connection.subscription;
-  if (!connection.closed && subscription !== undefined && subscription.streamId === pending.streamId) {
+  if (
+    pending.sent &&
+    !connection.closed &&
+    subscription !== undefined &&
+    subscription.streamId === pending.streamId
+  ) {
     try {
-      publishEventTo(state, connection, hostRequestCancelledEvent(requestId, notification));
+      publishEventTo(state, connection, hostRequestCancelledEvent(pending.requestId, notification));
     } catch {
       // The notice is best effort by contract: the wait ends either way, and a
       // stream that cannot carry the notice is already failing on its own.

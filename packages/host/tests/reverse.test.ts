@@ -428,3 +428,78 @@ describe("addressing", () => {
     expect(client.isClosed).toBe(false);
   });
 });
+
+describe("the deadline is armed against an entry that already exists", () => {
+  it("never sends a request whose deadline passed during setup", async () => {
+    const { attached, host } = composed();
+    const client = connect(host, { reverseRequests: true, onReverse: (_request, response) => response.ignore() });
+    await client.describe();
+    await client.call("subscriptions.open", {});
+    await flush();
+    const connection = attached[0];
+    if (connection === undefined) throw new Error("the host attached no connection");
+    const before = client.frames.length;
+
+    // The clock moves while the request is being set up, so the deadline is
+    // already in the past when the wait is armed.
+    let reads = 0;
+    const realNow = Date.now;
+    Date.now = (): number => {
+      reads += 1;
+      return realNow.call(Date) + reads * 1000;
+    };
+    try {
+      const outcome = await connection.reverse.request(ECHO_METHOD, echoParamsOf("late"), 1).outcome;
+      expect(outcome).toEqual({ ok: false, reason: "timeout" });
+    } finally {
+      Date.now = realNow;
+    }
+    await flush();
+
+    // Nothing was sent for it, and no cancellation notice was owed for a
+    // request the client never saw.
+    expect(client.frames.length).toBe(before);
+    expect(client.events.filter((event) => event.type === "host.request.cancelled")).toHaveLength(0);
+  });
+
+  it("keeps the ordinary timeout path working", async () => {
+    const { connection, client } = await subscribed("ignore");
+    const before = client.events.length;
+
+    const outcome = await connection.reverse.request(ECHO_METHOD, echoParamsOf("slow"), 30).outcome;
+    await flush();
+
+    expect(outcome).toEqual({ ok: false, reason: "timeout" });
+    expect(client.events.slice(before).filter((event) => event.type === "host.request.cancelled")).toHaveLength(1);
+    expect(client.frames.length).toBeGreaterThan(1);
+  });
+
+  it("settles a request at most once when cancel and answer race", async () => {
+    const { attached, host } = composed();
+    const answers: (() => void)[] = [];
+    const client = connect(host, {
+      reverseRequests: true,
+      onReverse: (_request, response) => {
+        answers.push(() => response.respond(echoAnswerOf("late")));
+      },
+    });
+    await client.describe();
+    await client.call("subscriptions.open", {});
+    await flush();
+    const connection = attached[0];
+    if (connection === undefined) throw new Error("the host attached no connection");
+
+    const handle = connection.reverse.request(ECHO_METHOD, echoParamsOf("hello"), 5000);
+    await flush();
+
+    // The host stops waiting, and *then* the answer arrives: one outcome, and
+    // the late answer is not allowed to settle anything a second time.
+    handle.cancel();
+    expect(await handle.outcome).toEqual({ ok: false, reason: "cancelled" });
+    answers[0]?.();
+    await flush();
+
+    expect(handle.outcome).toBeDefined();
+    expect(client.isClosed).toBe(false);
+  });
+});

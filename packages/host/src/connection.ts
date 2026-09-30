@@ -83,6 +83,24 @@ export function createConnection(
 }
 
 /**
+ * Removes the frame listener, exactly once.
+ *
+ * Whether the connection ended remotely, was detached by its owner, or never
+ * really started, the listener this host installed has to come off the channel —
+ * and `closed` is not a record of that having happened.
+ */
+export function disposeListener(connection: ConnectionState): void {
+  const detach = connection.detachListener;
+  connection.detachListener = undefined;
+  if (detach === undefined) return;
+  try {
+    detach();
+  } catch {
+    // A channel that cannot remove a listener is a channel that is already gone.
+  }
+}
+
+/**
  * Ends one logical connection.
  *
  * Idempotent, and it never touches a run: a client that goes away stops being
@@ -92,13 +110,17 @@ export function createConnection(
  * to close.
  */
 export function closeConnection(state: HostState, connection: ConnectionState): void {
-  if (connection.closed) return;
+  if (connection.closed) {
+    disposeListener(connection);
+    return;
+  }
   connection.closed = true;
   connection.subscription = undefined;
   dropAllReverse(connection, "closed");
   connection.outbox.length = 0;
   connection.outboxBytes = 0;
   state.connections.delete(connection);
+  disposeListener(connection);
 
   try {
     connection.channel.close();
