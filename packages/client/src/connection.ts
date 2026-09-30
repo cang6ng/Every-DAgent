@@ -77,6 +77,12 @@ const MAX_REVERSE_HISTORY = 4096;
  * to a stream it has already ended. Forgetting an id would mean accepting its
  * frames again; the budget is finite, and using it up ends the connection
  * honestly instead of degrading into guesswork.
+ *
+ * The ledger is a fact about one connection, not about the client: a revoked
+ * stream can still have frames in flight on the channel that carried it, so the
+ * proof has to live exactly as long as that channel does — and no longer. An
+ * ended connection releases what it remembered, and the next one starts with its
+ * own budget rather than inheriting a spent one.
  */
 const RETIRED_STREAM_BUDGET = 256;
 
@@ -114,6 +120,16 @@ function scheduleDeadline(deadline: number, fire: () => void): { cancel(): void 
   };
 }
 
+/** Runs foreign code — a disposer, a transport — that must not be able to fail this client's transition. */
+function quietly(act: () => void): void {
+  try {
+    act();
+  } catch {
+    // Deliberately swallowed: the caller's state is already consistent, and a
+    // transport that throws while being taken down has nothing left to say.
+  }
+}
+
 /** Which capability an operation needs before it may be sent at all. */
 const CAPABILITY_OF: Readonly<Record<OperationName, keyof HostCapabilities | undefined>> = Object.freeze({
   "host.describe": undefined,
@@ -134,7 +150,8 @@ interface PendingRequest {
   readonly method: OperationName;
   /** Control requests are the ones this connection cannot work without. */
   readonly control: boolean;
-  readonly complete: (envelope: ResponseEnvelope) => void;
+  /** Answers the caller from the frame path; `owner` is the generation that frame arrived on. */
+  readonly complete: (envelope: ResponseEnvelope, owner: number) => void;
   /** Ends the caller's wait without an answer. */
   readonly fail: (error: ClientError) => void;
   /** The bounded wait a control request is given; business requests have none. */
@@ -328,13 +345,12 @@ export class ClientConnection {
    * Re-opens the subscription on the current connection.
    *
    * A gap in the stream and a caller asking for a refresh are the same operation,
-   * and only one of them may be in flight: the subscription is re-cut, the
-   * snapshot replaces the presentation whole, and the stream restarts at one.
+   * and only one of them may be in flight: the transaction that drops the old
+   * stream is the same one that publishes the new cut, the snapshot replaces the
+   * presentation whole, and the stream restarts at one.
    */
   async resync(): Promise<void> {
     if (this.channel === undefined || this.identity === undefined) throw connectionLost("disconnected");
-    const stream = this.stream;
-    if (stream !== undefined) this.revokeStream(stream.streamId);
     await this.openStream();
   }
 
@@ -354,9 +370,17 @@ export class ClientConnection {
     }
     if (this.openToken !== undefined) throw clientMisuse("sync-in-flight");
 
+    const owner = this.epoch;
     const streamId = stream.streamId;
-    this.revokeStream(streamId);
-    this.store.update({ status: "connected", stale: this.store.get().presentation !== null });
+    this.revokeStream(owner, streamId);
+
+    // The stream is gone before the host is even told: the presentation it
+    // explained is retained and stale, and the client is `ready` for nothing.
+    // The two facts are published together, because a status that outlives the
+    // stream it describes is exactly the lie this client exists to avoid.
+    if (this.owns(owner)) {
+      this.store.update({ status: "connected", stale: this.store.get().presentation !== null });
+    }
 
     await new Promise<void>((resolve, reject) => {
       this.send<"subscriptions.close">("subscriptions.close", { streamId }, {
@@ -409,9 +433,22 @@ export class ClientConnection {
     return promise;
   }
 
+  /**
+   * Whether a generation may still act on this client.
+   *
+   * Every continuation — a connector promise, a frame, a timer, a rejected wait,
+   * a cleanup after a notification — carries the epoch it belongs to, and this is
+   * the one check that lets it write state, publish a status or end a connection.
+   * A generation that is no longer current owns nothing: not the channel, not the
+   * stream, not the right to say what happened on this client.
+   */
+  private owns(owner: number): boolean {
+    return this.epoch === owner;
+  }
+
   /** Whether an attempt still owns this client: the only thing that may act on it. */
   private isActive(attempt: Attempt): boolean {
-    return !attempt.aborted && this.attempt === attempt && this.epoch === attempt.epoch;
+    return !attempt.aborted && this.attempt === attempt && this.owns(attempt.epoch);
   }
 
   private async runAttempt(attempt: Attempt): Promise<void> {
@@ -427,24 +464,32 @@ export class ClientConnection {
 
     if (!this.isActive(attempt)) {
       // A newer attempt owns the client now; this channel is nobody's.
-      try {
+      quietly(() => {
         channel.close();
-      } catch {
-        // Best effort: an attempt that lost its place has nothing left to do.
-      }
+      });
       throw connectionLost("disconnected");
     }
 
     this.channel = channel;
     const epoch = attempt.epoch;
-    this.detach = channel.listen({
+    const detach = channel.listen({
       onFrame: (frame: string): void => {
-        if (this.epoch === epoch) this.acceptFrame(frame);
+        if (this.owns(epoch)) this.acceptFrame(frame, epoch);
       },
       onClose: (): void => {
-        if (this.epoch === epoch) this.endWithLoss("channel-closed");
+        if (this.owns(epoch)) this.endWithLoss(epoch, "channel-closed");
       },
     });
+
+    if (!this.isActive(attempt)) {
+      // Installing the listener is itself a chance to hear that this generation
+      // is already over — a channel that closes before `listen` returns, say.
+      // The disposer is this generation's to run, and nothing else ever will.
+      quietly(detach);
+      throw connectionLost("disconnected");
+    }
+
+    this.detach = detach;
     this.store.update({ status: "connected" });
 
     try {
@@ -470,19 +515,22 @@ export class ClientConnection {
    * `describe`, then `open`, then `ready`.
    *
    * Every step re-checks that this attempt still owns the client: a disconnect,
-   * a failure or a reconnect during `await` must not be resumed into a send.
+   * a failure or a reconnect during `await` — or inside the notification that
+   * announced the channel — must not be resumed into a send or a status.
    */
   private async bootstrap(attempt: Attempt): Promise<void> {
+    if (!this.isActive(attempt)) throw connectionLost("disconnected");
+
     // `describe` is already part of synchronizing: the channel is up, but
     // nothing about this client's replica is valid yet.
     this.store.update({ status: "syncing", error: null });
-    await this.sendDescribe();
+    await this.sendDescribe(attempt.epoch);
     if (!this.isActive(attempt)) throw connectionLost("disconnected");
     await this.openStream();
     if (!this.isActive(attempt)) throw connectionLost("disconnected");
   }
 
-  private sendDescribe(): Promise<HostDescription> {
+  private sendDescribe(owner: number): Promise<HostDescription> {
     const client = this.options.client ?? DEFAULT_CLIENT;
     const capabilities: ClientCapabilities = Object.freeze({ reverseRequests: true });
 
@@ -499,15 +547,13 @@ export class ClientConnection {
             // The schema cannot say that the identity in the body is the identity
             // of *this* connection, nor that the host echoed what was declared.
             if (description.hostInstanceId !== envelope.hostInstanceId) {
-              const error = protocolViolation("invalid-description", "unknown");
-              reject(error);
-              this.protocolFailure("invalid-description");
+              this.protocolFailure(owner, "invalid-description");
+              reject(protocolViolation("invalid-description", "unknown"));
               return;
             }
             if (description.clientCapabilities.reverseRequests !== capabilities.reverseRequests) {
-              const error = protocolViolation("invalid-description", "unknown");
-              reject(error);
-              this.protocolFailure("invalid-description");
+              this.protocolFailure(owner, "invalid-description");
+              reject(protocolViolation("invalid-description", "unknown"));
               return;
             }
             if (!description.capabilities.subscriptions) {
@@ -543,19 +589,21 @@ export class ClientConnection {
   }
 
   /**
-   * One open at a time: a gap, a caller's resync and a retry share the same
-   * transaction.
+   * One open at a time, and one transaction per open.
    *
-   * The token is taken *before* anything observable — before the status is
-   * published and before the request is sent — so a listener that reacts to
-   * `syncing`, or to the `ready` that ends this open, starts a new cut rather
-   * than joining one that has already finished.
+   * The token is taken *before* anything observable — before the old stream is
+   * dropped, before the status is published, before the request is sent — so the
+   * cut, the transition that describes it and the ownership of the transaction
+   * are established in one synchronous step. A listener that reacts to `syncing`,
+   * or one that re-cuts because the presentation it was reading just went stale,
+   * finds this transaction in flight and joins it instead of starting a second.
    */
   private openStream(): Promise<void> {
     const running = this.sync;
     if (running !== undefined) return running;
 
-    const token: OpenToken = { attempt: this.epoch, token: Symbol("open") };
+    const owner = this.epoch;
+    const token: OpenToken = { attempt: owner, token: Symbol("open") };
     this.openToken = token;
 
     let resolve!: () => void;
@@ -575,10 +623,10 @@ export class ClientConnection {
       }
       reject(error);
       // A resync that failed leaves the client online but unsynchronized, and it
-      // says so rather than staying "syncing" forever. During bootstrap the
-      // attempt owns this outcome, and a protocol fault has already published
-      // its own verdict.
-      if (this.attempt === undefined && this.store.get().status === "syncing") {
+      // says so rather than staying "syncing" forever. Only the generation that
+      // cut the stream may say it: a failure arriving after a disconnect or a
+      // reconnect describes a connection that is already gone.
+      if (this.owns(owner) && this.attempt === undefined && this.store.get().status === "syncing") {
         this.store.update({
           status: this.channel === undefined ? "lost" : "connected",
           stale: this.store.get().presentation !== null,
@@ -587,7 +635,21 @@ export class ClientConnection {
       }
     };
 
-    this.store.update({ status: "syncing", error: null });
+    // The stream this open replaces ends here, in the same synchronous step as
+    // the transition that publishes it: losing the stream and marking what it
+    // explained stale are one fact, and a reader never sees "ready" with nothing
+    // left to be ready about.
+    const stream = this.stream;
+    if (stream !== undefined) this.revokeStream(owner, stream.streamId);
+    if (!this.owns(owner)) {
+      // Dropping that stream spent the connection's identity budget, which ends
+      // the connection: there is nothing left to open, and nothing this
+      // transaction may publish.
+      finish(connectionLost("disconnected"));
+      return promise;
+    }
+
+    this.store.update({ status: "syncing", stale: this.store.get().presentation !== null, error: null });
 
     this.send<"subscriptions.open">(
       "subscriptions.open",
@@ -601,15 +663,18 @@ export class ClientConnection {
             snapshot.hostInstanceId !== identity.hostInstanceId ||
             snapshot.hostInstanceId !== envelope.hostInstanceId
           ) {
+            // The connection ends before its caller is told: an open that
+            // answered wrongly is a protocol failure, not a subscription this
+            // client can stay online without.
+            this.protocolFailure(owner, "invalid-response");
             finish(protocolViolation("invalid-response", "unknown"));
-            this.protocolFailure("invalid-response");
             return;
           }
           if (this.retiredStreams.has(snapshot.watermark.streamId)) {
             // Streams are never reused; one that comes back is a stream whose
             // frames this client has already applied and discarded.
+            this.protocolFailure(owner, "snapshot-fence");
             finish(protocolViolation("snapshot-fence", "unknown"));
-            this.protocolFailure("snapshot-fence");
             return;
           }
 
@@ -651,6 +716,7 @@ export class ClientConnection {
     params: OperationMap[M]["params"],
     handlers: SendHandlers<M>,
   ): void {
+    const owner = this.epoch;
     const channel = this.channel;
     if (channel === undefined) {
       handlers.decline(connectionLost("disconnected"));
@@ -713,11 +779,14 @@ export class ClientConnection {
     // sent — never the caller's object, which they may edit the moment this
     // returns (and which the wire never saw).
     const sentParams = validated.output.params;
-    const complete = (envelope: ResponseEnvelope): void => {
+    const complete = (envelope: ResponseEnvelope, frameOwner: number): void => {
       const response = validateMessage({ kind: "host-response", method }, envelope);
       if (!response.success) {
+        // The connection ends first — every other wait on it is settled with the
+        // violation, and nothing is published about a connection that is already
+        // over — and only then is this caller told.
+        this.protocolFailure(frameOwner, "invalid-response");
         handlers.decline(protocolViolation("invalid-response", "unknown"));
-        this.protocolFailure("invalid-response");
         return;
       }
       if (response.output.error !== undefined) {
@@ -726,8 +795,8 @@ export class ClientConnection {
       }
       const mismatch = verifyResultIdentity(method, sentParams, response.output.result);
       if (mismatch !== undefined) {
+        this.protocolFailure(frameOwner, mismatch);
         handlers.decline(protocolViolation(mismatch, "unknown"));
-        this.protocolFailure(mismatch);
         return;
       }
       handlers.accept(response.output.result, envelope);
@@ -746,7 +815,7 @@ export class ClientConnection {
       // legitimately take a long time.
       pending.timer = scheduleDeadline(Date.now() + CONTROL_DEADLINE_MS, () => {
         if (this.pendings.get(requestId) !== pending) return;
-        this.endWithLoss("control-timeout");
+        this.endWithLoss(owner, "control-timeout");
       });
     }
 
@@ -757,7 +826,7 @@ export class ClientConnection {
       // knowable from here, so the connection ends and the outcome is `unknown`.
       const rejected = this.takePending(requestId);
       rejected?.fail(connectionLost("send-failed"));
-      this.endWithLoss("send-failed");
+      this.endWithLoss(owner, "send-failed");
     }
   }
 
@@ -781,29 +850,31 @@ export class ClientConnection {
   // The frame path.
   // -------------------------------------------------------------------------
 
-  private acceptFrame(frame: string): void {
+  private acceptFrame(frame: string, owner: number): void {
+    if (!this.owns(owner)) return;
+
     const decoded = decodeFrame(frame);
     if (!decoded.success) {
       // Nothing that cannot be read as a protocol message has any place on a
       // logical connection.
-      this.protocolFailure("invalid-frame");
+      this.protocolFailure(owner, "invalid-frame");
       return;
     }
 
     const envelope = decoded.output;
     switch (envelope.kind) {
       case "host-response":
-        this.acceptResponse(envelope);
+        this.acceptResponse(envelope, owner);
         return;
       case "host-event":
-        this.acceptEvent(envelope);
+        this.acceptEvent(envelope, owner);
         return;
       case "host-request":
-        this.acceptHostRequest(envelope);
+        this.acceptHostRequest(envelope, owner);
         return;
       case "client-request":
       case "client-response":
-        this.protocolFailure("wrong-direction");
+        this.protocolFailure(owner, "wrong-direction");
         return;
     }
   }
@@ -816,10 +887,11 @@ export class ClientConnection {
    * before the request id is even looked at. Only then does the id decide
    * whether this is an answer, a duplicate, or something never asked for.
    */
-  private acceptResponse(envelope: ResponseEnvelope): void {
+  private acceptResponse(envelope: ResponseEnvelope, owner: number): void {
     if (envelope.protocolVersion !== PROTOCOL_VERSION) {
-      this.takePending(envelope.requestId)?.fail(protocolViolation("unsupported-protocol", "unknown"));
-      this.protocolFailure("unsupported-protocol");
+      // The connection ends first: the request this was answering is settled
+      // with the violation rather than with a made-up outcome.
+      this.protocolFailure(owner, "unsupported-protocol");
       return;
     }
 
@@ -829,18 +901,17 @@ export class ClientConnection {
       // cannot be checked yet — but nothing else on this connection has been
       // asked at all.
       if (!this.pendings.has(envelope.requestId)) {
-        this.protocolFailure("invalid-response");
+        this.protocolFailure(owner, "invalid-response");
         return;
       }
     } else if (envelope.hostInstanceId !== identity.hostInstanceId) {
-      this.takePending(envelope.requestId)?.fail(protocolViolation("host-instance-mismatch", "unknown"));
-      this.protocolFailure("host-instance-mismatch");
+      this.protocolFailure(owner, "host-instance-mismatch");
       return;
     }
 
     const pending = this.takePending(envelope.requestId);
     if (pending === undefined) return; // A duplicate or an unknown id: read, checked, dropped.
-    pending.complete(envelope);
+    pending.complete(envelope, owner);
   }
 
   /**
@@ -860,27 +931,27 @@ export class ClientConnection {
     return this.everOpened ? "discard" : "fault";
   }
 
-  private acceptEvent(envelope: EventEnvelope): void {
+  private acceptEvent(envelope: EventEnvelope, owner: number): void {
     const identity = this.identity;
     if (identity === undefined) {
       // The snapshot is what explains a stream, and no stream has been explained
       // on this connection yet.
-      this.protocolFailure("snapshot-fence");
+      this.protocolFailure(owner, "snapshot-fence");
       return;
     }
     if (envelope.protocolVersion !== PROTOCOL_VERSION) {
-      this.protocolFailure("unsupported-protocol");
+      this.protocolFailure(owner, "unsupported-protocol");
       return;
     }
     if (envelope.hostInstanceId !== identity.hostInstanceId) {
-      this.protocolFailure("host-instance-mismatch");
+      this.protocolFailure(owner, "host-instance-mismatch");
       return;
     }
 
     const stream = this.stream;
     if (stream === undefined || envelope.streamId !== stream.streamId) {
       if (this.classifyNonCurrentStream(envelope.streamId) === "fault") {
-        this.protocolFailure("snapshot-fence");
+        this.protocolFailure(owner, "snapshot-fence");
       }
       return;
     }
@@ -889,14 +960,13 @@ export class ClientConnection {
       // A gap cannot be repaired from here, and guessing the missing events is
       // exactly what the contract forbids: the stream is revoked and re-cut —
       // and the event that revealed the gap is never applied.
-      this.revokeStream(stream.streamId);
       void this.openStream().catch(() => undefined);
       return;
     }
 
     const validated = validateMessage({ kind: "host-event" }, envelope);
     if (!validated.success) {
-      this.protocolFailure(validated.failure.reason === "UNKNOWN_EVENT" ? "unknown-event" : "invalid-event");
+      this.protocolFailure(owner, validated.failure.reason === "UNKNOWN_EVENT" ? "unknown-event" : "invalid-event");
       return;
     }
     const event = validated.output;
@@ -910,7 +980,7 @@ export class ClientConnection {
 
     const presentation = this.store.get().presentation;
     if (presentation === null) {
-      this.protocolFailure("snapshot-fence");
+      this.protocolFailure(owner, "snapshot-fence");
       return;
     }
     const watermark: Watermark = Object.freeze({
@@ -919,7 +989,7 @@ export class ClientConnection {
     });
     const folded = foldEvent(presentation, event, watermark);
     if (!folded.ok) {
-      this.protocolFailure(folded.reason);
+      this.protocolFailure(owner, folded.reason);
       return;
     }
 
@@ -933,18 +1003,18 @@ export class ClientConnection {
   // The reverse dispatcher.
   // -------------------------------------------------------------------------
 
-  private acceptHostRequest(envelope: RequestEnvelope): void {
+  private acceptHostRequest(envelope: RequestEnvelope, owner: number): void {
     const identity = this.identity;
     if (identity === undefined) {
-      this.protocolFailure("snapshot-fence");
+      this.protocolFailure(owner, "snapshot-fence");
       return;
     }
     if (envelope.protocolVersion !== PROTOCOL_VERSION) {
-      this.protocolFailure("unsupported-protocol");
+      this.protocolFailure(owner, "unsupported-protocol");
       return;
     }
     if (envelope.hostInstanceId !== identity.hostInstanceId) {
-      this.protocolFailure("host-instance-mismatch");
+      this.protocolFailure(owner, "host-instance-mismatch");
       return;
     }
 
@@ -953,13 +1023,13 @@ export class ClientConnection {
       // A request on a stream this client ended is dropped unanswered; one on a
       // stream that was never explained is the same fence an event would be.
       if (this.classifyNonCurrentStream(envelope.streamId) === "fault") {
-        this.protocolFailure("snapshot-fence");
+        this.protocolFailure(owner, "snapshot-fence");
       }
       return;
     }
     if (identity.description.capabilities.reverseRequests !== true) {
       // The host may only ask when both sides declared the capability.
-      this.protocolFailure("capability-violation");
+      this.protocolFailure(owner, "capability-violation");
       return;
     }
 
@@ -967,19 +1037,19 @@ export class ClientConnection {
     if (!validated.success) {
       // Readable enough to know it is a reverse request, but not enough to know
       // which stream it meant: there is no honest answer to send.
-      this.protocolFailure("invalid-frame");
+      this.protocolFailure(owner, "invalid-frame");
       return;
     }
     const request = validated.output;
 
     if (this.reverseRequestIds.has(request.requestId)) {
-      this.protocolFailure("duplicate-request-id");
+      this.protocolFailure(owner, "duplicate-request-id");
       return;
     }
     if (this.reverseRequestIds.size >= MAX_REVERSE_HISTORY) {
       // Uniqueness can no longer be proved on this connection, and pretending
       // otherwise would be worse than ending it.
-      this.protocolFailure("duplicate-request-id");
+      this.protocolFailure(owner, "duplicate-request-id");
       return;
     }
     this.reverseRequestIds.add(request.requestId);
@@ -988,19 +1058,19 @@ export class ClientConnection {
     if (handler === undefined) {
       // Unknown is refused immediately and explicitly — never ignored, and never
       // treated as an approval of anything.
-      this.replyReverse(request.streamId, request.requestId, {
+      this.replyReverse(owner, request.streamId, request.requestId, {
         error: Object.freeze({ code: "METHOD_NOT_FOUND", message: "this client has no handler for that method" }),
       });
       return;
     }
     if (!handler.accepts(request.params)) {
-      this.replyReverse(request.streamId, request.requestId, {
+      this.replyReverse(owner, request.streamId, request.requestId, {
         error: Object.freeze({ code: "INVALID_REQUEST", message: "the payload did not match the method's contract" }),
       });
       return;
     }
     if (this.reversePendings.size >= MAX_REVERSE_PENDING) {
-      this.replyReverse(request.streamId, request.requestId, {
+      this.replyReverse(owner, request.streamId, request.requestId, {
         error: Object.freeze({ code: "INTERNAL_ERROR", message: "this client is at capacity for reverse requests" }),
       });
       return;
@@ -1062,7 +1132,7 @@ export class ClientConnection {
     pending.finished = true;
     pending.timer?.cancel();
     pending.timer = undefined;
-    this.replyReverse(pending.streamId, pending.requestId, expressible(outcome, pending.resultIsValid));
+    this.replyReverse(pending.epoch, pending.streamId, pending.requestId, expressible(outcome, pending.resultIsValid));
   }
 
   /**
@@ -1087,7 +1157,9 @@ export class ClientConnection {
     }
   }
 
-  private replyReverse(streamId: string, requestId: string, outcome: ReverseHandlerOutcome): void {
+  /** Answers one reverse request on the stream it arrived on, if that stream's generation still holds the channel. */
+  private replyReverse(owner: number, streamId: string, requestId: string, outcome: ReverseHandlerOutcome): void {
+    if (!this.owns(owner)) return;
     const channel = this.channel;
     const identity = this.identity;
     if (channel === undefined || identity === undefined) return;
@@ -1119,7 +1191,7 @@ export class ClientConnection {
     try {
       channel.send(encoded.output);
     } catch {
-      this.endWithLoss("send-failed");
+      this.endWithLoss(owner, "send-failed");
     }
   }
 
@@ -1138,14 +1210,13 @@ export class ClientConnection {
   }
 
   /** The channel is gone, and nothing that was in flight will ever be answered. */
-  private endWithLoss(reason: ConnectionLostReason): void {
-    if (this.channel === undefined && this.attempt === undefined) return;
-    this.failAttempt(this.epoch, connectionLost(reason), "lost");
+  private endWithLoss(owner: number, reason: ConnectionLostReason): void {
+    this.failAttempt(owner, connectionLost(reason), "lost");
   }
 
   /** The peer broke the contract. The connection cannot be used for anything else. */
-  private protocolFailure(reason: ProtocolViolationReason): void {
-    this.failAttempt(this.epoch, protocolViolation(reason, "unknown"), "protocol-error");
+  private protocolFailure(owner: number, reason: ProtocolViolationReason): void {
+    this.failAttempt(owner, protocolViolation(reason, "unknown"), "protocol-error");
   }
 
   /**
@@ -1177,9 +1248,14 @@ export class ClientConnection {
     const channel = this.channel;
     this.channel = undefined;
     this.identity = undefined;
-    const stream = this.stream;
     this.stream = undefined;
-    if (stream !== undefined) this.rememberRetired(stream.streamId);
+    // The ledger of ended streams is a fact about *this* generation: a stream it
+    // revoked can still have frames in flight on its channel, so the proof has
+    // to live as long as the generation does — and no longer. Below, the
+    // listener is detached and the channel closed, and every frame of this
+    // generation is inert at the listener itself; the next generation therefore
+    // starts with its own budget instead of inheriting a spent one.
+    this.retiredStreams.clear();
     this.openToken = undefined;
     this.everOpened = false;
 
@@ -1205,38 +1281,28 @@ export class ClientConnection {
       pending.timer = undefined;
       pending.controller.abort();
     }
-    if (detach !== undefined) {
-      try {
-        detach();
-      } catch {
-        // The listener is gone from this client's point of view either way.
-      }
-    }
-    if (channel !== undefined) {
-      try {
-        channel.close();
-      } catch {
-        // Best effort: closing a connection that is already failing has no
-        // reader left to report it to.
-      }
-    }
+    if (detach !== undefined) quietly(detach);
+    if (channel !== undefined) quietly(() => {
+      channel.close();
+    });
   }
 
   /**
    * Drops the current stream, in one local transition.
    *
-   * Losing the stream and marking the presentation stale are the same fact, and
-   * they are published together: a reader never sees "no stream, but still
-   * current" — which would be exactly the lie this client exists to avoid.
+   * Nothing is published here. Dropping the stream is only half of a fact whose
+   * other half is the status that follows it — `syncing` for a re-cut,
+   * `connected` for a close — and the caller that drops it owns both, in one
+   * synchronous step. Publishing the two separately would show a reader a status
+   * that outlived the stream it describes.
    */
-  private revokeStream(streamId: string): void {
+  private revokeStream(owner: number, streamId: string): void {
     const stream = this.stream;
     if (stream === undefined || stream.streamId !== streamId) return;
 
     this.stream = undefined;
-    this.rememberRetired(streamId);
+    this.rememberRetired(owner, streamId);
     this.abortReverseForStream(streamId);
-    this.store.update({ stale: this.store.get().presentation !== null });
   }
 
   /**
@@ -1246,10 +1312,10 @@ export class ClientConnection {
    * like a new one, and its frames would be applied to a presentation that has
    * moved on.
    */
-  private rememberRetired(streamId: string): void {
+  private rememberRetired(owner: number, streamId: string): void {
     if (this.retiredStreams.has(streamId)) return;
     if (this.retiredStreams.size >= RETIRED_STREAM_BUDGET) {
-      this.protocolFailure("stream-identity-budget");
+      this.protocolFailure(owner, "stream-identity-budget");
       return;
     }
     this.retiredStreams.add(streamId);
