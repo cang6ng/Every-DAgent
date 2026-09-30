@@ -79,7 +79,10 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
   const streamAbort = new AbortController();
   const listenerBox: { current: ProtocolChannelListener | undefined } = { current: undefined };
   const buffered = createFrameQueue({ maxFrames: limits.queueFrames, maxBytes: limits.queueBytes });
-  const upstream: string[] = [];
+  const upstream: { readonly frame: string; readonly bytes: number }[] = [];
+  let upstreamBytes = 0;
+  /** The frame a POST is carrying right now: counted until its answer arrives. */
+  let inFlight: { readonly bytes: number } | undefined;
   let upstreamRunning = false;
   let closed = false;
   let closeNotified = false;
@@ -102,6 +105,8 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
     if (closed) return;
     closed = true;
     upstream.length = 0;
+    upstreamBytes = 0;
+    inFlight = undefined;
     buffered.clear();
     if (idleWatch !== undefined) clearInterval(idleWatch);
     idleWatch = undefined;
@@ -116,8 +121,10 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
     upstreamRunning = true;
 
     while (!closed && upstream.length > 0) {
-      const frame = upstream.shift();
-      if (frame === undefined) break;
+      const entry = upstream.shift();
+      if (entry === undefined) break;
+      upstreamBytes -= entry.bytes;
+      inFlight = entry;
       try {
         const response = await fetch(`${origin}/connections/${connection.connectionId}/frames`, {
           method: "POST",
@@ -127,12 +134,13 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
             [TRANSPORT_HEADER]: "1",
             ...extra,
           },
-          body: wrapFrame(frame),
+          body: wrapFrame(entry.frame),
           credentials: "omit",
           redirect: "error",
           cache: "no-store",
           signal: AbortSignal.timeout(limits.postTimeoutMs),
         });
+        inFlight = undefined;
         if (response.status !== 204) {
           endConnection();
           break;
@@ -144,7 +152,7 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
         break;
       }
     }
-
+    inFlight = undefined;
     upstreamRunning = false;
   }
 
@@ -191,8 +199,15 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
             endConnection();
             return;
           }
+          const frameBytes = utf8Length(frame);
+          if (frameBytes > limits.frameBytes) {
+            // The same limit the binding applies on its way out, applied on the
+            // way in: a frame past it is a connection that cannot be trusted.
+            endConnection();
+            return;
+          }
           if (listenerBox.current === undefined) {
-            if (!buffered.push(frame, utf8Length(frame))) {
+            if (!buffered.push(frame, frameBytes)) {
               endConnection();
               return;
             }
@@ -203,6 +218,13 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
           } catch {
             // The owner's frame handling is its own business.
           }
+        }
+        if (parser.overflowed) {
+          // A record that does not fit the limit means this stream's framing is
+          // no longer trustworthy: the connection ends rather than resynchronize
+          // on a boundary that was never really a boundary.
+          endConnection();
+          return;
         }
         established.resolve();
       }
@@ -239,11 +261,23 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
     send(frame: string): void {
       if (typeof frame !== "string") throw new Error("frames must be strings");
       if (closed) throw new Error("the connection is closed");
-      if (upstream.length >= limits.queueFrames) {
+
+      const bytes = utf8Length(frame);
+      if (bytes > limits.frameBytes) {
+        // A frame the binding would refuse is refused here, where the caller can
+        // still tell the difference between "not sent" and "lost".
+        endConnection();
+        throw new Error("a frame does not fit the binding's limit");
+      }
+
+      const held = upstreamBytes + (inFlight?.bytes ?? 0);
+      if (upstream.length >= limits.queueFrames || held + bytes > limits.queueBytes) {
         endConnection();
         throw new Error("the upstream queue is full");
       }
-      upstream.push(frame);
+
+      upstream.push({ frame, bytes });
+      upstreamBytes += bytes;
       void runUpstream();
     },
 

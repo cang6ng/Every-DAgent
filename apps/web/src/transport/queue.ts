@@ -21,22 +21,31 @@ export interface FrameQueue {
   readonly bytes: number;
 }
 
+interface QueuedFrame {
+  readonly frame: string;
+  /** What this frame was charged when it was accepted; released exactly as charged. */
+  readonly bytes: number;
+}
+
 export function createFrameQueue(limits: FrameQueueLimits): FrameQueue {
-  const frames: string[] = [];
+  const frames: QueuedFrame[] = [];
   let bytes = 0;
 
   return {
     push(frame: string, length: number): boolean {
       if (frames.length >= limits.maxFrames || bytes + length > limits.maxBytes) return false;
-      frames.push(frame);
+      frames.push({ frame, bytes: length });
       bytes += length;
       return true;
     },
 
     shift(): string | undefined {
-      const frame = frames.shift();
-      if (frame !== undefined) bytes -= frame.length;
-      return frame;
+      const entry = frames.shift();
+      if (entry === undefined) return undefined;
+      // The same number that was charged, not a re-measure of the string: a
+      // byte budget that is entered in one unit and left in another leaks.
+      bytes -= entry.bytes;
+      return entry.frame;
     },
 
     clear(): void {

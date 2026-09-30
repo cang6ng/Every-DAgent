@@ -13,7 +13,7 @@
 
 const encoder = new TextEncoder();
 
-/** The UTF-8 byte length of a string, without allocating a Buffer. */
+/** The UTF-8 byte length of a string, which is what every transport budget counts. */
 export function utf8Length(value: string): number {
   return encoder.encode(value).length;
 }
@@ -44,9 +44,19 @@ export function encodeSseComment(text: string): string {
   return `: ${text}\n\n`;
 }
 
+/**
+ * The framing a record may add around its payload — `data: ` and the line ends.
+ *
+ * An unterminated record is measured against the limit with this allowance, so a
+ * record split across chunks is judged exactly as the same record arriving whole.
+ */
+const RECORD_ALLOWANCE_BYTES = 16;
+
 export interface SseParser {
   /** Feeds one decoded chunk and returns every complete record it produced. */
   feed(chunk: string): readonly string[];
+  /** True once a record exceeded the limit: this stream cannot be trusted further. */
+  readonly overflowed: boolean;
   /** Drops whatever was incomplete: a record that never finished is never delivered. */
   reset(): void;
   readonly pendingLength: number;
@@ -56,20 +66,39 @@ export interface SseParser {
  * An incremental SSE reader.
  *
  * It handles the parts a real stream makes unavoidable: records split across
- * chunks, `\r\n` as well as `\n`, comment lines, and several `data:` lines in
- * one record. An oversized or unfinished record is dropped rather than guessed
- * at, and the caller decides that the connection is over.
+ * chunks, `\r\n` as well as `\n`, comment lines, and several `data:` lines in one
+ * record.
+ *
+ * The limit is enforced on the record's payload, measured as it arrives, so the
+ * verdict does not depend on where the chunk boundaries fell. Exceeding it is
+ * fatal and sticky: the rest of that record is never reinterpreted as a new one,
+ * and the caller is expected to end the connection rather than continue with a
+ * stream whose framing it can no longer trust.
  */
 export function createSseParser(limitBytes: number): SseParser {
   let buffer = "";
   let data: string[] = [];
+  let overflowed = false;
+
+  const abandon = (): readonly string[] => {
+    overflowed = true;
+    data = [];
+    buffer = "";
+    return [];
+  };
 
   return {
+    get overflowed(): boolean {
+      return overflowed;
+    },
+
     get pendingLength(): number {
       return buffer.length;
     },
 
     feed(chunk: string): readonly string[] {
+      if (overflowed) return [];
+
       buffer += chunk;
       const records: string[] = [];
 
@@ -83,9 +112,8 @@ export function createSseParser(limitBytes: number): SseParser {
           // The blank line ends a record; a record with no data is a comment.
           if (data.length > 0) {
             const record = data.join("\n");
-            // A record past the limit is dropped, never truncated and never
-            // delivered: half a frame would be worse than none.
-            if (utf8Length(record) <= limitBytes) records.push(record);
+            if (utf8Length(record) > limitBytes) return abandon();
+            records.push(record);
           }
           data = [];
           continue;
@@ -94,17 +122,14 @@ export function createSseParser(limitBytes: number): SseParser {
         if (line.startsWith("data:")) {
           const value = line.slice(5);
           data.push(value.startsWith(" ") ? value.slice(1) : value);
+          if (utf8Length(data.join("\n")) > limitBytes) return abandon();
           continue;
         }
         // Any other field is ignored by contract; `id`/`retry` mean nothing here
         // because this binding never resumes a stream.
       }
 
-      if (utf8Length(buffer) > limitBytes || utf8Length(data.join("\n")) > limitBytes) {
-        buffer = "";
-        data = [];
-      }
-
+      if (utf8Length(buffer) > limitBytes + RECORD_ALLOWANCE_BYTES) return abandon();
       return records;
     },
 

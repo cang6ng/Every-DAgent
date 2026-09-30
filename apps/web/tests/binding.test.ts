@@ -15,6 +15,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { ProtocolChannel } from "@every-dagent/protocol";
 
+import { wrapFrame } from "../src/index.js";
+
 import { createCredentials, openRawPeer, startBinding, waitUntil } from "./helpers/raw-peer.js";
 
 const TRANSPORT_HEADER = "x-every-dagent-transport";
@@ -295,6 +297,106 @@ describe("carrying frames", () => {
     });
 
     expect(answer.status).toBe(409);
+  });
+
+  it("decodes an upstream body whose bytes are split mid-character", async () => {
+    const { origin, channels } = await bindingWithHost();
+    const peer = await openRawPeer(origin);
+    const channel = channels[0];
+    const received: string[] = [];
+    channel?.listen({
+      onFrame: (frame: string): void => {
+        received.push(frame);
+      },
+      onClose: (): void => undefined,
+    });
+
+    // The body is sent byte by byte, so every multi-byte character is split
+    // across chunk boundaries; one decoder has to put it back together.
+    const frame = 'a phrase in Chinese: 中文字符 and an emoji: 🚀';
+    const body = wrapFrame(frame);
+    const bytes = new TextEncoder().encode(body);
+    const port = Number(new URL(origin).port);
+    const status = await new Promise<number>((resolve, reject) => {
+      const outgoing = request(
+        {
+          host: "127.0.0.1",
+          port,
+          method: "POST",
+          path: `/connections/${peer.connectionId}/frames`,
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${peer.token}`,
+            "x-every-dagent-transport": "1",
+          },
+        },
+        (response) => {
+          response.resume();
+          resolve(response.statusCode ?? 0);
+        },
+      );
+      outgoing.on("error", reject);
+      for (const byte of bytes) outgoing.write(Buffer.from([byte]));
+      outgoing.end();
+    });
+
+    expect(status).toBe(204);
+    await waitUntil(() => received.length === 1, "the frame to arrive");
+    expect(received[0]).toBe(frame);
+    peer.close();
+  });
+
+  it("refuses a body that is not valid UTF-8", async () => {
+    const { origin } = await bindingWithHost();
+    const peer = await openRawPeer(origin);
+
+    const status = await new Promise<number>((resolve, reject) => {
+      const outgoing = request(
+        {
+          host: "127.0.0.1",
+          port: Number(new URL(origin).port),
+          method: "POST",
+          path: `/connections/${peer.connectionId}/frames`,
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${peer.token}`,
+            "x-every-dagent-transport": "1",
+          },
+        },
+        (response) => {
+          response.resume();
+          resolve(response.statusCode ?? 0);
+        },
+      );
+      outgoing.on("error", reject);
+      // A lone continuation byte cannot begin a character.
+      outgoing.end(Buffer.from([0x22, 0x80, 0x22]));
+    });
+
+    expect(status).toBe(400);
+    await waitUntil(() => peer.ended, "the connection to end");
+  });
+
+  it("refuses a downstream frame that does not fit the binding's limit", async () => {
+    const { binding, channels } = await startBinding({ limits: { frameBytes: 32 } });
+    open.push(binding);
+    const peer = await openRawPeer(binding.origin);
+    await waitUntil(() => channels.length === 1, "the channel");
+    const channel = channels[0];
+    let closed = 0;
+    channel?.listen({
+      onFrame: (): void => undefined,
+      onClose: (): void => {
+        closed += 1;
+      },
+    });
+
+    expect(() => {
+      channel?.send("x".repeat(33));
+    }).toThrow(/does not fit/);
+
+    await waitUntil(() => closed === 1, "the connection to be told");
+    peer.close();
   });
 
   it("carries the awkward frames exactly", async () => {

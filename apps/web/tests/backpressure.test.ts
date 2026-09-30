@@ -125,6 +125,51 @@ describe("queue bounds", () => {
     await waitUntil(() => frames >= 0, "the queue to settle");
   });
 
+  it("ends a stalled connection even while heartbeats are scheduled", async () => {
+    const { binding, channels } = await startBinding({
+      limits: { queueFrames: 2, queueBytes: 300_000, drainTimeoutMs: 150, heartbeatMs: 20 },
+    });
+    open.push(binding);
+
+    // A reader that never reads, so the socket stops accepting.
+    const credentials = await createCredentials(binding.origin);
+    const claim = request(
+      {
+        host: "127.0.0.1",
+        port: Number(new URL(binding.origin).port),
+        path: `/connections/${credentials.connectionId}/events`,
+        headers: { authorization: `Bearer ${credentials.token}` },
+      },
+      (response) => {
+        response.pause();
+      },
+    );
+    claim.on("error", () => undefined);
+    claim.end();
+    await waitUntil(() => channels.length === 1, "the channel to be attached");
+
+    const channel = channels[0];
+    let closed = 0;
+    channel?.listen({
+      onFrame: (): void => undefined,
+      onClose: (): void => {
+        closed += 1;
+      },
+    });
+
+    const chunk = "x".repeat(64 * 1024);
+    await expect(
+      (async () => {
+        for (let index = 0; index < 64; index += 1) channel?.send(chunk);
+      })(),
+    ).rejects.toThrow();
+
+    // The heartbeat keeps its own schedule, and it does not keep a connection
+    // that cannot drain alive.
+    await waitUntil(() => closed === 1, "the connection to be closed");
+    claim.destroy();
+  });
+
   it("refuses new connections at capacity", async () => {
     const { binding } = await startBinding({ limits: { maxPending: 1, maxConnections: 1 } });
     open.push(binding);

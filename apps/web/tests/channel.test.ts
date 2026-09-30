@@ -11,7 +11,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { ProtocolChannel } from "@every-dagent/protocol";
-import { connectHttpChannel } from "../src/index.js";
+import { connectHttpChannel, wrapFrame } from "../src/index.js";
 
 import { startBinding, waitUntil } from "./helpers/raw-peer.js";
 
@@ -143,6 +143,49 @@ describe("carrying frames", () => {
 
     expect(atClient.frames).toEqual(["early-one", "early-two"]);
     channel.close();
+  });
+
+  it("refuses to send a frame past the frame limit, and ends the connection", async () => {
+    const { binding } = await startBinding({ limits: { frameBytes: 16 } });
+    open.push(binding);
+    const channel = await connectHttpChannel({ origin: binding.origin, limits: { frameBytes: 16 } });
+    channel.listen({ onFrame: (): void => undefined, onClose: (): void => undefined });
+
+    expect(() => {
+      channel.send("x".repeat(17));
+    }).toThrow(/does not fit/);
+  });
+
+  it("ends the connection when a frame arrives past the frame limit", async () => {
+    // The binding is happy to carry this frame; the client is not willing to
+    // accept one this large, and says so by ending the connection.
+    const { binding, channels } = await startBinding({ limits: { frameBytes: 4096 } });
+    open.push(binding);
+    const channel = await connectHttpChannel({ origin: binding.origin, limits: { frameBytes: 16 } });
+    await waitUntil(() => channels.length === 1, "the binding's channel");
+    const atClient = collector();
+    channel.listen(atClient.listener);
+
+    // The binding's own limit is looser here, so this frame really does arrive.
+    channels[0]?.send("y".repeat(64));
+
+    await waitUntil(() => atClient.closed.length === 1, "the client to end the connection");
+    expect(atClient.frames).toEqual([]);
+  });
+
+  it("refuses to send when its byte budget is spent, not only when its frame count is", async () => {
+    const { binding } = await startBinding({ limits: { queueBytes: 200, queueFrames: 64 } });
+    open.push(binding);
+    const channel = await connectHttpChannel({
+      origin: binding.origin,
+      limits: { queueBytes: 200, queueFrames: 64, frameBytes: 4096 },
+    });
+    channel.listen({ onFrame: (): void => undefined, onClose: (): void => undefined });
+
+    const chunk = "z".repeat(100);
+    expect(() => {
+      for (let index = 0; index < 8; index += 1) channel.send(chunk);
+    }).toThrow();
   });
 
   it("refuses a second listener", async () => {

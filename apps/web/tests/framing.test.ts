@@ -84,17 +84,63 @@ describe("the SSE reader", () => {
     expect(parser.feed('id: 7\nretry: 100\ndata: "one"\ndata: "two"\n\n')).toEqual(['"one"\n"two"']);
   });
 
-  it("never delivers an unfinished record, and drops an oversized one", () => {
+  it("never delivers an unfinished record", () => {
     const parser = createSseParser(64);
 
     expect(parser.feed('data: "half')).toEqual([]);
     expect(parser.feed(" of a record")).toEqual([]);
     expect(parser.feed('"\n\n')).toEqual(['"half of a record"']);
     expect(parser.pendingLength).toBe(0);
+    expect(parser.overflowed).toBe(false);
+  });
 
-    const oversized = createSseParser(64);
-    expect(oversized.feed(`data: ${"x".repeat(200)}\n\n`)).toEqual([]);
-    expect(oversized.pendingLength).toBe(0);
+  it("accepts a record exactly at the limit and refuses the next byte", () => {
+    const payload = "x".repeat(64);
+    const atLimit = createSseParser(64);
+    expect(atLimit.feed(`data: ${payload}\n\n`)).toEqual([payload]);
+    expect(atLimit.overflowed).toBe(false);
+
+    const overLimit = createSseParser(64);
+    expect(overLimit.feed(`data: ${"x".repeat(65)}\n\n`)).toEqual([]);
+    expect(overLimit.overflowed).toBe(true);
+  });
+
+  it("judges a record the same way however it was split", () => {
+    const payload = "x".repeat(64);
+    const record = `data: ${payload}\n\n`;
+
+    for (let cut = 1; cut < record.length; cut += 1) {
+      const parser = createSseParser(64);
+      const records = [...parser.feed(record.slice(0, cut)), ...parser.feed(record.slice(cut))];
+      expect(records, `split at ${cut}`).toEqual([payload]);
+      expect(parser.overflowed, `split at ${cut}`).toBe(false);
+    }
+
+    const tooLong = `data: ${"x".repeat(65)}\n\n`;
+    for (let cut = 1; cut < tooLong.length; cut += 1) {
+      const parser = createSseParser(64);
+      const records = [...parser.feed(tooLong.slice(0, cut)), ...parser.feed(tooLong.slice(cut))];
+      expect(records, `split at ${cut}`).toEqual([]);
+      expect(parser.overflowed, `split at ${cut}`).toBe(true);
+    }
+  });
+
+  it("counts a record's payload across several data lines", () => {
+    const parser = createSseParser(10);
+    // Twenty bytes of payload, spread over lines, with the separators counted.
+    expect(parser.feed('data: "1234"\ndata: "5678"\n\n')).toEqual([]);
+    expect(parser.overflowed).toBe(true);
+  });
+
+  it("does not reinterpret the rest of an oversized record as a new one", () => {
+    const parser = createSseParser(16);
+    parser.feed(`data: ${"x".repeat(64)}\n`);
+
+    expect(parser.overflowed).toBe(true);
+    expect(parser.pendingLength).toBe(0);
+    // Whatever arrives afterwards belongs to the record that already failed.
+    expect(parser.feed('data: "small"\n\n')).toEqual([]);
+    expect(parser.overflowed).toBe(true);
   });
 
   it("writes the ready marker as a comment", () => {

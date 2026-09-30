@@ -63,6 +63,8 @@ interface LogicalConnection {
   readonly outbox: FrameQueue;
   readonly inbound: FrameQueue;
   paused: boolean;
+  /** Bytes of a record the socket accepted but has not flushed yet. */
+  inFlightBytes: number;
   pumping: boolean;
   heartbeat: ReturnType<typeof setInterval> | undefined;
   ttl: ReturnType<typeof setTimeout> | undefined;
@@ -149,11 +151,45 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
   }
 
   /**
-   * Hands queued frames to the downstream, one at a time, respecting the
-   * socket's own backpressure: a `write` that returns false has *accepted* the
-   * record, so it is never written twice — the pump simply waits for `drain`,
-   * and gives up on a reader that never drains.
+   * Writes one record, and owns the backpressure that follows.
+   *
+   * Every downstream write goes through here — data, the ready marker, the
+   * heartbeat — so a socket that stops accepting pauses all of them, not just
+   * the busiest one. A `write` that returns false has *accepted* the record, so
+   * it is never written twice: the pump waits for `drain`, and gives up on a
+   * reader that never drains.
    */
+  function writeRecord(connection: LogicalConnection, record: string, bytes: number): void {
+    const response = connection.response;
+    if (response === undefined || connection.status !== "established") return;
+    if (connection.paused) return;
+
+    let accepted: boolean;
+    try {
+      accepted = response.write(record);
+    } catch {
+      closeConnection(connection, "the downstream write failed");
+      return;
+    }
+    if (accepted) return;
+
+    // The record is already accepted by the socket, and it stays on the books
+    // until the socket drains: the budget covers what is queued *and* in flight.
+    connection.paused = true;
+    connection.inFlightBytes += bytes;
+    connection.drain = setTimeout(() => {
+      closeConnection(connection, "the downstream never drained");
+    }, limits.drainTimeoutMs);
+    response.once("drain", () => {
+      if (connection.drain !== undefined) clearTimeout(connection.drain);
+      connection.drain = undefined;
+      connection.paused = false;
+      connection.inFlightBytes -= bytes;
+      pump(connection);
+    });
+  }
+
+  /** Hands queued frames to the downstream, one at a time, through the one write path. */
   function pump(connection: LogicalConnection): void {
     if (connection.pumping) return;
     connection.pumping = true;
@@ -161,29 +197,13 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
     while (!connection.paused && connection.status === "established") {
       const frame = connection.outbox.shift();
       if (frame === undefined) break;
-      const response = connection.response;
-      if (response === undefined) break;
-
-      let accepted: boolean;
-      try {
-        accepted = response.write(encodeSseRecord(frame));
-      } catch {
-        closeConnection(connection, "the downstream write failed");
+      const record = encodeSseRecord(frame);
+      const bytes = utf8Length(record);
+      if (bytes > limits.recordBytes) {
+        closeConnection(connection, "a record does not fit the binding's limit");
         break;
       }
-
-      if (!accepted) {
-        connection.paused = true;
-        connection.drain = setTimeout(() => {
-          closeConnection(connection, "the downstream never drained");
-        }, limits.drainTimeoutMs);
-        response.once("drain", () => {
-          if (connection.drain !== undefined) clearTimeout(connection.drain);
-          connection.drain = undefined;
-          connection.paused = false;
-          pump(connection);
-        });
-      }
+      writeRecord(connection, record, bytes);
     }
 
     connection.pumping = false;
@@ -192,8 +212,13 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
   function sendFrame(connection: LogicalConnection, frame: string): void {
     if (connection.status !== "established") throw new Error("the connection is not carrying frames");
     const bytes = utf8Length(frame);
-    // In flight counts too: the record being written is already accepted, and it
-    // must fit the same budget as everything waiting behind it.
+    if (bytes > limits.frameBytes) {
+      // A frame the binding cannot carry is a connection it cannot serve, and
+      // saying so here is the only honest answer: truncating it would change
+      // what the protocol sees.
+      closeConnection(connection, "a frame does not fit the binding's limit");
+      throw new Error("a frame does not fit the binding's limit");
+    }
     if (!connection.outbox.push(frame, bytes)) {
       closeConnection(connection, "the downstream queue is full");
       throw new Error("the downstream queue is full");
@@ -298,6 +323,7 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
   type BodyRead =
     | { readonly kind: "body"; readonly body: string }
     | { readonly kind: "oversized" }
+    | { readonly kind: "malformed" }
     | { readonly kind: "failed" };
 
   /**
@@ -310,6 +336,11 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
   async function readBody(request: IncomingMessage, limit: number): Promise<BodyRead> {
     return await new Promise<BodyRead>((resolve) => {
       const chunks: string[] = [];
+      // One decoder across the whole body: a frame's bytes may be split anywhere,
+      // and decoding each chunk on its own would corrupt any multi-byte
+      // character that straddles a boundary. Invalid UTF-8 is refused rather
+      // than replaced with something the sender never wrote.
+      const decoder = new TextDecoder("utf-8", { fatal: true });
       let bytes = 0;
       let settled = false;
       const finish = (outcome: BodyRead): void => {
@@ -335,9 +366,22 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
           finish({ kind: "oversized" });
           return;
         }
-        chunks.push(chunk.toString("utf8"));
+        try {
+          chunks.push(decoder.decode(chunk, { stream: true }));
+        } catch {
+          finish({ kind: "malformed" });
+        }
       });
-      request.on("end", () => finish({ kind: "body", body: chunks.join("") }));
+      request.on("end", () => {
+        if (settled) return;
+        try {
+          chunks.push(decoder.decode());
+        } catch {
+          finish({ kind: "malformed" });
+          return;
+        }
+        finish({ kind: "body", body: chunks.join("") });
+      });
       request.on("error", () => finish({ kind: "failed" }));
     });
   }
@@ -447,6 +491,7 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
       outbox: createFrameQueue({ maxFrames: limits.queueFrames, maxBytes: limits.queueBytes }),
       inbound: createFrameQueue({ maxFrames: limits.queueFrames, maxBytes: limits.queueBytes }),
       paused: false,
+      inFlightBytes: 0,
       pumping: false,
       heartbeat: undefined,
       ttl: undefined,
@@ -491,21 +536,22 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
       "x-accel-buffering": "no",
       ...corsHeaders(request),
     });
-    // The marker the client waits for: the stream exists before anything is sent.
-    response.write(encodeSseComment("ready"));
     connection.response = response;
     connection.status = "established";
+    // The marker the client waits for: the stream exists before anything is
+    // sent — and it obeys the same backpressure as everything else.
+    const ready = encodeSseComment("ready");
+    writeRecord(connection, ready, utf8Length(ready));
     response.on("close", () => {
       closeConnection(connection, "the downstream ended");
     });
 
     connection.heartbeat = setInterval(() => {
-      if (connection.paused || connection.status !== "established") return;
-      try {
-        response.write(encodeSseComment("ping"));
-      } catch {
-        closeConnection(connection, "the heartbeat failed");
-      }
+      if (connection.status !== "established") return;
+      // A heartbeat that skipped the write path would be a second, unbounded way
+      // to write to a socket that has already stopped accepting.
+      const ping = encodeSseComment("ping");
+      writeRecord(connection, ping, utf8Length(ping));
     }, limits.heartbeatMs);
 
     try {
@@ -532,6 +578,11 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
     }
 
     const read = await readBody(request, limits.recordBytes);
+    if (read.kind === "malformed") {
+      respond(request, response, 400, { error: "the body is not valid UTF-8" });
+      closeConnection(connection, "a body that is not valid UTF-8");
+      return;
+    }
     if (read.kind !== "body") {
       respond(request, response, 413, { error: "the frame is too large" });
       closeConnection(connection, "an oversized or unfinished request");
