@@ -17,9 +17,10 @@
  *    late completion travels nowhere.
  */
 
-import type { JsonValue, ProtocolChannel } from "@every-dagent/protocol";
+import type { CanonicalItem, JsonValue, ProtocolChannel } from "@every-dagent/protocol";
 import { connectHttpChannel, startHttpBinding, type HttpBinding } from "@every-dagent/web";
 import { createClient, type Client } from "@every-dagent/client";
+import type { Plugin } from "@every-dagent/plugin-system";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { ReverseHandlerContext, ReverseHandlerOutcome } from "../../packages/client/src/reverse.js";
@@ -27,7 +28,13 @@ import { createClientWith } from "../../packages/client/src/client.js";
 import type { ReverseProfile } from "../../packages/host/src/reverse.js";
 
 import { createHostPlatform, waitFor, type HostPlatform } from "../helpers/platform.js";
-import { partialThenGatedReply, scriptedModel, textReply, type ModelReply } from "../helpers/demo-fixtures.js";
+import {
+  demoPlugin,
+  partialThenGatedReply,
+  scriptedModel,
+  textReply,
+  type ModelReply,
+} from "../helpers/demo-fixtures.js";
 
 const ECHO = "test.echo";
 
@@ -52,12 +59,13 @@ afterEach(async () => {
 async function platformFor(
   carrier: "memory" | "web",
   replies: readonly ModelReply[] = [textReply("unused")],
+  plugins: readonly Plugin[] = [],
 ): Promise<{ readonly platform: HostPlatform; readonly model: ReturnType<typeof scriptedModel> }> {
   const model = scriptedModel(replies);
   let binding: HttpBinding | undefined;
   const platform = createHostPlatform({
     modelClient: model.client,
-    plugins: [],
+    plugins,
     reverseProfiles: PROFILES,
     ...(carrier === "web" ? { source: (): Promise<ProtocolChannel> => connectHttpChannel({ origin: binding?.origin ?? "" }) } : {}),
   });
@@ -291,6 +299,91 @@ for (const carrier of ["memory", "web"] as const) {
       }
     });
 
+    it("adopts the canonical state a run reached while the client was offline", async () => {
+      const tool = demoPlugin("demo", "demo.tool");
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const fixture = await platformFor(
+        carrier,
+        [
+          async function* () {
+            yield { type: "text-delta", text: "seen-live" } as const;
+            await gate;
+            yield { type: "tool-call", call: { callId: "call-1", name: "demo.tool", input: { value: 1 } } } as const;
+            yield { type: "done" } as const;
+          },
+          textReply("the answer after the tool"),
+          textReply("after the resync"),
+        ],
+        [tool.plugin],
+      );
+      const client = createClient({ connect: (): Promise<ProtocolChannel> => fixture.platform.connect() });
+      const observer = createClient({ connect: (): Promise<ProtocolChannel> => fixture.platform.connect() });
+      const run = (which: Client) => which.getSnapshot().presentation?.runs[0];
+      const session = (which: Client) => which.getSnapshot().presentation?.sessions[0];
+      const canonical = (which: Client): readonly CanonicalItem[] => session(which)?.canonical ?? [];
+      const liveText = (which: Client): string =>
+        (run(which)?.live ?? []).map((item) => (item.kind === "text" ? item.text : "")).join("");
+
+      try {
+        await client.connect();
+        await observer.connect();
+        // The tool the run will call: registered on the host, enabled by a client.
+        await client.plugins.enable({ pluginId: "demo" });
+        const created = (await client.sessions.create()).session;
+        await client.runs.start({ sessionId: created.sessionId, submissionId: "offline-terminal", text: "go" });
+        await waitFor(() => liveText(client) === "seen-live");
+
+        // The client goes away with a live prefix on screen. The run then reaches
+        // its terminal state — the tool call, its result and the answer — while
+        // the client is not there to see any of it.
+        const streamBefore = client.getSnapshot().presentation?.watermark.streamId;
+        client.disconnect();
+        release();
+        await waitFor(() => run(observer)?.status === "completed");
+        expect(canonical(observer).map((item) => item.kind)).toEqual([
+          "user",
+          "assistant",
+          "tool-call",
+          "tool-result",
+          "assistant",
+        ]);
+        expect(tool.executions).toHaveLength(1);
+        // None of it reached the client: it is still holding the prefix it had.
+        expect(liveText(client)).toBe("seen-live");
+        expect(run(client)?.status).toBe("running");
+
+        // The snapshot, not a replay, is what puts it back in step — including
+        // the state that only ever existed while it was away.
+        await client.reconnect();
+        expect(run(client)?.status).toBe("completed");
+        // No live draft beside the canonical history, and no stale prefix kept.
+        expect(run(client)?.live).toBeNull();
+        expect(canonical(client)).toEqual(canonical(observer));
+        expect(canonical(client)).toContainEqual(
+          expect.objectContaining({ kind: "tool-result", name: "demo.tool", content: "tool answered" }),
+        );
+        // The session is free, and the snapshot named a new stream — from which
+        // the events of the next run arrive as they happen.
+        expect(session(client)?.activeRunId).toBeNull();
+        expect(client.getSnapshot().presentation?.watermark.streamId).not.toBe(streamBefore);
+        expect(client.getSnapshot().presentation?.watermark.sequence).toBe(0);
+        await client.runs.start({ sessionId: created.sessionId, submissionId: "after", text: "again" });
+        await waitFor(() =>
+          canonical(client).some((item) => item.kind === "assistant" && item.text === "after the resync"),
+        );
+        // Two runs: the first took two steps (the tool call and the answer that
+        // followed it), the second one. Nothing ran twice.
+        expect(fixture.model.requests).toHaveLength(3);
+      } finally {
+        release();
+        client.disconnect();
+        observer.disconnect();
+      }
+    });
+
     it("settles a reverse request only with its own answer, once", async () => {
       const fixture = await platformFor(carrier);
       const pending: { resolve: (outcome: ReverseHandlerOutcome) => void; context: ReverseHandlerContext }[] = [];
@@ -389,6 +482,117 @@ for (const carrier of ["memory", "web"] as const) {
       } finally {
         client.disconnect();
         other.disconnect();
+      }
+    });
+
+    it("keeps an old handler's completion away from the request that replaced it", async () => {
+      const fixture = await platformFor(carrier);
+      const started: { resolve: (outcome: ReverseHandlerOutcome) => void; context: ReverseHandlerContext }[] = [];
+      const sent: string[] = [];
+      const received: string[] = [];
+      let wire: ProtocolChannel | undefined;
+
+      const client = createClientWith(
+        {
+          connect: async (): Promise<ProtocolChannel> => {
+            wire = await fixture.platform.connect();
+            return tap(wire, sent, received);
+          },
+        },
+        {
+          reverseHandlers: [
+            {
+              method: ECHO,
+              accepts: (params: JsonValue) => exact(params, "value"),
+              resultIsValid: (result: JsonValue) => exact(result, "echoed"),
+              handle: (_params, context) =>
+                new Promise<ReverseHandlerOutcome>((resolve) => {
+                  started.push({ resolve, context });
+                }),
+            },
+          ],
+        },
+      );
+
+      const kindOf = (frame: string): string | undefined => (JSON.parse(frame) as { kind?: string }).kind;
+      const answers = (): number => sent.filter((frame) => kindOf(frame) === "client-response").length;
+      const requestStreams = (): string[] =>
+        received
+          .filter((frame) => kindOf(frame) === "host-request")
+          .map((frame) => (JSON.parse(frame) as { streamId: string }).streamId);
+      const settle = async (): Promise<void> => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 20);
+        });
+      };
+
+      /**
+       * One switch: a request already running, the connection or the stream under
+       * it replaced, a new request that is genuinely open on what replaced it,
+       * and then the old handler's completion.
+       */
+      const round = async (switchIt: () => Promise<void>, reason: string, label: string): Promise<void> => {
+        const host = fixture.platform.attached.at(-1);
+        if (host === undefined) throw new Error("the host has no attached connection");
+        const before = started.length;
+
+        const previous = host.reverse.request(ECHO, { value: `${label}-old` }, 5000);
+        await waitFor(() => started.length === before + 1);
+
+        // The switch happens while that request is genuinely still open.
+        await switchIt();
+        expect(await previous.outcome).toEqual({ ok: false, reason });
+
+        // A new request on what is current now, with a handler that really starts.
+        const current = fixture.platform.attached.at(-1);
+        if (current === undefined) throw new Error("the host has no current connection");
+        const next = current.reverse.request(ECHO, { value: `${label}-new` }, 5000);
+        let nextSettled = 0;
+        void next.outcome.then(() => {
+          nextSettled += 1;
+        });
+        await waitFor(() => started.length === before + 2);
+        expect(nextSettled).toBe(0);
+        const streams = requestStreams();
+        expect(streams.at(-1)).not.toBe(streams.at(-2));
+        expect(started[before]?.context.signal.aborted).toBe(true);
+        expect(started[before + 1]?.context.signal.aborted).toBe(false);
+
+        // The handler that was already running finishes now. Its request is over,
+        // and the one open now is not its to answer.
+        const answersBefore = answers();
+        started[before]?.resolve({ result: { echoed: `${label}-old` } });
+        await settle();
+        expect(answers()).toBe(answersBefore);
+        expect(nextSettled).toBe(0);
+        expect(started[before + 1]?.context.signal.aborted).toBe(false);
+
+        // Only its own completion answers it — once.
+        started[before + 1]?.resolve({ result: { echoed: `${label}-new` } });
+        expect(await next.outcome).toEqual({ ok: true, result: { echoed: `${label}-new` } });
+        await waitFor(() => answers() === answersBefore + 1);
+        expect(nextSettled).toBe(1);
+
+        // The same answer again is not a second settlement.
+        const response = sent.filter((frame) => kindOf(frame) === "client-response").at(-1);
+        if (response === undefined || wire === undefined) throw new Error("the client sent no response");
+        wire.send(response);
+        await client.sessions.list();
+        expect(nextSettled).toBe(1);
+        expect(answers()).toBe(answersBefore + 1);
+      };
+
+      try {
+        await client.connect();
+        // The stream under the connection, and then the connection itself.
+        await round(async () => {
+          await client.resync();
+        }, "stream-gone", "stream");
+        await round(async () => {
+          await client.reconnect();
+        }, "closed", "connection");
+      } finally {
+        client.disconnect();
       }
     });
 
