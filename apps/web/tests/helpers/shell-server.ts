@@ -1,0 +1,231 @@
+/**
+ * The acceptance host: a real host, the real shell server, the real page.
+ *
+ * Nothing in the acceptance path is mocked at the application level. The host
+ * is `createHost` with two real plugins and the offline model; the shell server
+ * is the product composition; the page is the built artifact the command line
+ * would serve. The only seam this helper adds is the channel ward: how a
+ * binding channel reaches the host is composition, and the acceptance uses
+ * that seam exactly the way a deployment would use it for tracing — to drop
+ * one answer, or to end a connection, and then watch what the shell does about
+ * it.
+ */
+
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { createHost, type Host } from "@every-dagent/host";
+import { createCalculatorPlugin } from "@every-dagent/plugin-calculator";
+import type { Plugin, PluginContext } from "@every-dagent/plugin-system";
+import type { ProtocolChannel } from "@every-dagent/protocol";
+
+import { buildApp } from "../../scripts/build.mjs";
+import { startShellServer, type ShellServer } from "../../src/server/shell-server.js";
+import { offlineModel, type OfflineModel } from "./offline-model.js";
+import { textStatsPlugin, type TextStatsPluginFixture } from "../../../../tests/fixtures/text-stats-plugin.js";
+
+export interface ShellControls {
+  /** The next `runs.start` answer dies with its connection instead of arriving. */
+  dropNextStartResponse(): void;
+  /** How many times a response was dropped this way. */
+  readonly drops: number;
+  /** Ends every open connection without touching the host or its runs. */
+  closeConnections(): void;
+  /** Open logical connections, as the binding sees them. */
+  connections(): number;
+}
+
+/**
+ * A plugin that cannot activate, carrying a fake secret in its failure.
+ *
+ * Its cleanup fails too, which is what puts the manager into the `error` state
+ * rather than back to `disabled` — the only state in which a plugin genuinely
+ * cannot be operated on. The acceptance uses it to check two things at once:
+ * that a failed activation becomes a safe, enumerable summary in the page —
+ * and that the raw failure text, which here contains something that must never
+ * be shown, does not travel with it.
+ */
+export function failingPlugin(): Plugin {
+  return {
+    manifest: {
+      id: "always-broken",
+      name: "Always Broken",
+      version: "0.0.1",
+      description: "A plugin whose activation always fails.",
+    },
+    activate(context: PluginContext): void {
+      context.onDispose((): void => {
+        throw new Error("cleanup failed as well: the other half is hunter2-cleanup-secret");
+      });
+      throw new Error("activation failed: the vault code is hunter2-should-not-leak");
+    },
+  };
+}
+
+export interface ShellAcceptance {
+  readonly host: Host;
+  readonly shell: ShellServer;
+  readonly model: OfflineModel;
+  readonly textStats: TextStatsPluginFixture;
+  readonly controls: ShellControls;
+  readonly pageUrl: string;
+  readonly bindingOrigin: string;
+  /** Ends the servers and then the host: the host is truly gone afterwards. */
+  close(): Promise<void>;
+}
+
+export interface ShellAcceptanceOptions {
+  /** Fixed ports, for a test that restarts the whole application in place. */
+  readonly pagePort?: number;
+  readonly bindingPort?: number;
+}
+
+const buildDirectory = mkdtempSync(join(tmpdir(), "every-dagent-shell-build-"));
+process.once("exit", () => {
+  try {
+    rmSync(buildDirectory, { recursive: true, force: true });
+  } catch {
+    // A temp directory the OS will reclaim; the test result does not depend on it.
+  }
+});
+
+let building: Promise<string> | undefined;
+
+/** The built artifact, once per process. */
+export async function ensureShellBuild(): Promise<string> {
+  if (building === undefined) {
+    building = buildApp({ outDir: join(buildDirectory, "dist") }).then((result) => result.outDir);
+  }
+  return await building;
+}
+
+function safeParse(frame: string): { readonly kind?: unknown; readonly method?: unknown; readonly requestId?: unknown } | null {
+  try {
+    const value = JSON.parse(frame) as unknown;
+    return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+interface Ward {
+  readonly wrap: (channel: ProtocolChannel) => ProtocolChannel;
+  readonly controls: ShellControls;
+}
+
+function createWard(): Ward {
+  const connections = new Set<ProtocolChannel>();
+  let armed = false;
+  let drops = 0;
+
+  return {
+    wrap: (channel: ProtocolChannel): ProtocolChannel => {
+      connections.add(channel);
+      /** The request ids this connection carries that belong to `runs.start`. */
+      const startRequests = new Set<string>();
+      return {
+        send(frame: string): void {
+          if (armed) {
+            const parsed = safeParse(frame);
+            if (
+              parsed !== null &&
+              parsed.kind === "host-response" &&
+              typeof parsed.requestId === "string" &&
+              startRequests.has(parsed.requestId)
+            ) {
+              // The answer is lost with the connection that carried it: the
+              // client can no longer learn whether the host accepted the run.
+              armed = false;
+              drops += 1;
+              connections.delete(channel);
+              channel.close();
+              return;
+            }
+          }
+          channel.send(frame);
+        },
+        listen(listener): () => void {
+          return channel.listen({
+            onFrame(frame: string): void {
+              const parsed = safeParse(frame);
+              if (
+                parsed !== null &&
+                parsed.kind === "client-request" &&
+                parsed.method === "runs.start" &&
+                typeof parsed.requestId === "string"
+              ) {
+                startRequests.add(parsed.requestId);
+              }
+              listener.onFrame(frame);
+            },
+            onClose(): void {
+              listener.onClose();
+            },
+          });
+        },
+        close(): void {
+          connections.delete(channel);
+          channel.close();
+        },
+      };
+    },
+    controls: {
+      dropNextStartResponse(): void {
+        armed = true;
+      },
+      get drops(): number {
+        return drops;
+      },
+      closeConnections(): void {
+        for (const channel of [...connections]) {
+          connections.delete(channel);
+          channel.close();
+        }
+      },
+      connections(): number {
+        return connections.size;
+      },
+    },
+  };
+}
+
+export async function startShellAcceptance(options: ShellAcceptanceOptions = {}): Promise<ShellAcceptance> {
+  const outDir = await ensureShellBuild();
+  const model = offlineModel();
+  const textStats = textStatsPlugin();
+  const ward = createWard();
+
+  const host = createHost({
+    modelClient: model.client,
+    plugins: [createCalculatorPlugin(), textStats.plugin, failingPlugin()],
+  });
+  const shell = await startShellServer({
+    host,
+    staticRoot: join(outDir, "public"),
+    wrapChannel: ward.wrap,
+    ...(options.pagePort === undefined ? {} : { port: options.pagePort }),
+    ...(options.bindingPort === undefined ? {} : { bindingPort: options.bindingPort }),
+  });
+
+  return {
+    host,
+    shell,
+    model,
+    textStats,
+    controls: ward.controls,
+    pageUrl: shell.pageUrl,
+    bindingOrigin: shell.bindingOrigin,
+    async close(): Promise<void> {
+      await shell.close();
+      try {
+        await host.shutdown();
+      } catch {
+        // The fixture's `always-broken` plugin cannot be released once it is in
+        // the error state, and the host says so instead of pretending — that
+        // honesty is asserted where it matters (in the host's own tests); here
+        // it must not turn a passing acceptance into a teardown failure.
+      }
+    },
+  };
+}
