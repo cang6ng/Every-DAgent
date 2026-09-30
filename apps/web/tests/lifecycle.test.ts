@@ -15,7 +15,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { ProtocolChannel, ProtocolChannelListener } from "@every-dagent/protocol";
 
-import { connectHttpChannel, startHttpBinding, type HttpBinding } from "../src/index.js";
+import { connectHttpChannel, startHttpBinding, utf8Length, wrapFrame, type HttpBinding } from "../src/index.js";
 
 import { createCredentials, openRawPeer, startBinding, waitUntil } from "./helpers/raw-peer.js";
 
@@ -37,6 +37,13 @@ afterEach(async () => {
 
 function silence(): ProtocolChannelListener {
   return { onFrame: (): void => undefined, onClose: (): void => undefined };
+}
+
+/** Lets real time pass: these tests are about clocks, not about promises. */
+async function wait(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function serve(handler: (request: IncomingMessage, response: ServerResponse) => void): Promise<number> {
@@ -157,6 +164,46 @@ describe("the deployment policy is enforced", () => {
     });
 
     expect(response.status).toBe(403);
+  });
+
+  it("treats another spelling of loopback as another origin", async () => {
+    const { binding } = await startBinding();
+    open.push(binding);
+    const port = new URL(binding.origin).port;
+
+    const create = (origin: string): Promise<Response> =>
+      fetch(`${binding.origin}/connections`, {
+        method: "POST",
+        headers: { "content-type": "application/json", [TRANSPORT_HEADER]: "1", origin },
+        body: "{}",
+      });
+
+    // Same scheme, same host, same port: this binding's own origin.
+    expect((await create(binding.origin)).status).toBe(201);
+    // `localhost` and `127.0.0.1` are different origins to a browser, and a page
+    // that the binding never named does not become same-origin by spelling the
+    // same address differently.
+    expect((await create(`http://localhost:${port}`)).status).toBe(403);
+    // A different port is a different origin, whatever the host says.
+    expect((await create(`http://127.0.0.1:${Number(port) + 1}`)).status).toBe(403);
+    // So is a different scheme.
+    expect((await create(`https://127.0.0.1:${port}`)).status).toBe(403);
+    // A trailing slash is the same origin — that is what an origin *is* — while
+    // a different spelling of the same loopback address is not.
+    expect((await create(`${binding.origin}/`)).status).toBe(201);
+  });
+
+  it("admits another origin only when it is on the allowlist", async () => {
+    const { binding } = await startBinding({ originAllowlist: ["http://localhost:1234"] });
+    open.push(binding);
+
+    const response = await fetch(`${binding.origin}/connections`, {
+      method: "POST",
+      headers: { "content-type": "application/json", [TRANSPORT_HEADER]: "1", origin: "http://localhost:1234" },
+      body: "{}",
+    });
+
+    expect(response.status).toBe(201);
   });
 
   it("answers a preflight only for an allowed origin", async () => {
@@ -361,6 +408,136 @@ describe("deadlines are absolute", () => {
     }
   });
 
+  it("gives every stage of establishing a connection the same budget", async () => {
+    // Each stage stalls in its own way. The create is never answered, the body
+    // never finishes, the stream's headers never arrive, and the stream opens
+    // and then says nothing — and all four draw on one deadline, measured from
+    // the moment the connector started. A stage that begins with a moment of it
+    // left does not buy a fresh one: `pendingTtlMs` is the binding's own number
+    // for how long an unclaimed connection may wait, not a second client clock.
+    const stages = ["create", "body", "headers", "first byte"] as const;
+    for (const stage of stages) {
+      const port = await serve((request, response) => {
+        if (request.url === "/connections") {
+          if (stage === "create") return;
+          response.writeHead(201, { "content-type": "application/json" });
+          if (stage === "body") {
+            response.write("{");
+            return;
+          }
+          response.end(JSON.stringify({ connectionId: "probe", token: "probe-token" }));
+          return;
+        }
+        if (stage === "headers") return;
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.flushHeaders();
+      });
+
+      const started = Date.now();
+      await expect(
+        connectHttpChannel({
+          origin: `http://127.0.0.1:${port}`,
+          limits: { connectTimeoutMs: 150, pendingTtlMs: 5000 },
+        }),
+      ).rejects.toThrow();
+      expect(Date.now() - started, `${stage} took longer than the one budget`).toBeLessThan(1500);
+    }
+  });
+
+  it("gives a record that begins where another ended a deadline of its own", async () => {
+    const probe = await serveProbe();
+    const channel = await connectHttpChannel({ origin: probe.origin, limits: { recordTimeoutMs: 400 } });
+    const frames: string[] = [];
+    const closed: number[] = [];
+    channel.listen({
+      onFrame: (frame: string): void => {
+        frames.push(frame);
+      },
+      onClose: (): void => {
+        closed.push(1);
+      },
+    });
+
+    try {
+      probe.stream?.write('data: "old');
+      // Just before the first record's deadline, one chunk finishes it and
+      // starts the next one. The next record is not the first one's heir: it
+      // gets the whole budget, not what was left of its predecessor's clock.
+      await wait(300);
+      probe.stream?.write('"\n\ndata: "new');
+      await wait(200);
+
+      expect(closed, "the new record inherited the old one's deadline").toEqual([]);
+
+      // And nothing else arrives. The deadline the second record owns is a
+      // live one: a record that only ever saw its predecessor's clock would sit
+      // there with no deadline at all, which is the same as having none.
+      await waitUntil(() => closed.length === 1, "the new record's own deadline");
+      expect(frames).toEqual(["old"]);
+    } finally {
+      channel.close();
+    }
+  });
+
+  it("clears a record's deadline when it finishes, and starts a fresh one next", async () => {
+    const probe = await serveProbe();
+    const channel = await connectHttpChannel({ origin: probe.origin, limits: { recordTimeoutMs: 250 } });
+    const frames: string[] = [];
+    const closed: number[] = [];
+    channel.listen({
+      onFrame: (frame: string): void => {
+        frames.push(frame);
+      },
+      onClose: (): void => {
+        closed.push(1);
+      },
+    });
+
+    try {
+      probe.stream?.write('data: "old');
+      await wait(80);
+      probe.stream?.write('"\n\n');
+      // Well past the first record's deadline, which went with the record.
+      await wait(400);
+      expect(closed).toEqual([]);
+
+      probe.stream?.write('data: "next');
+      await waitUntil(() => closed.length === 1, "the next record's own deadline");
+      expect(frames).toEqual(["old"]);
+    } finally {
+      channel.close();
+    }
+  });
+
+  it("ends a record that holds nothing but comments, however often it talks", async () => {
+    const probe = await serveProbe();
+    const channel = await connectHttpChannel({ origin: probe.origin, limits: { recordTimeoutMs: 200 } });
+    const frames: string[] = [];
+    const closed: number[] = [];
+    channel.listen({
+      onFrame: (frame: string): void => {
+        frames.push(frame);
+      },
+      onClose: (): void => {
+        closed.push(1);
+      },
+    });
+    // A record with no data field is still a record, and its deadline is not an
+    // idle timeout: talking to it does not keep it alive.
+    const dribble = setInterval(() => {
+      probe.stream?.write(": next\n");
+    }, 30);
+    probe.stream?.write(": still open\n");
+
+    try {
+      await waitUntil(() => closed.length === 1, "the comment-only record to hit its deadline");
+      expect(frames).toEqual([]);
+    } finally {
+      clearInterval(dribble);
+      channel.close();
+    }
+  });
+
   it("aborts an upstream request that is still in flight when the stream ends", async () => {
     const probe = await serveProbe();
     probe.holdPosts = true;
@@ -374,5 +551,67 @@ describe("deadlines are absolute", () => {
 
     await waitUntil(() => probe.counter.postsAbandoned === 1, "the in-flight POST to be abandoned");
     expect(probe.counter.posts).toBe(1);
+  });
+});
+
+describe("the upstream budget counts what the connection still owes", () => {
+  it("counts the POST that is on the wire but unanswered", async () => {
+    const probe = await serveProbe();
+    probe.holdPosts = true;
+    const channel = await connectHttpChannel({ origin: probe.origin, limits: { queueFrames: 2 } });
+    channel.listen(silence());
+
+    try {
+      channel.send("1");
+      await waitUntil(() => probe.counter.posts === 1, "the first POST to be sent");
+      // One frame is in the POST and one is waiting: the budget of two is
+      // spent, and a third frame is not admitted just because the queue looks
+      // empty.
+      channel.send("2");
+      expect(() => {
+        channel.send("3");
+      }).toThrow(/queue is full/);
+    } finally {
+      channel.close();
+    }
+  });
+
+  it("charges the record the transport actually sends, not the frame it wraps", async () => {
+    const probe = await serveProbe();
+    probe.holdPosts = true;
+    const channel = await connectHttpChannel({ origin: probe.origin, limits: { queueBytes: 8 } });
+    channel.listen(silence());
+
+    try {
+      // Two bytes of frame, fourteen bytes once the wrapper escapes them: the
+      // transport carries the wrapper, so the wrapper is what the budget pays
+      // for.
+      expect(utf8Length("\u0000\u0000")).toBe(2);
+      expect(utf8Length(wrapFrame("\u0000\u0000"))).toBe(14);
+      expect(() => {
+        channel.send("\u0000\u0000");
+      }).toThrow(/queue is full/);
+    } finally {
+      channel.close();
+    }
+  });
+
+  it("refuses a frame whose record does not fit the record limit", async () => {
+    const probe = await serveProbe();
+    probe.holdPosts = true;
+    const channel = await connectHttpChannel({ origin: probe.origin, limits: { recordBytes: 8 } });
+    channel.listen(silence());
+
+    try {
+      // A two-byte frame that becomes a fourteen-byte record is a record the
+      // binding would refuse on its way in; refusing it here is the difference
+      // between "not sent" and "lost".
+      expect(() => {
+        channel.send("\u0000\u0000");
+      }).toThrow(/record does not fit/);
+      expect(probe.counter.posts).toBe(0);
+    } finally {
+      channel.close();
+    }
   });
 });

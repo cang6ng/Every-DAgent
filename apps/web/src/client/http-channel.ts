@@ -69,9 +69,12 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
   const extra = options.headers ?? {};
   const origin = options.origin.replace(/\/$/, "");
 
-  // One deadline for the whole establishment: the create, the claim, and the
-  // first byte of the stream. A connector that hangs anywhere in that sequence
-  // has not connected at all.
+  // One deadline for the whole establishment: the create, the claim, the
+  // headers and the first byte of the stream all draw on the same budget. A
+  // server that answers each stage just in time cannot stretch the total — a
+  // stage that begins with a second left gets a second, never a fresh ten.
+  const connectStartedAt = Date.now();
+  const connectBudget = (): number => Math.max(0, limits.connectTimeoutMs - (Date.now() - connectStartedAt));
   const connectAbort = new AbortController();
   const connectDeadline = setTimeout(() => {
     connectAbort.abort();
@@ -99,7 +102,7 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
   const streamAbort = new AbortController();
   const listenerBox: { current: ProtocolChannelListener | undefined } = { current: undefined };
   const buffered = createFrameQueue({ maxFrames: limits.queueFrames, maxBytes: limits.queueBytes });
-  const upstream: { readonly frame: string; readonly bytes: number }[] = [];
+  const upstream: { readonly body: string; readonly bytes: number }[] = [];
   let upstreamBytes = 0;
   /** The frame a POST is carrying right now: counted until its answer arrives. */
   let inFlight: { readonly bytes: number } | undefined;
@@ -115,6 +118,8 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
   let idleWatch: ReturnType<typeof setInterval> | undefined;
   /** Guards the deadline of one record that has started but not finished. */
   let recordWatch: ReturnType<typeof setTimeout> | undefined;
+  /** Which record that deadline belongs to; `0` is no record at all. */
+  let recordWatchGeneration = 0;
 
   function notifyClose(): void {
     if (closeNotified) return;
@@ -155,15 +160,32 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
     readerDone();
   }
 
-  /** Watches one record that has started and not finished, however many chunks arrive. */
+  /**
+   * Watches the one record that has started and not finished.
+   *
+   * The deadline belongs to a record, not to the stream. When a chunk ends one
+   * record and starts the next, the new record gets a deadline of its own
+   * instead of inheriting what was left of the old one's — and a deadline that
+   * arrives after its record ended belongs to nothing, so it can neither close
+   * the record that replaced it nor the connection carrying it. A record made of
+   * comments alone is a record: it started, and it is on the clock.
+   */
   function watchRecord(): void {
     if (!parser.open) {
       if (recordWatch !== undefined) clearTimeout(recordWatch);
       recordWatch = undefined;
+      recordWatchGeneration = 0;
       return;
     }
-    if (recordWatch !== undefined) return;
+    if (recordWatch !== undefined && recordWatchGeneration === parser.generation) return;
+
+    if (recordWatch !== undefined) clearTimeout(recordWatch);
+    const generation = parser.generation;
+    recordWatchGeneration = generation;
     recordWatch = setTimeout(() => {
+      recordWatch = undefined;
+      recordWatchGeneration = 0;
+      if (!parser.open || parser.generation !== generation) return;
       // Heartbeats are comments: they keep the connection warm without making
       // progress on the record that is stuck, and this deadline is absolute.
       endConnection();
@@ -189,7 +211,7 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
             [TRANSPORT_HEADER]: "1",
             ...extra,
           },
-          body: wrapFrame(entry.frame),
+          body: entry.body,
           credentials: "omit",
           redirect: "error",
           cache: "no-store",
@@ -298,7 +320,7 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
       new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(() => {
           reject(new Error("the stream did not start in time"));
-        }, limits.pendingTtlMs);
+        }, connectBudget());
       }),
     ]);
   } catch (error) {
@@ -328,14 +350,28 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
         throw new Error("a frame does not fit the binding's limit");
       }
 
-      const held = upstreamBytes + (inFlight?.bytes ?? 0);
-      if (upstream.length >= limits.queueFrames || held + bytes > limits.queueBytes) {
+      // What the transport will actually send is the wrapped record, and the
+      // record limit is about the record: a small frame that escapes into a
+      // large wrapper is still a record this binding cannot carry.
+      const body = wrapFrame(frame);
+      const encoded = utf8Length(body);
+      if (encoded > limits.recordBytes) {
+        endConnection();
+        throw new Error("a record does not fit the binding's limit");
+      }
+
+      // The budget is about work this connection still owes, not about the
+      // queue: a POST that is on the wire but unanswered holds its frame, and
+      // holds it in the bytes the transport is carrying.
+      const heldFrames = upstream.length + (inFlight === undefined ? 0 : 1);
+      const heldBytes = upstreamBytes + (inFlight?.bytes ?? 0);
+      if (heldFrames + 1 > limits.queueFrames || heldBytes + encoded > limits.queueBytes) {
         endConnection();
         throw new Error("the upstream queue is full");
       }
 
-      upstream.push({ frame, bytes });
-      upstreamBytes += bytes;
+      upstream.push({ body, bytes: encoded });
+      upstreamBytes += encoded;
       void runUpstream();
     },
 

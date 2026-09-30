@@ -87,6 +87,8 @@ interface LogicalConnection {
   paused: boolean;
   /** Bytes of a record the socket accepted but has not flushed yet. */
   inFlightBytes: number;
+  /** Records the socket accepted but has not flushed yet. */
+  inFlightFrames: number;
   pumping: boolean;
   heartbeat: ReturnType<typeof setInterval> | undefined;
   ttl: ReturnType<typeof setTimeout> | undefined;
@@ -148,6 +150,12 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
     if (connection.drain !== undefined) clearTimeout(connection.drain);
     connection.outbox.clear();
     connection.inbound.clear();
+    // The ledger belongs to this connection, and a closed one owes nothing:
+    // whatever the socket still held went with it, and a stale number could only
+    // make the next state look busy.
+    connection.inFlightBytes = 0;
+    connection.inFlightFrames = 0;
+    connection.paused = false;
 
     // The owner hears about it exactly once, and before the response is torn
     // down: a host that learns of a dead connection after its socket is gone has
@@ -215,6 +223,7 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
     // until the socket drains: the budget covers what is queued *and* in flight.
     connection.paused = true;
     connection.inFlightBytes += bytes;
+    connection.inFlightFrames += 1;
     connection.drain = setTimeout(() => {
       closeConnection(connection, "the downstream never drained");
     }, limits.drainTimeoutMs);
@@ -223,6 +232,7 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
       connection.drain = undefined;
       connection.paused = false;
       connection.inFlightBytes -= bytes;
+      connection.inFlightFrames -= 1;
       pump(connection);
     });
   }
@@ -247,6 +257,23 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
     connection.pumping = false;
   }
 
+  /**
+   * Whether the downstream may take one more frame.
+   *
+   * The budget is about what this connection still owes, not about what happens
+   * to be waiting: a record the socket accepted but has not flushed is retained
+   * work exactly like a queued frame, and counting only the queue would let a
+   * slow reader hold `queueFrames` plus whatever is in flight. The frame count
+   * and the byte budget are separate numbers — one counts frames, the other
+   * counts the bytes they took to retain — and both are checked here, before
+   * anything is queued.
+   */
+  function admitsFrame(connection: LogicalConnection, bytes: number): boolean {
+    const frames = connection.outbox.size + connection.inFlightFrames;
+    const held = connection.outbox.bytes + connection.inFlightBytes;
+    return frames + 1 <= limits.queueFrames && held + bytes <= limits.queueBytes;
+  }
+
   function sendFrame(connection: LogicalConnection, frame: string): void {
     if (connection.status !== "established") throw new Error("the connection is not carrying frames");
     const bytes = utf8Length(frame);
@@ -257,7 +284,7 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
       closeConnection(connection, "a frame does not fit the binding's limit");
       throw new Error("a frame does not fit the binding's limit");
     }
-    if (!connection.outbox.push(frame, bytes)) {
+    if (!admitsFrame(connection, bytes) || !connection.outbox.push(frame, bytes)) {
       closeConnection(connection, "the downstream queue is full");
       throw new Error("the downstream queue is full");
     }
@@ -340,21 +367,52 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
   }
 
   /**
+   * The origin a browser would write for one scheme, host and port.
+   *
+   * `URL` is the browser's own parser: it lowercases the host, keeps an IPv6
+   * literal in brackets, and drops a port that is the scheme's default — so two
+   * spellings of one origin compare equal, and two different origins never do.
+   */
+  function ownOrigin(port: number): string | undefined {
+    const host = address.includes(":") ? `[${address}]` : address;
+    try {
+      return new URL(`http://${host}:${port}`).origin;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The same normalization for a presented `Origin`, or `undefined` if it is not one. */
+  function normalizedOrigin(value: string): string | undefined {
+    try {
+      return new URL(value).origin;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Whether this request may act on the binding, judged by its `Origin`.
    *
-   * A page is allowed when it comes from the binding's own origin or from the
-   * configured allowlist — exact matches, never a suffix or a wildcard. An
-   * opaque origin (`null`) is refused outright: it is what a sandboxed or
-   * `data:` document has, and it is not a deployment this binding serves. A
-   * request with no `Origin` at all is not a browser, and the loopback peer
-   * check is what stands behind it.
+   * Same-origin means exactly that: the same scheme, the same host and the same
+   * effective port as the binding's own origin. Loopback spellings are different
+   * origins to a browser, so they are different here too — a page served from
+   * `localhost` is not the page this binding named as `127.0.0.1`, and treating
+   * the two as one would let either reach a binding that only ever named the
+   * other. A page that needs a second origin is on the allowlist, explicitly,
+   * and the allowlist is compared character for character. An opaque origin
+   * (`null`) is refused outright: it is what a sandboxed or `data:` document
+   * has, and it is not a deployment this binding serves. A request with no
+   * `Origin` at all is not a browser, and the loopback peer check is what stands
+   * behind it.
    */
   function allowOrigin(request: IncomingMessage, port: number): boolean {
     const origin = request.headers.origin;
     if (origin === undefined) return true;
     if (typeof origin !== "string" || origin === "null") return false;
     if (allowlist.has(origin)) return true;
-    return origin === `http://${address}:${port}` || origin === `http://127.0.0.1:${port}` || origin === `http://localhost:${port}`;
+    const own = ownOrigin(port);
+    return own !== undefined && normalizedOrigin(origin) === own;
   }
 
   function hostIsMine(request: IncomingMessage, port: number): boolean {
@@ -591,6 +649,7 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
       closeOwed: false,
       paused: false,
       inFlightBytes: 0,
+      inFlightFrames: 0,
       pumping: false,
       heartbeat: undefined,
       ttl: undefined,

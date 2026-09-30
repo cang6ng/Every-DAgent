@@ -6,7 +6,7 @@
  * small limits so both sides of every boundary can be exercised for real.
  */
 
-import { request } from "node:http";
+import { request, ServerResponse } from "node:http";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -123,6 +123,70 @@ describe("queue bounds", () => {
     }).toThrow();
 
     await waitUntil(() => frames >= 0, "the queue to settle");
+  });
+
+  /**
+   * A socket that stops accepting the moment a data record reaches it.
+   *
+   * The alternative — filling a real socket buffer — needs hundreds of
+   * kilobytes to happen at all, and this is about what the *ledger* does with a
+   * record the socket took and did not flush, at limits small enough to see.
+   */
+  function withStalledSocket(run: () => Promise<void>): Promise<void> {
+    const original = ServerResponse.prototype.write;
+    ServerResponse.prototype.write = function (this: ServerResponse, chunk: unknown, ...rest: never[]): boolean {
+      const accepted = (original as (...args: unknown[]) => boolean).call(this, chunk, ...rest);
+      return String(chunk).startsWith("data:") ? false : accepted;
+    };
+    return run().finally(() => {
+      ServerResponse.prototype.write = original;
+    });
+  }
+
+  it("counts the record a stalled socket took against the frame budget", async () => {
+    let channel: ProtocolChannel | undefined;
+    const { binding } = await startBinding({
+      limits: { queueFrames: 2, queueBytes: 300_000, drainTimeoutMs: 2000 },
+      onConnection: (attached) => {
+        channel = attached;
+      },
+    });
+    open.push(binding);
+    const peer = await openRawPeer(binding.origin);
+    await waitUntil(() => channel !== undefined, "the channel to attach");
+
+    await withStalledSocket(async () => {
+      // One record is in the socket and one is waiting: the budget of two is
+      // spent, and a third frame is not admitted just because the queue is one
+      // short of its count.
+      channel?.send("1");
+      channel?.send("2");
+      expect(() => channel?.send("3")).toThrow(/queue is full/);
+    });
+
+    peer.close();
+  });
+
+  it("counts the record a stalled socket took against the byte budget", async () => {
+    let channel: ProtocolChannel | undefined;
+    const { binding } = await startBinding({
+      limits: { queueFrames: 64, queueBytes: 8, drainTimeoutMs: 2000 },
+      onConnection: (attached) => {
+        channel = attached;
+      },
+    });
+    open.push(binding);
+    const peer = await openRawPeer(binding.origin);
+    await waitUntil(() => channel !== undefined, "the channel to attach");
+
+    await withStalledSocket(async () => {
+      // The first frame fits the budget exactly and the socket takes it without
+      // draining. The second one is offered while those bytes are still held.
+      channel?.send("12345678");
+      expect(() => channel?.send("12345678")).toThrow(/queue is full/);
+    });
+
+    peer.close();
   });
 
   it("ends a stalled connection even while heartbeats are scheduled", async () => {
