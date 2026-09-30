@@ -15,6 +15,8 @@ import { connectHttpChannel, startHttpBinding, type HttpBinding } from "@every-d
 import type { ReverseProfile, ReverseRequestHandle } from "../../packages/host/src/reverse.js";
 import type { ReverseHandlerContext, ReverseHandlerOutcome, ReverseHandlerRegistration } from "@every-dagent/client";
 
+import type { Plugin } from "@every-dagent/plugin-system";
+
 import { createClientOn, createHostPlatform, waitFor } from "../helpers/platform.js";
 import type { ClientInternals } from "../../packages/client/src/client.js";
 import { scriptedModel, textReply } from "../helpers/demo-fixtures.js";
@@ -107,6 +109,7 @@ interface Seam {
 async function seamPlatform(
   carrier: "memory" | "web",
   profiles: readonly ReverseProfile[],
+  plugins: readonly Plugin[] = [],
 ): Promise<{
   readonly platform: ReturnType<typeof createHostPlatform>;
   readonly binding: HttpBinding | undefined;
@@ -117,7 +120,7 @@ async function seamPlatform(
 
   const platform = createHostPlatform({
     modelClient: model.client,
-    plugins: [],
+    plugins: [...plugins],
     reverseProfiles: profiles,
     ...(carrier === "web"
       ? {
@@ -273,6 +276,40 @@ for (const carrier of ["memory", "web"] as const) {
       const answer = await pending.request(ECHO, { value: "again" }, 2000).outcome;
       expect(answer).toEqual({ ok: true, result: { echoed: "again" } });
       expect(client.getSnapshot().status).toBe("ready");
+      await platform.shutdown();
+    });
+
+    it("answers a reverse request while a plugin lifecycle owns the host", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const deferred: Plugin = {
+        manifest: { id: "seam-deferred", name: "Deferred", version: "1.0.0" },
+        activate: async (): Promise<void> => {
+          await gate;
+        },
+      };
+
+      const { platform, open: openClient } = await seamPlatform(carrier, hostProfiles(), [deferred]);
+      const client = await openClient({ reverseHandlers: clientHandlers({ aborted: [], started: [] }) });
+
+      // The host is busy: the plugin's activation has not settled, so the
+      // mutation lease is held.
+      const enabling = client.plugins.enable({ pluginId: "seam-deferred" });
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20);
+      });
+
+      // A reverse request and its answer still travel: the reverse path is not
+      // behind the execution gate, and neither is the read next to it.
+      const attached = platform.attached[0];
+      const outcome = await attached?.reverse.request(ECHO, { value: "while busy" }, 2000).outcome;
+      expect(outcome).toEqual({ ok: true, result: { echoed: "while busy" } });
+      await expect(client.sessions.list()).resolves.toEqual({ sessions: [] });
+
+      release();
+      await expect(enabling).resolves.toMatchObject({ plugin: { status: "enabled" } });
       await platform.shutdown();
     });
 

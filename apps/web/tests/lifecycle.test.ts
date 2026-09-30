@@ -325,14 +325,15 @@ describe("deadlines are absolute", () => {
     expect(Date.now() - started).toBeLessThan(2000);
   });
 
-  it("ends a stream whose record never finishes, however many keep-alives arrive", async () => {
+  it("ends a stream whose record never finishes, however slowly it arrives", async () => {
     const probe = await serveProbe();
-    let keepAlive: ReturnType<typeof setInterval> | undefined;
+    let dribble: ReturnType<typeof setInterval> | undefined;
     probe.onClaim = (response) => {
-      // A record that starts and never ends, with comments to keep it "alive".
-      response.write('data: "this record never ends');
-      keepAlive = setInterval(() => {
-        response.write(": ping\n\n");
+      // A record that keeps growing and never ends: more data lines, each one
+      // terminated, and no blank line to finish the record. This is a record
+      // arriving slowly, not an idle stream — and its deadline is still absolute.
+      dribble = setInterval(() => {
+        response.write('data: "still going\n');
       }, 20);
     };
 
@@ -342,16 +343,21 @@ describe("deadlines are absolute", () => {
         limits: { recordTimeoutMs: 150, connectTimeoutMs: 2000 },
       });
       const closed: number[] = [];
+      const frames: string[] = [];
       channel.listen({
-        onFrame: (): void => undefined,
+        onFrame: (frame: string): void => {
+          frames.push(frame);
+        },
         onClose: (): void => {
           closed.push(1);
         },
       });
 
       await waitUntil(() => closed.length === 1, "the unfinished record to end the connection");
+      // The record never became a frame: an unfinished record is never delivered.
+      expect(frames).toEqual([]);
     } finally {
-      if (keepAlive !== undefined) clearInterval(keepAlive);
+      if (dribble !== undefined) clearInterval(dribble);
     }
   });
 

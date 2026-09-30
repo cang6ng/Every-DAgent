@@ -32,11 +32,18 @@ afterEach(async () => {
  * Everything else still crosses the real transport; this is the delivery that
  * never happens, applied where a lossy network would apply it.
  */
-function dropping(source: () => Promise<ProtocolChannel>, drop: (frame: string) => boolean): () => Promise<ProtocolChannel> {
+function dropping(
+  source: () => Promise<ProtocolChannel>,
+  drop: (frame: string) => boolean,
+  sent: string[],
+): () => Promise<ProtocolChannel> {
   return async (): Promise<ProtocolChannel> => {
     const inner = await source();
     return {
-      send: (frame: string): void => inner.send(frame),
+      send: (frame: string): void => {
+        sent.push(frame);
+        inner.send(frame);
+      },
       listen: (listener: ProtocolChannelListener): (() => void) =>
         inner.listen({
           onFrame: (frame: string): void => {
@@ -58,6 +65,7 @@ async function webPlatform(drop?: (frame: string) => boolean): Promise<{
   readonly binding: HttpBinding;
   readonly demo: ReturnType<typeof demoPlugin>;
   readonly client: ReturnType<typeof createClient>;
+  readonly sent: readonly string[];
 }> {
   const demo = demoPlugin(PLUGIN_ID, TOOL_NAME, "tool answered");
   const model = scriptedModel([
@@ -81,15 +89,13 @@ async function webPlatform(drop?: (frame: string) => boolean): Promise<{
   binding = await startHttpBinding({ onConnection: (channel) => platform.host.attach(channel) });
   open.push(binding);
 
+  const sent: string[] = [];
   const connector = (): Promise<ProtocolChannel> => platform.connect();
   const client = createClient({
-    connect:
-      drop === undefined
-        ? connector
-        : dropping(connector, drop),
+    connect: drop === undefined ? connector : dropping(connector, drop, sent),
   });
 
-  return { platform, binding, demo, client };
+  return { platform, binding, demo, client, sent };
 }
 
 describe("a lost runs.start answer over the web binding", () => {
@@ -109,7 +115,7 @@ describe("a lost runs.start answer over the web binding", () => {
       if (isTheStartAnswer) dropped = true;
       return isTheStartAnswer;
     });
-    const { client, platform } = fixture;
+    const { client, platform, sent } = fixture;
     let observerHasRun = false;
 
     await client.connect();
@@ -147,6 +153,10 @@ describe("a lost runs.start answer over the web binding", () => {
           .presentation?.runs.some((run) => run.runId === recovered.run.runId && run.live === null) === true,
       { what: "the recovered run to settle" },
     );
+
+    // Exactly one start left this client, and it was not sent again for the
+    // answer it never heard.
+    expect(sent.filter((frame) => frame.includes('"runs.start"'))).toHaveLength(1);
 
     const outcome = await lost;
     expect(outcome).toMatchObject({ code: "CONNECTION_LOST", outcome: "unknown" });
