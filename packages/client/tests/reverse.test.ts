@@ -32,12 +32,17 @@ function strictObject(params: JsonValue): Record<string, JsonValue> | undefined 
 }
 
 /** The strict test profile: exactly `{ value: string }` in, `{ echoed: string }` out. */
-function echoHandler(options: { readonly answer?: Answer } = {}): ReverseHandlerRegistration {
+function echoHandler(
+  options: {
+    readonly answer?: Answer;
+    readonly resultIsValid?: (result: JsonValue) => boolean;
+  } = {},
+): ReverseHandlerRegistration {
   const answer: Answer = options.answer ?? ((params) => ({ result: { echoed: strictObject(params)?.["value"] ?? "" } }));
   return {
     method: "test.echo",
     accepts: (params: JsonValue): boolean => typeof strictObject(params)?.["value"] === "string",
-    resultIsValid: (result: JsonValue): boolean => typeof strictObject(result)?.["echoed"] === "string",
+    resultIsValid: options.resultIsValid ?? ((result: JsonValue): boolean => typeof strictObject(result)?.["echoed"] === "string"),
     handle: (params: JsonValue, context: ReverseHandlerContext): ReturnType<Answer> => answer(params, context),
   };
 }
@@ -623,6 +628,126 @@ describe("the params contract is foreign code too", () => {
     expect(answer?.["result"]).toBeUndefined();
     expect(dispatched).toHaveLength(0);
     expect(scenario.client.getSnapshot().status).toBe("ready");
+  });
+});
+
+describe("the result contract is foreign code too", () => {
+  /** Collects unhandled rejections for the duration of one test. */
+  function trackRejections(): { readonly seen: unknown[]; stop(): void } {
+    const seen: unknown[] = [];
+    const track = (reason: unknown): void => {
+      seen.push(reason);
+    };
+    process.on("unhandledRejection", track);
+    return { seen, stop: () => process.off("unhandledRejection", track) };
+  }
+
+  it("answers a throw from the result contract as a safe failure", async () => {
+    const rejections = trackRejections();
+    try {
+      const scenario = scenarioWith([
+        echoHandler({
+          resultIsValid: (): boolean => {
+            throw new Error("PRIVATE_RESULT_CONTRACT_TOKEN");
+          },
+        }),
+      ]);
+      await scenario.ready();
+
+      sendHostRequest(scenario.host, { requestId: "h-1", method: "test.echo", params: { value: "hello" } });
+      await flush();
+      await flush();
+
+      // One answer, this client's own sentence: a contract that throws has not
+      // judged the result, so the result does not travel as a success — and
+      // neither does the contract's own words.
+      const answers = clientAnswers(scenario, "h-1");
+      expect(answers).toHaveLength(1);
+      expect(answers[0]?.["result"]).toBeUndefined();
+      expect(answers[0]?.["error"]).toMatchObject({ code: "INTERNAL_ERROR" });
+      expect(JSON.stringify(answers[0])).not.toContain("PRIVATE_RESULT_CONTRACT_TOKEN");
+
+      // The frame path and the connection are untouched by foreign code.
+      expect(scenario.client.getSnapshot().status).toBe("ready");
+      expect(scenario.client.getSnapshot().error).toBeNull();
+      expect(rejections.seen).toEqual([]);
+    } finally {
+      rejections.stop();
+    }
+  });
+
+  it("keeps answering later requests after its contract threw once", async () => {
+    let judged = 0;
+    const scenario = scenarioWith([
+      echoHandler({
+        resultIsValid: (result: JsonValue): boolean => {
+          judged += 1;
+          if (judged === 1) throw new Error("the first answer is refused outright");
+          return typeof strictObject(result)?.["echoed"] === "string";
+        },
+      }),
+    ]);
+    await scenario.ready();
+
+    sendHostRequest(scenario.host, { requestId: "h-1", method: "test.echo", params: { value: "hello" } });
+    await flush();
+    expect(clientAnswers(scenario, "h-1")[0]?.["error"]).toMatchObject({ code: "INTERNAL_ERROR" });
+
+    // Nothing was left waiting on the first request, and the second one is
+    // answered normally — by the same contract, now that it can judge.
+    sendHostRequest(scenario.host, { requestId: "h-2", method: "test.echo", params: { value: "again" } });
+    await flush();
+    expect(clientAnswers(scenario, "h-2")[0]?.["result"]).toEqual({ echoed: "again" });
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+
+    // The ended request cannot be ended twice: its cancellation finds nothing.
+    scenario.host.sendRaw(
+      JSON.stringify({
+        kind: "host-event",
+        protocolVersion: "1",
+        hostInstanceId: scenario.host.hostInstanceId,
+        streamId: scenario.host.currentStreamId,
+        sequence: scenario.host.currentSequence + 1,
+        type: "host.request.cancelled",
+        scope: { kind: "host" },
+        payload: { requestId: "h-1", reason: "cancelled" },
+      }),
+    );
+    await flush();
+    expect(clientAnswers(scenario, "h-1")).toHaveLength(1);
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+  });
+
+  it("cannot answer the stream a contract re-cut while it was judging", async () => {
+    let cuts = 0;
+    const scenario = scenarioWith([
+      echoHandler({
+        resultIsValid: (): boolean => {
+          // A contract is foreign code, and a resync from inside it is legal:
+          // the cut happens before this returns, so the answer belongs to a
+          // stream this client no longer holds.
+          cuts += 1;
+          if (cuts === 1) void scenario.client.resync().catch(() => undefined);
+          return true;
+        },
+      }),
+    ]);
+    await scenario.ready();
+    const retired = scenario.host.currentStreamId;
+
+    sendHostRequest(scenario.host, { requestId: "h-1", method: "test.echo", params: { value: "hello" } });
+    await flush();
+
+    // The answer that judged a result for the retired stream never travels.
+    expect(clientAnswers(scenario, "h-1")).toHaveLength(0);
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+    expect(scenario.host.currentStreamId).not.toBe(retired);
+
+    // And the fresh stream is fully usable for the next request.
+    sendHostRequest(scenario.host, { requestId: "h-2", method: "test.echo", params: { value: "again" } });
+    await flush();
+    expect(clientAnswers(scenario, "h-2")[0]?.["result"]).toEqual({ echoed: "again" });
+    expect(clientAnswers(scenario, "h-2")[0]?.["streamId"]).toBe(scenario.host.currentStreamId);
   });
 });
 

@@ -33,6 +33,17 @@ import { createReverseTrigger } from "@every-dagent/host/src/reverse.js";
 // @ts-expect-error the web binding has no internal entry of its own
 import { createFrameQueue } from "@every-dagent/web/src/transport/queue.js";
 
+// Nor is the reverse registration contract a *name* on the public root: a
+// consumer cannot import the shape, and therefore cannot read the internal
+// `resultIsValid` member off it. The production catalog is empty, and the
+// contract that fills it belongs to the dispatcher, not to the package.
+// @ts-expect-error the reverse registration contract is not exported
+import type { ReverseHandlerRegistration } from "@every-dagent/client";
+// @ts-expect-error the handler context is not exported
+import type { ReverseHandlerContext } from "@every-dagent/client";
+// @ts-expect-error the handler outcome is not exported
+import type { ReverseHandlerOutcome } from "@every-dagent/client";
+
 export const refused = {
   createClientWith,
   ClientConnection,

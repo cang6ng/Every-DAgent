@@ -1236,11 +1236,22 @@ export class ClientConnection {
     if (this.reversePendings.get(pending.requestId) !== pending) return;
     if (this.epoch !== pending.epoch) return;
 
+    // Choosing the answer runs this profile's own result contract, which is
+    // foreign code and the last thing to run before anything travels. It may
+    // re-enter this client — a resync or a close from inside it is legal — so
+    // the same rules are checked again once it has returned: the answer belongs
+    // to the entry, the stream and the generation that still stand, and a
+    // contract that ended any of them has ended this request with it.
+    const answer = expressible(outcome, pending.resultIsValid);
+    if (this.reversePendings.get(pending.requestId) !== pending) return;
+    if (this.epoch !== pending.epoch) return;
+    if (this.stream?.streamId !== pending.streamId) return;
+
     this.reversePendings.delete(pending.requestId);
     pending.finished = true;
     pending.timer?.cancel();
     pending.timer = undefined;
-    this.replyReverse(pending.epoch, pending.streamId, pending.requestId, expressible(outcome, pending.resultIsValid));
+    this.replyReverse(pending.epoch, pending.streamId, pending.requestId, answer);
   }
 
   /**
@@ -1440,7 +1451,17 @@ function expressible(
       error: Object.freeze({ code: "INTERNAL_ERROR", message: "the handler produced a value the wire cannot carry" }),
     };
   }
-  if (!resultIsValid(validated.output)) {
+  // The contract is foreign code on the answer's way out: it may refuse the
+  // result, and it may throw. A contract that throws has not judged anything,
+  // so its result is refused as well — and nothing it said travels: the answer
+  // is this client's own sentence about a result it will not vouch for.
+  let acceptable: boolean;
+  try {
+    acceptable = resultIsValid(validated.output);
+  } catch {
+    acceptable = false;
+  }
+  if (!acceptable) {
     return {
       error: Object.freeze({ code: "INTERNAL_ERROR", message: "the handler produced a result this method does not define" }),
     };

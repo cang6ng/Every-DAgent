@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { JsonValue } from "@every-dagent/protocol";
 import { connectHttpChannel, startHttpBinding, type HttpBinding } from "@every-dagent/web";
 import type { ReverseProfile, ReverseRequestHandle } from "../../packages/host/src/reverse.js";
-import type { ReverseHandlerContext, ReverseHandlerOutcome, ReverseHandlerRegistration } from "@every-dagent/client";
+import type { ReverseHandlerContext, ReverseHandlerOutcome, ReverseHandlerRegistration } from "../../packages/client/src/reverse.js";
 
 import type { Plugin } from "@every-dagent/plugin-system";
 
