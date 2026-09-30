@@ -57,28 +57,58 @@ function createdConnectionOf(value: unknown): CreatedConnection | undefined {
   return { connectionId, token };
 }
 
+/** One attempt at establishing a connection: its limits, its address, its one clock. */
+interface ConnectAttempt {
+  readonly limits: WebLimits;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly origin: string;
+  /** How much of the one establishment budget is left. */
+  readonly budget: () => number;
+  /** Aborted when that budget runs out; every stage of the attempt draws on it. */
+  readonly abort: AbortController;
+}
+
 /**
  * Establishes one logical connection and returns its channel.
  *
  * It resolves only once the downstream is demonstrably live — the binding writes
  * a marker as soon as the stream exists — so a channel handed to a client is
  * never a channel that cannot receive.
+ *
+ * The clock belongs to the attempt, not to any one stage of it. Establishing a
+ * connection runs through a create, a claim, the headers of the stream and the
+ * first byte of it, and all of them draw on the same budget: a server that
+ * answers each stage just in time cannot stretch the total, and a stage that
+ * begins with a second left gets a second, never a fresh ten. However the
+ * attempt ends — established, refused, malformed, aborted, thrown — it ends
+ * here, and the timer it was started with ends here with it. A deadline left
+ * behind by an attempt the binding refused would go on firing into an answer
+ * that was already given.
  */
 export async function connectHttpChannel(options: HttpChannelOptions): Promise<ProtocolChannel> {
   const limits: WebLimits = { ...DEFAULT_WEB_LIMITS, ...options.limits };
-  const extra = options.headers ?? {};
-  const origin = options.origin.replace(/\/$/, "");
-
-  // One deadline for the whole establishment: the create, the claim, the
-  // headers and the first byte of the stream all draw on the same budget. A
-  // server that answers each stage just in time cannot stretch the total — a
-  // stage that begins with a second left gets a second, never a fresh ten.
-  const connectStartedAt = Date.now();
-  const connectBudget = (): number => Math.max(0, limits.connectTimeoutMs - (Date.now() - connectStartedAt));
-  const connectAbort = new AbortController();
-  const connectDeadline = setTimeout(() => {
-    connectAbort.abort();
+  const startedAt = Date.now();
+  const abort = new AbortController();
+  const deadline = setTimeout(() => {
+    abort.abort();
   }, limits.connectTimeoutMs);
+
+  try {
+    return await establish({
+      limits,
+      headers: options.headers ?? {},
+      origin: options.origin.replace(/\/$/, ""),
+      budget: (): number => Math.max(0, limits.connectTimeoutMs - (Date.now() - startedAt)),
+      abort,
+    });
+  } finally {
+    clearTimeout(deadline);
+  }
+}
+
+/** The establishment itself, under the one clock its caller owns. */
+async function establish(attempt: ConnectAttempt): Promise<ProtocolChannel> {
+  const { limits, headers: extra, origin, budget: connectBudget, abort: connectAbort } = attempt;
 
   const created = await fetch(`${origin}/connections`, {
     method: "POST",
@@ -328,7 +358,6 @@ export async function connectHttpChannel(options: HttpChannelOptions): Promise<P
     throw error instanceof Error ? error : new Error("the stream did not start");
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
-    clearTimeout(connectDeadline);
   }
 
   // The downstream is kept alive by the binding's heartbeat, so silence past the

@@ -188,9 +188,40 @@ describe("the deployment policy is enforced", () => {
     expect((await create(`http://127.0.0.1:${Number(port) + 1}`)).status).toBe(403);
     // So is a different scheme.
     expect((await create(`https://127.0.0.1:${port}`)).status).toBe(403);
-    // A trailing slash is the same origin — that is what an origin *is* — while
-    // a different spelling of the same loopback address is not.
-    expect((await create(`${binding.origin}/`)).status).toBe(201);
+  });
+
+  it("refuses a value that is a URL rather than an origin", async () => {
+    const { binding } = await startBinding();
+    open.push(binding);
+    const port = new URL(binding.origin).port;
+
+    const create = (origin: string): Promise<Response> =>
+      fetch(`${binding.origin}/connections`, {
+        method: "POST",
+        headers: { "content-type": "application/json", [TRANSPORT_HEADER]: "1", origin },
+        body: "{}",
+      });
+
+    // Every one of these serialises to this binding's own origin, and not one of
+    // them is an origin: a browser's `Origin` is a scheme, a host and a port,
+    // and nothing else. A value that has to be shortened before it matches is a
+    // URL wearing this origin's prefix.
+    const urls = [
+      `${binding.origin}/`,
+      `${binding.origin}/path`,
+      `${binding.origin}/../connections`,
+      `${binding.origin}?query=1`,
+      `${binding.origin}#fragment`,
+      `http://user:pass@127.0.0.1:${port}`,
+      `http://user@127.0.0.1:${port}`,
+      `HTTP://127.0.0.1:${port}`,
+    ];
+    for (const origin of urls) {
+      expect((await create(origin)).status, origin).toBe(403);
+    }
+
+    // And the binding's own origin is still the origin it admits.
+    expect((await create(binding.origin)).status).toBe(201);
   });
 
   it("admits another origin only when it is on the allowlist", async () => {
@@ -370,6 +401,109 @@ describe("deadlines are absolute", () => {
     ).rejects.toThrow();
 
     expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  /**
+   * The delays of the timers that are still scheduled when `run` returns.
+   *
+   * `setTimeout` is patched for the length of the attempt, so a deadline that
+   * nobody stopped is still on the books when the attempt is over — which is the
+   * only way to see a timer that nothing waits on any more. A timer that fires
+   * in the meantime takes itself off.
+   */
+  async function clocksLeftBehind(run: () => Promise<void>): Promise<number[]> {
+    const live = new Map<ReturnType<typeof setTimeout>, number>();
+    const realSet = globalThis.setTimeout;
+    const realClear = globalThis.clearTimeout;
+
+    globalThis.setTimeout = ((handler: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+      const entry: { handle: ReturnType<typeof setTimeout> | undefined } = { handle: undefined };
+      const wrapped = (...inner: unknown[]): void => {
+        if (entry.handle !== undefined) live.delete(entry.handle);
+        handler(...inner);
+      };
+      entry.handle = realSet(wrapped, delay, ...args);
+      live.set(entry.handle, delay ?? 0);
+      return entry.handle;
+    }) as typeof globalThis.setTimeout;
+    globalThis.clearTimeout = ((handle?: ReturnType<typeof setTimeout>) => {
+      if (handle !== undefined) live.delete(handle);
+      return realClear(handle as never);
+    }) as typeof globalThis.clearTimeout;
+
+    try {
+      await run();
+    } finally {
+      globalThis.setTimeout = realSet;
+      globalThis.clearTimeout = realClear;
+    }
+    return [...live.values()];
+  }
+
+  it("stops the establishment clock however the attempt ends", async () => {
+    // Every way an establishment can end, with a budget that is its own: a
+    // refused create, a create that answers with something that is not a
+    // connection, a server that never answers at all, and one that works. None
+    // of them may leave the attempt's deadline scheduled.
+    const budget = 700;
+
+    const refusedPort = await serve((_request, response) => {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end("{}");
+    });
+    const malformedPort = await serve((_request, response) => {
+      response.writeHead(201, { "content-type": "application/json" });
+      response.end("{}");
+    });
+    const silentPort = await serve(() => undefined);
+    const { binding, channels } = await startBinding();
+    open.push(binding);
+
+    const failures: { readonly what: string; readonly message: string; readonly left: number[] }[] = [];
+    for (const [what, origin] of [
+      ["a refused create", `http://127.0.0.1:${refusedPort}`],
+      ["a create that describes nothing", `http://127.0.0.1:${malformedPort}`],
+      ["a server that never answers", `http://127.0.0.1:${silentPort}`],
+    ] as const) {
+      let thrown: unknown;
+      const left = await clocksLeftBehind(async () => {
+        thrown = await connectHttpChannel({ origin, limits: { connectTimeoutMs: budget } }).catch(
+          (error: unknown) => error,
+        );
+      });
+      failures.push({ what, message: thrown instanceof Error ? thrown.message : String(thrown), left });
+    }
+
+    expect(failures[0]?.message).toContain("503");
+    expect(failures[1]?.message).toContain("did not describe");
+    expect(failures[2]?.message).not.toBe("");
+    for (const failure of failures) {
+      expect(failure.left, `${failure.what} left a deadline behind`).not.toContain(budget);
+    }
+
+    // And the attempt that succeeds: the clock it started on ends with the
+    // attempt, not later, and the connection it established is unaffected by it.
+    let channel: ProtocolChannel | undefined;
+    const connected = await clocksLeftBehind(async () => {
+      channel = await connectHttpChannel({ origin: binding.origin, limits: { connectTimeoutMs: budget } });
+    });
+    expect(connected).not.toContain(budget);
+
+    const received: string[] = [];
+    let closed = 0;
+    await waitUntil(() => channels.length === 1, "the host side to attach");
+    channels[0]?.listen({ onFrame: (frame: string) => received.push(frame), onClose: () => (closed += 1) });
+    try {
+      // Past the budget the attempt started with: the deadline was stopped with
+      // the attempt, so the connection it established is still carrying frames.
+      await wait(budget + 100);
+      channel?.send("still here");
+      await waitUntil(() => received.length === 1, "the frame to arrive");
+      expect(received).toEqual(["still here"]);
+      expect(closed).toBe(0);
+    } finally {
+      channel?.close();
+    }
   });
 
   it("ends a stream whose record never finishes, however slowly it arrives", async () => {

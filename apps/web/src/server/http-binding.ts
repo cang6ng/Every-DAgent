@@ -27,6 +27,7 @@ import type { AddressInfo } from "node:net";
 import type { ProtocolChannel, ProtocolChannelListener } from "@every-dagent/protocol";
 
 import { encodeSseComment, encodeSseRecord, unwrapRecord, utf8Length } from "../transport/framing.js";
+import { createLedger, type Ledger } from "../transport/ledger.js";
 import { DEFAULT_WEB_LIMITS, type WebLimits } from "../transport/limits.js";
 import { createFrameQueue, type FrameQueue } from "../transport/queue.js";
 
@@ -78,6 +79,7 @@ interface LogicalConnection {
   status: ConnectionStatus;
   response: ServerResponse | undefined;
   listener: ProtocolChannelListener | undefined;
+  /** Encoded records waiting for the socket. */
   readonly outbox: FrameQueue;
   readonly inbound: FrameQueue;
   /** Whether the one close this connection will ever report has been handed to its owner. */
@@ -85,10 +87,8 @@ interface LogicalConnection {
   /** Whether a close is owed to an owner that was not listening when it happened. */
   closeOwed: boolean;
   paused: boolean;
-  /** Bytes of a record the socket accepted but has not flushed yet. */
-  inFlightBytes: number;
-  /** Records the socket accepted but has not flushed yet. */
-  inFlightFrames: number;
+  /** Records the socket accepted but has not flushed, owned by this connection's generation. */
+  readonly ledger: Ledger;
   pumping: boolean;
   heartbeat: ReturnType<typeof setInterval> | undefined;
   ttl: ReturnType<typeof setTimeout> | undefined;
@@ -151,10 +151,11 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
     connection.outbox.clear();
     connection.inbound.clear();
     // The ledger belongs to this connection, and a closed one owes nothing:
-    // whatever the socket still held went with it, and a stale number could only
-    // make the next state look busy.
-    connection.inFlightBytes = 0;
-    connection.inFlightFrames = 0;
+    // whatever the socket still held went with it. Retiring it is what makes
+    // that true — the generation moves on, so a write or a drain that comes
+    // back later speaks for a connection that no longer exists and is refused
+    // rather than subtracting from, or adding to, a number that is already final.
+    connection.ledger.retire();
     connection.paused = false;
 
     // The owner hears about it exactly once, and before the response is torn
@@ -204,12 +205,18 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
    * the busiest one. A `write` that returns false has *accepted* the record, so
    * it is never written twice: the pump waits for `drain`, and gives up on a
    * reader that never drains.
+   *
+   * Both halves of that — taking the record onto the ledger and giving it back —
+   * are owned by the generation this call was issued under. A write can end the
+   * connection before it returns, and a drain can arrive after it ended: neither
+   * is a reason for a retired connection's ledger to move.
    */
   function writeRecord(connection: LogicalConnection, record: string, bytes: number): void {
     const response = connection.response;
     if (response === undefined || connection.status !== "established") return;
     if (connection.paused) return;
 
+    const generation = connection.ledger.generation;
     let accepted: boolean;
     try {
       accepted = response.write(record);
@@ -219,72 +226,83 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
     }
     if (accepted) return;
 
+    // The write can end the connection before it returns, and a connection that
+    // has ended has no ledger to put this record on and nothing that will ever
+    // drain it. The generation is what tells the two apart: a retired ledger has
+    // moved on, and this call's ownership moved with it.
+    if (connection.ledger.generation !== generation) return;
+
     // The record is already accepted by the socket, and it stays on the books
     // until the socket drains: the budget covers what is queued *and* in flight.
     connection.paused = true;
-    connection.inFlightBytes += bytes;
-    connection.inFlightFrames += 1;
+    connection.ledger.retain(generation, 1, bytes);
     connection.drain = setTimeout(() => {
       closeConnection(connection, "the downstream never drained");
     }, limits.drainTimeoutMs);
     response.once("drain", () => {
       if (connection.drain !== undefined) clearTimeout(connection.drain);
       connection.drain = undefined;
+      // A drain that arrives after the connection ended belongs to a ledger that
+      // is already final: it has nothing to give back and nothing to resume.
+      if (connection.ledger.generation !== generation) return;
       connection.paused = false;
-      connection.inFlightBytes -= bytes;
-      connection.inFlightFrames -= 1;
+      connection.ledger.release(generation, 1, bytes);
       pump(connection);
     });
   }
 
-  /** Hands queued frames to the downstream, one at a time, through the one write path. */
+  /** Hands queued records to the downstream, one at a time, through the one write path. */
   function pump(connection: LogicalConnection): void {
     if (connection.pumping) return;
     connection.pumping = true;
 
     while (!connection.paused && connection.status === "established") {
-      const frame = connection.outbox.shift();
-      if (frame === undefined) break;
-      const record = encodeSseRecord(frame);
-      const bytes = utf8Length(record);
-      if (bytes > limits.recordBytes) {
-        closeConnection(connection, "a record does not fit the binding's limit");
-        break;
-      }
-      writeRecord(connection, record, bytes);
+      const record = connection.outbox.shift();
+      if (record === undefined) break;
+      writeRecord(connection, record, utf8Length(record));
     }
 
     connection.pumping = false;
   }
 
   /**
-   * Whether the downstream may take one more frame.
+   * Whether the downstream may take one more record.
    *
    * The budget is about what this connection still owes, not about what happens
    * to be waiting: a record the socket accepted but has not flushed is retained
-   * work exactly like a queued frame, and counting only the queue would let a
+   * work exactly like a queued record, and counting only the queue would let a
    * slow reader hold `queueFrames` plus whatever is in flight. The frame count
-   * and the byte budget are separate numbers — one counts frames, the other
-   * counts the bytes they took to retain — and both are checked here, before
-   * anything is queued.
+   * and the byte budget are separate numbers — one counts records, the other
+   * counts the bytes they took to retain — and both are about the same encoded
+   * record that will be written, because a budget kept in one unit and spent in
+   * another is a budget that does not hold.
    */
   function admitsFrame(connection: LogicalConnection, bytes: number): boolean {
-    const frames = connection.outbox.size + connection.inFlightFrames;
-    const held = connection.outbox.bytes + connection.inFlightBytes;
+    const frames = connection.outbox.size + connection.ledger.frames;
+    const held = connection.outbox.bytes + connection.ledger.bytes;
     return frames + 1 <= limits.queueFrames && held + bytes <= limits.queueBytes;
   }
 
   function sendFrame(connection: LogicalConnection, frame: string): void {
     if (connection.status !== "established") throw new Error("the connection is not carrying frames");
-    const bytes = utf8Length(frame);
-    if (bytes > limits.frameBytes) {
+    if (utf8Length(frame) > limits.frameBytes) {
       // A frame the binding cannot carry is a connection it cannot serve, and
       // saying so here is the only honest answer: truncating it would change
       // what the protocol sees.
       closeConnection(connection, "a frame does not fit the binding's limit");
       throw new Error("a frame does not fit the binding's limit");
     }
-    if (!admitsFrame(connection, bytes) || !connection.outbox.push(frame, bytes)) {
+
+    // What travels is the encoded record, and it is encoded exactly once: the
+    // record limit, the byte budget and the write all see this same string, so
+    // what is charged for cannot drift away from what is sent.
+    const record = encodeSseRecord(frame);
+    const bytes = utf8Length(record);
+    if (bytes > limits.recordBytes) {
+      closeConnection(connection, "a record does not fit the binding's limit");
+      throw new Error("a record does not fit the binding's limit");
+    }
+    if (!admitsFrame(connection, bytes) || !connection.outbox.push(record, bytes)) {
       closeConnection(connection, "the downstream queue is full");
       throw new Error("the downstream queue is full");
     }
@@ -382,37 +400,57 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
     }
   }
 
-  /** The same normalization for a presented `Origin`, or `undefined` if it is not one. */
-  function normalizedOrigin(value: string): string | undefined {
+  /**
+   * The serialized origin a browser would write in `Origin`, or `undefined`.
+   *
+   * The header carries an origin and nothing else: a scheme, a host and an
+   * effective port. Anything a normalising parser would have to strip before the
+   * value looks like an origin — a path, userinfo, a query, a fragment, a
+   * spelling the URL parser would rewrite — is not an origin, and accepting it
+   * because its prefix happens to serialise to one would let a URL that merely
+   * resembles this binding's origin act as if it were. `null` is not one either:
+   * it is what a sandboxed or `data:` document has, and this binding serves
+   * neither.
+   */
+  function serializedOrigin(value: string): string | undefined {
+    let url: URL;
     try {
-      return new URL(value).origin;
+      url = new URL(value);
     } catch {
       return undefined;
     }
+    if (url.username !== "" || url.password !== "") return undefined;
+    if (url.pathname !== "/" || url.search !== "" || url.hash !== "") return undefined;
+    // The one spelling that survives its own serialisation: `http://h:80` and
+    // `http://h` name the same origin, and only the second is what a browser
+    // writes.
+    return value === url.origin ? url.origin : undefined;
   }
 
   /**
    * Whether this request may act on the binding, judged by its `Origin`.
    *
    * Same-origin means exactly that: the same scheme, the same host and the same
-   * effective port as the binding's own origin. Loopback spellings are different
-   * origins to a browser, so they are different here too — a page served from
-   * `localhost` is not the page this binding named as `127.0.0.1`, and treating
-   * the two as one would let either reach a binding that only ever named the
-   * other. A page that needs a second origin is on the allowlist, explicitly,
-   * and the allowlist is compared character for character. An opaque origin
-   * (`null`) is refused outright: it is what a sandboxed or `data:` document
-   * has, and it is not a deployment this binding serves. A request with no
-   * `Origin` at all is not a browser, and the loopback peer check is what stands
-   * behind it.
+   * effective port as the binding's own origin. The header has to *be* an origin
+   * before it can be compared to one — a value that has to be shortened before
+   * it matches is a different origin wearing this one's prefix. Loopback
+   * spellings are different origins to a browser, so they are different here
+   * too: a page served from `localhost` is not the page this binding named as
+   * `127.0.0.1`, and treating the two as one would let either reach a binding
+   * that only ever named the other. A page that needs a second origin is on the
+   * allowlist, explicitly, and the allowlist is compared character for
+   * character. A request with no `Origin` at all is not a browser, and the
+   * loopback peer check is what stands behind it.
    */
   function allowOrigin(request: IncomingMessage, port: number): boolean {
     const origin = request.headers.origin;
     if (origin === undefined) return true;
-    if (typeof origin !== "string" || origin === "null") return false;
-    if (allowlist.has(origin)) return true;
+    if (typeof origin !== "string") return false;
+    const presented = serializedOrigin(origin);
+    if (presented === undefined) return false;
+    if (allowlist.has(presented)) return true;
     const own = ownOrigin(port);
-    return own !== undefined && normalizedOrigin(origin) === own;
+    return own !== undefined && presented === own;
   }
 
   function hostIsMine(request: IncomingMessage, port: number): boolean {
@@ -648,8 +686,7 @@ export async function startHttpBinding(options: HttpBindingOptions): Promise<Htt
       closeDelivered: false,
       closeOwed: false,
       paused: false,
-      inFlightBytes: 0,
-      inFlightFrames: 0,
+      ledger: createLedger(),
       pumping: false,
       heartbeat: undefined,
       ttl: undefined,

@@ -12,7 +12,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { ProtocolChannel } from "@every-dagent/protocol";
 
-import { FRAME_LIMIT_BYTES, connectHttpChannel, utf8Length } from "../src/index.js";
+import { FRAME_LIMIT_BYTES, connectHttpChannel, encodeSseRecord, utf8Length } from "../src/index.js";
 
 import { createCredentials, openRawPeer, startBinding, waitUntil } from "./helpers/raw-peer.js";
 
@@ -169,8 +169,11 @@ describe("queue bounds", () => {
 
   it("counts the record a stalled socket took against the byte budget", async () => {
     let channel: ProtocolChannel | undefined;
+    // The budget is spent in the unit the socket is given: the record, wrapper
+    // and line ends included, not the frame it happens to wrap.
+    const record = encodeSseRecord("12345678");
     const { binding } = await startBinding({
-      limits: { queueFrames: 64, queueBytes: 8, drainTimeoutMs: 2000 },
+      limits: { queueFrames: 64, queueBytes: utf8Length(record), drainTimeoutMs: 2000 },
       onConnection: (attached) => {
         channel = attached;
       },
@@ -180,13 +183,80 @@ describe("queue bounds", () => {
     await waitUntil(() => channel !== undefined, "the channel to attach");
 
     await withStalledSocket(async () => {
-      // The first frame fits the budget exactly and the socket takes it without
+      // The first record fits the budget exactly and the socket takes it without
       // draining. The second one is offered while those bytes are still held.
       channel?.send("12345678");
       expect(() => channel?.send("12345678")).toThrow(/queue is full/);
     });
 
     peer.close();
+  });
+
+  it("charges what it writes, not what it wraps, against the byte budget", async () => {
+    // Two bytes of frame; the record the socket would be given is larger by the
+    // wrapper and the framing around it. A budget that counted the frame would
+    // admit work it cannot actually retain.
+    const frame = "\u0000\u0000";
+    const record = encodeSseRecord(frame);
+    expect(utf8Length(frame)).toBe(2);
+    expect(utf8Length(record)).toBe(22);
+
+    const tight = await startBinding({ limits: { queueBytes: utf8Length(record) - 1 } });
+    open.push(tight.binding);
+    const tightPeer = await openRawPeer(tight.binding.origin);
+    await waitUntil(() => tight.channels.length === 1, "the channel to attach");
+    expect(() => {
+      tight.channels[0]?.send(frame);
+    }).toThrow(/queue is full/);
+    tightPeer.close();
+
+    // Exactly the record's size: admitted, and what arrives is the frame.
+    const exact = await startBinding({ limits: { queueBytes: utf8Length(record) } });
+    open.push(exact.binding);
+    const exactPeer = await openRawPeer(exact.binding.origin);
+    await waitUntil(() => exact.channels.length === 1, "the channel to attach");
+    exact.channels[0]?.send(frame);
+    await exactPeer.waitForFrames(1);
+    expect(exactPeer.frames).toEqual([frame]);
+    exactPeer.close();
+  });
+
+  it("tells the caller when the record does not fit the record limit", async () => {
+    const frame = "12345678";
+    const record = encodeSseRecord(frame);
+    // The frame is small; the record carrying it is not.
+    expect(utf8Length(record)).toBe(18);
+
+    const refused = await startBinding({ limits: { recordBytes: utf8Length(record) - 1 } });
+    open.push(refused.binding);
+    const refusedPeer = await openRawPeer(refused.binding.origin);
+    await waitUntil(() => refused.channels.length === 1, "the channel to attach");
+    let closed = 0;
+    refused.channels[0]?.listen({
+      onFrame: (): void => undefined,
+      onClose: (): void => {
+        closed += 1;
+      },
+    });
+
+    // A frame the binding cannot carry is refused to the caller: taking it and
+    // dropping it later would look exactly like "queued".
+    expect(() => {
+      refused.channels[0]?.send(frame);
+    }).toThrow(/record does not fit/);
+    await waitUntil(() => closed === 1, "the connection to end");
+    await waitUntil(() => refusedPeer.ended, "the downstream to end at the peer");
+    refusedPeer.close();
+
+    // Exactly the record's size: admitted, and delivered whole.
+    const exact = await startBinding({ limits: { recordBytes: utf8Length(record) } });
+    open.push(exact.binding);
+    const exactPeer = await openRawPeer(exact.binding.origin);
+    await waitUntil(() => exact.channels.length === 1, "the channel to attach");
+    exact.channels[0]?.send(frame);
+    await exactPeer.waitForFrames(1);
+    expect(exactPeer.frames).toEqual([frame]);
+    exactPeer.close();
   });
 
   it("ends a stalled connection even while heartbeats are scheduled", async () => {

@@ -45,6 +45,7 @@ describe("dependency boundary", () => {
         "index.ts",
         "server/http-binding.ts",
         "transport/framing.ts",
+        "transport/ledger.ts",
         "transport/limits.ts",
         "transport/queue.ts",
       ].sort(),
