@@ -132,6 +132,102 @@ describe("the SSE reader", () => {
     expect(parser.overflowed).toBe(true);
   });
 
+  /**
+   * One stream, cut into chunks of `size` code points each.
+   *
+   * A chunk boundary in this parser is a boundary between decoded code points:
+   * the bytes were already turned into a string by the decoder above it, and
+   * cutting a surrogate pair here would be a different stream, not a different
+   * chunking of this one.
+   */
+  function judged(stream: string, limit: number, size: number): { readonly records: readonly string[]; readonly overflowed: boolean; readonly generations: number } {
+    const parser = createSseParser(limit);
+    const points = [...stream];
+    const records: string[] = [];
+    for (let at = 0; at < points.length; at += size) {
+      for (const record of parser.feed(points.slice(at, at + size).join(""))) records.push(record);
+    }
+    return { records, overflowed: parser.overflowed, generations: parser.generation };
+  }
+
+  it("judges one stream identically however it is cut into chunks", () => {
+    const streams: readonly { readonly name: string; readonly stream: string; readonly limit: number }[] = [
+      // The counterexample: a comment record longer than the limit is refused
+      // whether it arrives whole or in pieces — the verdict is about the line,
+      // not about the buffer that happens to hold it.
+      { name: "a comment record past the limit", stream: `: ${"x".repeat(40)}\n\n`, limit: 8 },
+      { name: "a comment record at the limit", stream: `: ${"x".repeat(6)}\n\n`, limit: 8 },
+      { name: "comment-only records", stream: ": keepalive\n\n: ping\n\n", limit: 64 },
+      { name: "several data records", stream: 'data: "one"\n\ndata: "two"\n\n', limit: 64 },
+      { name: "a record exactly at the limit", stream: `data: ${"z".repeat(64)}\n\n`, limit: 64 },
+      { name: "a record one byte past it", stream: `data: ${"z".repeat(65)}\n\n`, limit: 64 },
+      { name: "CRLF line ends", stream: 'data: "crlf"\r\n\r\n', limit: 64 },
+      { name: "a record with no terminator", stream: 'data: "unfinished', limit: 64 },
+      { name: "an oversized line with no terminator", stream: `data: ${"q".repeat(40)}`, limit: 8 },
+      { name: "multi-byte payloads", stream: 'data: "é中🚀"\n\n', limit: 64 },
+      { name: "a comment between data lines", stream: 'data: "a"\n: note\ndata: "b"\n\n', limit: 64 },
+      // A complete record followed by a violating one: what was already
+      // delivered must not depend on the chunk boundary having fallen between
+      // the two.
+      { name: "a good record before a bad one", stream: `data: "ok"\n\ndata: ${"x".repeat(40)}\n\n`, limit: 8 },
+    ];
+
+    for (const { name, stream, limit } of streams) {
+      const whole = judged(stream, limit, stream.length + 1);
+      for (let size = 1; size <= [...stream].length; size += 1) {
+        const cut = judged(stream, limit, size);
+        expect(cut, `${name}, chunks of ${size}`).toMatchObject({
+          records: whole.records,
+          overflowed: whole.overflowed,
+        });
+      }
+    }
+  });
+
+  it("delivers the records it already completed before a violation", () => {
+    // The failing record is dropped, and the record that finished before it is
+    // not: a chunk that happens to carry both must not swallow the first.
+    expect(judged(`data: "ok"\n\ndata: ${"x".repeat(40)}\n\n`, 8, 1_000)).toEqual({
+      records: ['"ok"'],
+      overflowed: true,
+      generations: 2,
+    });
+    expect(judged(`data: "ok"\n\ndata: ${"x".repeat(40)}\n\n`, 8, 3).records).toEqual(['"ok"']);
+  });
+
+  it("starts a new generation whenever a record starts", () => {
+    const parser = createSseParser(64);
+    expect(parser.generation).toBe(0);
+    parser.feed('data: "first');
+    const first = parser.generation;
+    expect(first).toBe(1);
+    expect(parser.open).toBe(true);
+
+    // The same chunk ends the first record and starts the second: the second is
+    // a different record, and its deadline must not be the first one's.
+    parser.feed('"\n\ndata: "second');
+    expect(parser.generation).toBe(first + 1);
+    expect(parser.open).toBe(true);
+
+    // A record that ends and nothing follows leaves nothing open.
+    parser.feed('"\n\n');
+    expect(parser.open).toBe(false);
+    expect(parser.feed("")).toEqual([]);
+    expect(parser.generation).toBe(first + 1);
+  });
+
+  it("treats a comment-only record as a record", () => {
+    const parser = createSseParser(64);
+
+    parser.feed(": keepalive\n");
+    // Its only line is a comment, and the record it belongs to has not been
+    // terminated: it has started, and it is open.
+    expect(parser.open).toBe(true);
+
+    parser.feed("\n");
+    expect(parser.open).toBe(false);
+  });
+
   it("does not reinterpret the rest of an oversized record as a new one", () => {
     const parser = createSseParser(16);
     parser.feed(`data: ${"x".repeat(64)}\n`);
