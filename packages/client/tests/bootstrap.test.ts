@@ -7,7 +7,7 @@
  * just because the transport happened to deliver it.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { decodeFrame } from "@every-dagent/protocol";
 
@@ -211,5 +211,73 @@ describe("the frames themselves", () => {
       expect(decoded.success).toBe(true);
     }
     expect(typeof scenario.host.sent[0]).toBe("string");
+  });
+});
+
+describe("a control request cannot wait forever", () => {
+  it("ends the attempt when describe is never answered", async () => {
+    vi.useFakeTimers();
+    try {
+      const scenario = createScenario({ host: { auto: false } });
+      const connecting = scenario.client.connect().catch((error: unknown) => error);
+      for (let index = 0; index < 10; index += 1) await Promise.resolve();
+
+      expect(scenario.client.getSnapshot().status).toBe("syncing");
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      const failure = await connecting;
+      expect(failure).toMatchObject({ code: "CONNECTION_LOST", reason: "control-timeout" });
+      expect(scenario.client.getSnapshot().status).toBe("lost");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ends the attempt when open is never answered", async () => {
+    vi.useFakeTimers();
+    try {
+      const scenario = createScenario({ host: { auto: false } });
+      const connecting = scenario.client.connect().catch((error: unknown) => error);
+      for (let index = 0; index < 10; index += 1) await Promise.resolve();
+      scenario.host.serveDescribe();
+      for (let index = 0; index < 10; index += 1) await Promise.resolve();
+
+      expect(scenario.host.requests.filter((request) => request.method === "subscriptions.open")).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      const failure = await connecting;
+      expect(failure).toMatchObject({ code: "CONNECTION_LOST", reason: "control-timeout" });
+      expect(scenario.client.getSnapshot().status).toBe("lost");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not time out a business request", async () => {
+    vi.useFakeTimers();
+    try {
+      const scenario = createScenario();
+      const connecting = scenario.client.connect();
+      for (let index = 0; index < 20; index += 1) await Promise.resolve();
+
+      const listing = scenario.client.sessions.list();
+      let settled = "";
+      void listing.then(
+        () => {
+          settled = "resolved";
+        },
+        () => {
+          settled = "rejected";
+        },
+      );
+      await vi.advanceTimersByTimeAsync(120_000);
+      await Promise.resolve();
+
+      expect(settled).toBe("");
+      expect(listing).toBeDefined();
+      void connecting;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

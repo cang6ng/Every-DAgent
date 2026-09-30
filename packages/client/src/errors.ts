@@ -33,6 +33,7 @@ export type ConnectionLostReason =
   | "channel-closed"
   | "connector-failed"
   | "send-failed"
+  | "control-timeout"
   | "disconnected";
 
 export type ProtocolViolationReason =
@@ -48,7 +49,8 @@ export type ProtocolViolationReason =
   | "snapshot-fence"
   | "capability-violation"
   | "result-identity"
-  | "run-identity";
+  | "run-identity"
+  | "stream-identity-budget";
 
 export type ClientMisuseReason =
   | "not-initialized"
@@ -61,6 +63,7 @@ const CONNECTION_MESSAGES: Readonly<Record<ConnectionLostReason, string>> = Obje
   "channel-closed": "the connection to the host was lost",
   "connector-failed": "the connection to the host could not be established",
   "send-failed": "the connection refused a frame and was closed",
+  "control-timeout": "the host did not answer a control request in time",
   disconnected: "the client was disconnected",
 });
 
@@ -78,6 +81,7 @@ const VIOLATION_MESSAGES: Readonly<Record<ProtocolViolationReason, string>> = Ob
   "capability-violation": "the host used a capability it did not describe",
   "result-identity": "the host's result describes a different request than the one made",
   "run-identity": "the host changed a run's identity or live timeline",
+  "stream-identity-budget": "the client can no longer prove which streams this connection has retired",
 });
 
 const MISUSE_MESSAGES: Readonly<Record<ClientMisuseReason, string>> = Object.freeze({
@@ -113,6 +117,9 @@ export class ClientError extends Error {
     this.outcome = fields.outcome;
     this.reason = fields.reason;
     this.protocolError = fields.protocolError;
+    // A published error is part of the client's state: an error a caller could
+    // edit is an error the client would then be reporting.
+    Object.freeze(this);
   }
 }
 
@@ -140,12 +147,19 @@ export function connectionLost(reason: ConnectionLostReason, outcome: OutcomeCla
   });
 }
 
-/** The peer broke the frozen contract on this connection. */
-export function protocolViolation(reason: ProtocolViolationReason): ClientError {
+/**
+ * The peer broke the frozen contract on this connection.
+ *
+ * `outcome` matters when the violation is discovered while answering a request
+ * that had already been sent: the request may or may not have been executed, and
+ * a protocol failure does not turn that into "not sent".
+ */
+export function protocolViolation(reason: ProtocolViolationReason, outcome?: OutcomeClaim): ClientError {
   return new ClientError({
     kind: "protocol",
     code: "PROTOCOL_VIOLATION",
     message: VIOLATION_MESSAGES[reason],
+    ...(outcome === undefined ? {} : { outcome }),
     reason,
   });
 }

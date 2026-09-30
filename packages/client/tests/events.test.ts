@@ -104,6 +104,7 @@ describe("run events", () => {
     const scenario = createScenario({ host: { auto: false } });
     await openWith(scenario, { sessions: [SESSION] });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+    scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
 
     scenario.host.emit({
       type: "run.updated",
@@ -117,6 +118,7 @@ describe("run events", () => {
   it("refuses a run whose turn id moved", async () => {
     const scenario = createScenario({ host: { auto: false } });
     await openWith(scenario, { sessions: [SESSION] });
+    scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
     scenario.host.emit({
       type: "run.updated",
       run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1", turnId: "turn-1" }),
@@ -151,10 +153,16 @@ describe("run events", () => {
 });
 
 describe("live text and tools", () => {
+  /**
+   * A run that has reached `running`, written the way the host writes it:
+   * accepted, then running, and only then content. Content before running is a
+   * contract violation, and the fold refuses it.
+   */
   async function withRun(text = "hello") {
     const scenario = createScenario({ host: { auto: false } });
     await openWith(scenario, { sessions: [SESSION] });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1", text }) });
+    scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1", text }) });
     return scenario;
   }
 
@@ -256,6 +264,7 @@ describe("the terminal correction", () => {
     const scenario = createScenario({ host: { auto: false } });
     await openWith(scenario, { sessions: [SESSION] });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+    scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
     scenario.host.emit({ type: "run.output.delta", sessionId: "s-1", runId: "r-1", itemId: "i-1", text: "draft" });
 
     const seen: { readonly runLive: unknown; readonly activeRunId: unknown }[] = [];
@@ -344,5 +353,118 @@ describe("unknown events", () => {
 
     expect(scenario.client.getSnapshot().status).toBe("protocol-error");
     expect(scenario.client.getSnapshot().error?.reason).toBe("invalid-event");
+  });
+});
+
+describe("content and runs must fit the history the client published", () => {
+  async function running(): Promise<ReturnType<typeof createScenario>> {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+    scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+    scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+    return scenario;
+  }
+
+  for (const kind of ["run.output.delta", "run.tool.call", "run.tool.result"] as const) {
+    it(`refuses a ${kind} whose scope names another session`, async () => {
+      const scenario = await running();
+      if (kind === "run.tool.result") {
+        scenario.host.emit({
+          type: "run.tool.call",
+          sessionId: "s-1",
+          runId: "r-1",
+          item: toolItem({ itemId: "i-1", invocationId: "inv-1" }),
+        });
+      }
+      const before = scenario.client.getSnapshot().presentation;
+
+      if (kind === "run.output.delta") {
+        scenario.host.emit({ type: kind, sessionId: "WRONG", runId: "r-1", itemId: "i-1", text: "injected" });
+      }
+      if (kind === "run.tool.call") {
+        scenario.host.emit({
+          type: kind,
+          sessionId: "WRONG",
+          runId: "r-1",
+          item: toolItem({ itemId: "i-1", invocationId: "inv-1" }),
+        });
+      }
+      if (kind === "run.tool.result") {
+        scenario.host.emit({ type: kind, sessionId: "WRONG", runId: "r-1", invocationId: "inv-1", ok: true, content: "injected" });
+      }
+
+      expect(scenario.client.getSnapshot().status).toBe("protocol-error");
+      expect(scenario.client.getSnapshot().presentation).toBe(before);
+    });
+  }
+
+  it("refuses a run that begins as running without an accepted publication", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+
+    scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+
+    expect(scenario.client.getSnapshot().status).toBe("protocol-error");
+  });
+
+  it("refuses a running run that goes back to accepted", async () => {
+    const scenario = await running();
+
+    scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+
+    expect(scenario.client.getSnapshot().status).toBe("protocol-error");
+  });
+
+  it("refuses content before the run has reached running", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+    scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
+
+    scenario.host.emit({ type: "run.output.delta", sessionId: "s-1", runId: "r-1", itemId: "i-1", text: "too early" });
+
+    expect(scenario.client.getSnapshot().status).toBe("protocol-error");
+  });
+
+  it("refuses a full live replacement that rewrites a published occurrence", async () => {
+    const scenario = await running();
+    scenario.host.emit({
+      type: "run.tool.call",
+      sessionId: "s-1",
+      runId: "r-1",
+      item: toolItem({ itemId: "i-1", invocationId: "inv-1", name: "original" }),
+    });
+
+    scenario.host.emit({
+      type: "run.updated",
+      run: runningRun({
+        runId: "r-1",
+        sessionId: "s-1",
+        submissionId: "sub-1",
+        live: [toolItem({ itemId: "i-1", invocationId: "inv-1", name: "REWRITTEN" })],
+      }),
+    });
+
+    expect(scenario.client.getSnapshot().status).toBe("protocol-error");
+  });
+
+  it("accepts a full live replacement that only extends the timeline", async () => {
+    const scenario = await running();
+    scenario.host.emit({ type: "run.output.delta", sessionId: "s-1", runId: "r-1", itemId: "i-1", text: "hello" });
+
+    scenario.host.emit({
+      type: "run.updated",
+      run: runningRun({
+        runId: "r-1",
+        sessionId: "s-1",
+        submissionId: "sub-1",
+        live: [textItem("i-1", "hello world")],
+      }),
+    });
+
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+    expect(scenario.client.getSnapshot().presentation?.runs[0]).toMatchObject({
+      status: "running",
+      live: [{ itemId: "i-1", kind: "text", text: "hello world" }],
+    });
   });
 });

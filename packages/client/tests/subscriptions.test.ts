@@ -273,3 +273,239 @@ describe("closing a subscription", () => {
     expect(host.requests.filter((request) => request.method === "subscriptions.close")).toHaveLength(1);
   });
 });
+
+describe("control transactions are taken before anything observable", () => {
+  it("a listener that sees `syncing` cannot start a second simultaneous cut", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+    const host = scenario.host;
+
+    let reentered = false;
+    let second: Promise<unknown> | undefined;
+    scenario.client.subscribe(() => {
+      if (reentered || scenario.client.getSnapshot().status !== "syncing") return;
+      reentered = true;
+      second = scenario.client.resync().catch((error: unknown) => error);
+    });
+
+    const first = scenario.client.resync();
+    const opens = host.requests.filter((request) => request.method === "subscriptions.open").length;
+
+    host.serveOpen({ sessions: [SESSION] });
+    await first;
+    await second;
+
+    // The initial open plus exactly one new cut: the reentrant call joined it.
+    expect(opens).toBe(2);
+    expect(host.requests.filter((request) => request.method === "subscriptions.open")).toHaveLength(2);
+  });
+
+  it("a listener that sees `ready` starts a new cut, not a stale one", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    let refreshed = false;
+    scenario.client.subscribe(() => {
+      if (refreshed || scenario.client.getSnapshot().status !== "ready") return;
+      refreshed = true;
+      void scenario.client.resync().catch(() => undefined);
+    });
+
+    const connecting = scenario.client.connect();
+    await flush();
+    scenario.host.serveDescribe();
+    await flush();
+    scenario.host.serveOpen();
+    await connecting;
+
+    expect(scenario.client.getSnapshot().status).toBe("syncing");
+    expect(scenario.host.requests.filter((request) => request.method === "subscriptions.open")).toHaveLength(2);
+  });
+
+  it("a gap delivered in the same batch as the snapshot still starts a new cut", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    const connecting = scenario.client.connect();
+    await flush();
+    scenario.host.serveDescribe();
+    await flush();
+
+    const host = scenario.host;
+    host.serveOpen();
+    host.sendRaw(
+      JSON.stringify({
+        kind: "host-event",
+        protocolVersion: "1",
+        hostInstanceId: host.hostInstanceId,
+        streamId: host.currentStreamId,
+        sequence: 2,
+        type: "session.created",
+        scope: { kind: "session", sessionId: "skipped" },
+        payload: { session: sessionSnapshot({ sessionId: "skipped" }) },
+      }),
+    );
+    await connecting;
+
+    expect(host.requests.filter((request) => request.method === "subscriptions.open")).toHaveLength(2);
+    expect(scenario.client.getSnapshot().status).toBe("syncing");
+  });
+});
+
+describe("losing the stream marks the presentation stale", () => {
+  it("a caller's resync marks what is retained as stale", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+    const host = scenario.host;
+
+    const resyncing = scenario.client.resync();
+    await flush();
+
+    expect(scenario.client.getSnapshot().stale).toBe(true);
+    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(1);
+
+    host.serveOpen({ sessions: [SESSION] });
+    await resyncing;
+
+    expect(scenario.client.getSnapshot().stale).toBe(false);
+  });
+
+  it("a gap marks what is retained as stale", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+    const host = scenario.host;
+
+    host.sendRaw(
+      JSON.stringify({
+        kind: "host-event",
+        protocolVersion: "1",
+        hostInstanceId: host.hostInstanceId,
+        streamId: host.currentStreamId,
+        sequence: 5,
+        type: "session.created",
+        scope: { kind: "session", sessionId: "skipped" },
+        payload: { session: sessionSnapshot({ sessionId: "skipped" }) },
+      }),
+    );
+
+    expect(scenario.client.getSnapshot().stale).toBe(true);
+    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(1);
+  });
+
+  it("an open that fails leaves the retained presentation stale", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+    const host = scenario.host;
+
+    const resyncing = scenario.client.resync().catch((error: unknown) => error);
+    await flush();
+    host.respondError(host.requestIdOf("subscriptions.open", 1) ?? "", "INTERNAL_ERROR");
+    await resyncing;
+
+    expect(scenario.client.getSnapshot().stale).toBe(true);
+    expect(scenario.client.getSnapshot().status).toBe("connected");
+  });
+});
+
+describe("which non-current streams are noise and which are a fence", () => {
+  function eventFrame(host: { readonly hostInstanceId: string }, streamId: string): string {
+    return JSON.stringify({
+      kind: "host-event",
+      protocolVersion: "1",
+      hostInstanceId: host.hostInstanceId,
+      streamId,
+      sequence: 1,
+      type: "session.created",
+      scope: { kind: "session", sessionId: "late" },
+      payload: { session: sessionSnapshot({ sessionId: "late" }) },
+    });
+  }
+
+  function requestFrame(host: { readonly hostInstanceId: string }, streamId: string): string {
+    return JSON.stringify({
+      kind: "host-request",
+      protocolVersion: "1",
+      hostInstanceId: host.hostInstanceId,
+      streamId,
+      requestId: "late-request",
+      method: "test.echo",
+      params: {},
+      timeoutMs: 1000,
+    });
+  }
+
+  const factories = { event: eventFrame, request: requestFrame } as const;
+
+  for (const kind of ["event", "request"] as const) {
+    it(`discards a never-installed ${kind} after an explicit close`, async () => {
+      const scenario = createScenario();
+      await scenario.ready();
+      const host = scenario.host;
+
+      const closing = scenario.client.closeSubscription();
+      host.respond(host.requestIdOf("subscriptions.close") ?? "", "subscriptions.close", { closed: true });
+      await closing;
+
+      const before = scenario.client.getSnapshot();
+      host.sendRaw(factories[kind](host, "never-installed"));
+
+      expect(scenario.client.getSnapshot()).toBe(before);
+      expect(host.isClosed).toBe(false);
+    });
+
+    it(`still discards a retired ${kind} long after that stream was ended`, async () => {
+      const scenario = createScenario({ host: { auto: false } });
+      await openWith(scenario, { sessions: [SESSION] });
+      const host = scenario.host;
+      const firstStream = host.currentStreamId ?? "";
+
+      // More cuts than the old eight-entry window ever held.
+      for (let index = 0; index < 10; index += 1) {
+        const resyncing = scenario.client.resync();
+        await flush();
+        host.serveOpen({ sessions: [SESSION] });
+        await resyncing;
+      }
+
+      const resyncing = scenario.client.resync();
+      await flush();
+      const before = scenario.client.getSnapshot();
+      host.sendRaw(factories[kind](host, firstStream));
+
+      expect(scenario.client.getSnapshot()).toBe(before);
+      expect(scenario.client.getSnapshot().status).toBe("syncing");
+      host.serveOpen({ sessions: [SESSION] });
+      await resyncing;
+    });
+  }
+});
+
+describe("a gap never reaches the presentation, not even for a moment", () => {
+  it("keeps the skipped payload out of every observation", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    await openWith(scenario, { sessions: [SESSION] });
+    const host = scenario.host;
+    const observed: string[] = [];
+    const watermarks: number[] = [];
+    scenario.client.subscribe(() => {
+      const snapshot = scenario.client.getSnapshot();
+      observed.push(JSON.stringify(snapshot.presentation?.sessions.map((session) => session.sessionId) ?? []));
+      watermarks.push(snapshot.presentation?.watermark.sequence ?? -1);
+    });
+
+    host.sendRaw(
+      JSON.stringify({
+        kind: "host-event",
+        protocolVersion: "1",
+        hostInstanceId: host.hostInstanceId,
+        streamId: host.currentStreamId,
+        sequence: 4,
+        type: "session.created",
+        scope: { kind: "session", sessionId: "gap-payload" },
+        payload: { session: sessionSnapshot({ sessionId: "gap-payload" }) },
+      }),
+    );
+
+    // The event that revealed the gap is never applied — not transiently either.
+    expect(observed.some((state) => state.includes("gap-payload"))).toBe(false);
+    expect(observed.some((state) => state.includes("s-1"))).toBe(true);
+    expect(watermarks.every((sequence) => sequence === 0)).toBe(true);
+    expect(scenario.client.getSnapshot().status).toBe("syncing");
+  });
+});

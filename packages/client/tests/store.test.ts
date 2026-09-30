@@ -154,3 +154,41 @@ describe("the store is not a response cache", () => {
     expect(scenario.client.getSnapshot().presentation).toBe(before);
   });
 });
+
+describe("what a caller reads cannot be edited into the client's state", () => {
+  it("keeps capability enforcement independent of the published description", async () => {
+    const scenario = createScenario({ host: { capabilities: { plugins: false } } });
+    await scenario.ready();
+    const description = scenario.client.getSnapshot().description;
+    expect(description).not.toBeNull();
+    expect(Object.isFrozen(description)).toBe(true);
+    expect(Object.isFrozen(description?.capabilities)).toBe(true);
+
+    expect(() => {
+      (description?.capabilities as unknown as { plugins: boolean }).plugins = true;
+    }).toThrow();
+
+    const before = scenario.host.sent.length;
+    const refused = scenario.client.plugins.enable({ pluginId: "demo" });
+    await expect(refused).rejects.toMatchObject({ reason: "capability-unavailable" });
+    expect(scenario.host.sent.length).toBe(before);
+  });
+
+  it("keeps a published error uneditable, with a stable snapshot identity", async () => {
+    const scenario = createScenario();
+    await scenario.ready();
+    scenario.host.close();
+
+    const before = scenario.client.getSnapshot();
+    const error = before.error;
+    expect(error).not.toBeNull();
+    const reason = error?.reason;
+
+    expect(() => {
+      (error as unknown as { reason: string }).reason = "caller-corrupted";
+    }).toThrow();
+
+    expect(scenario.client.getSnapshot()).toBe(before);
+    expect(scenario.client.getSnapshot().error?.reason).toBe(reason);
+  });
+});

@@ -257,3 +257,89 @@ describe("disconnecting", () => {
     expect(statusTransitions(scenario)).toContain("disconnected");
   });
 });
+
+describe("invalidation comes before publication", () => {
+  it("a listener that hears about a disconnection cannot send on it", async () => {
+    const scenario = createScenario();
+    await scenario.ready();
+    const before = scenario.host.sent.length;
+    let attempted = false;
+
+    scenario.client.subscribe(() => {
+      if (attempted || scenario.client.getSnapshot().status !== "disconnected") return;
+      attempted = true;
+      void scenario.client.sessions.create().catch(() => undefined);
+    });
+    scenario.client.disconnect();
+    await flush();
+
+    expect(attempted).toBe(true);
+    expect(scenario.host.sent.length).toBe(before);
+  });
+
+  it("a bootstrap continuation that resumes after a disconnect changes nothing", async () => {
+    const scenario = createScenario({ host: { auto: false } });
+    const connecting = scenario.client.connect().catch((error: unknown) => error);
+
+    await flush();
+    scenario.host.serveDescribe();
+    scenario.client.disconnect();
+    const afterDisconnect = scenario.client.getSnapshot();
+    let notifications = 0;
+    scenario.client.subscribe(() => {
+      notifications += 1;
+    });
+
+    await connecting;
+    await flush();
+
+    expect(scenario.client.getSnapshot()).toBe(afterDisconnect);
+    expect(notifications).toBe(0);
+    expect(scenario.host.requests.some((request) => request.method === "subscriptions.open")).toBe(false);
+  });
+
+  it("an old epoch's frames are inert, whichever kind they are", async () => {
+    const scenario = createScenario();
+    await scenario.ready();
+    const old = scenario.host;
+
+    await scenario.client.reconnect();
+    const current = scenario.host;
+    const before = scenario.client.getSnapshot();
+    let notifications = 0;
+
+    old.deliverLate(
+      JSON.stringify({
+        kind: "host-event",
+        protocolVersion: "1",
+        hostInstanceId: old.hostInstanceId,
+        streamId: old.currentStreamId,
+        sequence: 1,
+        type: "session.created",
+        scope: { kind: "session", sessionId: "late" },
+        payload: { session: sessionSnapshot({ sessionId: "late" }) },
+      }),
+    );
+    old.deliverLate(
+      JSON.stringify({
+        kind: "host-request",
+        protocolVersion: "1",
+        hostInstanceId: old.hostInstanceId,
+        streamId: old.currentStreamId,
+        requestId: "late-request",
+        method: "test.echo",
+        params: { value: "late" },
+        timeoutMs: 1000,
+      }),
+    );
+    const remove = scenario.client.subscribe(() => {
+      notifications += 1;
+    });
+    await flush();
+    remove();
+
+    expect(scenario.client.getSnapshot()).toBe(before);
+    expect(notifications).toBe(0);
+    expect(current.isClosed).toBe(false);
+  });
+});

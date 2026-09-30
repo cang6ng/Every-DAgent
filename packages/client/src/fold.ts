@@ -7,14 +7,21 @@
  * never repairs a gap by guessing: an event that does not fit its own history is
  * a peer error, not something to paper over.
  *
- * Immutability is by construction here: every node this module creates is
- * frozen, every node it reuses is already frozen, and the arrays it touches are
- * copied rather than edited — so an old snapshot can never change under a
- * reader, and an unchanged branch is shared instead of rebuilt.
+ * A single event's schema cannot describe history, so the checks here are about
+ * *continuity*: which session a run belongs to, which stage it has reached, and
+ * which identities it has already published. A frame that is individually valid
+ * and still cannot follow from what was published before it is refused.
+ *
+ * Immutability is by construction: every node this module creates is frozen,
+ * every node it reuses is already frozen, and the arrays it touches are copied
+ * rather than edited — so an old snapshot can never change under a reader, and
+ * an unchanged branch is shared instead of rebuilt.
  */
 
 import type {
   ActiveRunSnapshot,
+  DisplayInput,
+  EventScope,
   HostEvent,
   HostSnapshot,
   LiveItem,
@@ -77,6 +84,65 @@ function withWatermark(base: Omit<HostSnapshot, "watermark">, watermark: Waterma
   return Object.freeze({ ...base, watermark: Object.freeze({ streamId: watermark.streamId, sequence: watermark.sequence }) });
 }
 
+/** Structural equality for the JSON the protocol carries, used on display inputs and results. */
+function sameJson(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (typeof left !== "object" || typeof right !== "object" || left === null || right === null) return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((value, index) => sameJson(value, right[index]));
+  }
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) return false;
+  return leftKeys.every(
+    (key) =>
+      Object.hasOwn(right, key) &&
+      sameJson((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]),
+  );
+}
+
+function sameDisplayInput(left: DisplayInput, right: DisplayInput): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "json" && right.kind === "json") return sameJson(left.value, right.value);
+  return true;
+}
+
+/**
+ * One live item's published identity, compared across a full replacement.
+ *
+ * A run.updated carries the whole timeline, so a rewrite of something already
+ * shown would silently change history the client has already presented. Text
+ * may grow; the identity of an occurrence may not.
+ */
+function sameLiveIdentity(left: LiveItem, right: LiveItem): boolean {
+  if (left.kind !== right.kind || left.itemId !== right.itemId) return false;
+  if (left.kind !== "tool" || right.kind !== "tool") return true;
+  if (
+    left.invocationId !== right.invocationId ||
+    left.callId !== right.callId ||
+    left.name !== right.name ||
+    !sameDisplayInput(left.input, right.input)
+  ) {
+    return false;
+  }
+  if (left.result === null) return true;
+  return right.result !== null && left.result.ok === right.result.ok && left.result.content === right.result.content;
+}
+
+/** The published timeline may only be extended, never rewritten or reordered. */
+function liveContinues(previous: readonly LiveItem[], next: readonly LiveItem[]): boolean {
+  if (next.length < previous.length) return false;
+  for (let index = 0; index < previous.length; index += 1) {
+    const before = previous[index];
+    const after = next[index];
+    if (before === undefined || after === undefined) return false;
+    if (!sameLiveIdentity(before, after)) return false;
+  }
+  const seen = new Set(next.map((item) => item.itemId));
+  return seen.size === next.length;
+}
+
 /**
  * Applies one event.
  *
@@ -99,13 +165,13 @@ export function foldEvent(
     case "run.updated":
       return foldRunUpdated(previous, event.payload.run, watermark);
     case "run.output.delta":
-      return foldOutputDelta(previous, event.scope.runId, event.payload.itemId, event.payload.text, watermark);
+      return foldOutputDelta(previous, event.scope, event.payload.itemId, event.payload.text, watermark);
     case "run.tool.call":
-      return foldToolCall(previous, event.scope.runId, event.payload.item, watermark);
+      return foldToolCall(previous, event.scope, event.payload.item, watermark);
     case "run.tool.result":
-      return foldToolResult(previous, event.scope.runId, event.payload, watermark);
+      return foldToolResult(previous, event.scope, event.payload, watermark);
     case "run.ended":
-      return foldRunEnded(previous, event.payload.run, event.payload.session, watermark);
+      return foldRunEnded(previous, event.scope, event.payload.run, event.payload.session, watermark);
     case "plugin.updated":
       return foldPluginUpdated(previous, event.payload.plugin, watermark);
     case "host.request.cancelled":
@@ -170,14 +236,25 @@ function foldRunUpdated(
   const runIndex = indexOfId(previous.runs, run.runId, (item) => item.runId);
   let runs: readonly RunSnapshot[];
   if (runIndex < 0) {
+    // A run this client has never seen can only be announced as accepted: the
+    // `accepted → running` order is part of the contract, and a snapshot that
+    // already holds a running run is the one exception (it is not an event).
+    if (run.status !== "accepted") return { ok: false, reason: "invalid-event" };
     runs = Object.freeze([...previous.runs, run]);
   } else {
     const existing = previous.runs[runIndex];
     if (existing === undefined) return { ok: false, reason: "invalid-event" };
-    // A terminal run is final; and a run's identity is fixed for its life.
-    if (existing.live === null || !sameRunIdentity(existing, run) || !turnIdFits(existing.turnId, run.turnId)) {
-      return { ok: false, reason: existing.live === null ? "invalid-event" : "run-identity" };
+    // A terminal run is final; a run's identity is fixed for its life; accepted
+    // never comes back once running has been published; and the timeline only
+    // ever grows.
+    if (existing.live === null) return { ok: false, reason: "invalid-event" };
+    if (existing.status === "running" && run.status === "accepted") {
+      return { ok: false, reason: "invalid-event" };
     }
+    if (!sameRunIdentity(existing, run) || !turnIdFits(existing.turnId, run.turnId)) {
+      return { ok: false, reason: "run-identity" };
+    }
+    if (!liveContinues(existing.live, run.live)) return { ok: false, reason: "run-identity" };
     runs = replaceAt(previous.runs, runIndex, run);
   }
 
@@ -198,26 +275,36 @@ function foldRunUpdated(
   };
 }
 
-/** The run a content event belongs to: it must exist here, and it must still be live. */
-function liveRunAt(
+/**
+ * The run a content event belongs to.
+ *
+ * The event's own scope says which session it claims to come from, and that
+ * claim has to match the run this client actually published — a run belongs to
+ * one session for its whole life, and a frame that says otherwise is not a
+ * content update for anything.
+ */
+function contentRunAt(
   previous: HostSnapshot,
-  runId: string,
+  scope: Extract<EventScope, { kind: "run" }>,
 ): { readonly index: number; readonly run: Extract<RunSnapshot, { live: readonly LiveItem[] }> } | undefined {
-  const index = indexOfId(previous.runs, runId, (item) => item.runId);
+  const index = indexOfId(previous.runs, scope.runId, (item) => item.runId);
   if (index < 0) return undefined;
   const run = previous.runs[index];
   if (run === undefined || run.live === null) return undefined;
+  if (run.sessionId !== scope.sessionId) return undefined;
+  // Content follows the run's running publication, never its acceptance.
+  if (run.status !== "running") return undefined;
   return { index, run };
 }
 
 function foldOutputDelta(
   previous: HostSnapshot,
-  runId: string,
+  scope: Extract<EventScope, { kind: "run" }>,
   itemId: string,
   text: string,
   watermark: Watermark,
 ): FoldOutcome {
-  const live = liveRunAt(previous, runId);
+  const live = contentRunAt(previous, scope);
   if (live === undefined) return { ok: false, reason: "invalid-event" };
 
   const itemIndex = indexOfId(live.run.live, itemId, (item) => item.itemId);
@@ -239,11 +326,11 @@ function foldOutputDelta(
 
 function foldToolCall(
   previous: HostSnapshot,
-  runId: string,
+  scope: Extract<EventScope, { kind: "run" }>,
   item: Extract<LiveItem, { kind: "tool" }>,
   watermark: Watermark,
 ): FoldOutcome {
-  const live = liveRunAt(previous, runId);
+  const live = contentRunAt(previous, scope);
   if (live === undefined) return { ok: false, reason: "invalid-event" };
 
   // Item ids and invocation ids identify one occurrence each: a repeated
@@ -263,11 +350,11 @@ function foldToolCall(
 
 function foldToolResult(
   previous: HostSnapshot,
-  runId: string,
+  scope: Extract<EventScope, { kind: "run" }>,
   payload: { readonly invocationId: string; readonly ok: boolean; readonly content: string },
   watermark: Watermark,
 ): FoldOutcome {
-  const live = liveRunAt(previous, runId);
+  const live = contentRunAt(previous, scope);
   if (live === undefined) return { ok: false, reason: "invalid-event" };
 
   const itemIndex = live.run.live.findIndex(
@@ -296,6 +383,7 @@ function foldToolResult(
 
 function foldRunEnded(
   previous: HostSnapshot,
+  scope: Extract<EventScope, { kind: "run" }>,
   run: TerminalRunSnapshot,
   session: SessionSnapshot,
   watermark: Watermark,
@@ -303,6 +391,9 @@ function foldRunEnded(
   const runIndex = indexOfId(previous.runs, run.runId, (item) => item.runId);
   const sessionIndex = indexOfId(previous.sessions, session.sessionId, (item) => item.sessionId);
   if (runIndex < 0 || sessionIndex < 0) return { ok: false, reason: "invalid-event" };
+  if (scope.sessionId !== session.sessionId || scope.sessionId !== run.sessionId) {
+    return { ok: false, reason: "invalid-event" };
+  }
 
   const existing = previous.runs[runIndex];
   if (existing === undefined || existing.live === null) return { ok: false, reason: "invalid-event" };

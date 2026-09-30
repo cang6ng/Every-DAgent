@@ -248,3 +248,54 @@ describe("losing the connection", () => {
     }
   });
 });
+
+describe("the request the client remembers is the request it sent", () => {
+  it("checks a result against the parameters that travelled, not the caller's object", async () => {
+    const scenario = createScenario();
+    await scenario.ready();
+    const params = { sessionId: "original" };
+
+    const response = scenario.client.sessions.get(params);
+    params.sessionId = "changed-after-send";
+    scenario.host.respond(scenario.host.requestIdOf("sessions.get") ?? "", "sessions.get", {
+      session: sessionSnapshot({ sessionId: "original" }),
+    });
+
+    await expect(response).resolves.toMatchObject({ session: { sessionId: "original" } });
+    expect(scenario.client.getSnapshot().status).toBe("ready");
+  });
+
+  it("keeps a protocol failure on a sent write conservatively unknown", async () => {
+    const scenario = createScenario();
+    await scenario.ready();
+
+    const creating = scenario.client.sessions.create();
+    scenario.host.sendRaw(
+      JSON.stringify({
+        kind: "host-response",
+        protocolVersion: "1",
+        hostInstanceId: scenario.host.hostInstanceId,
+        requestId: scenario.host.requestIdOf("sessions.create") ?? "",
+        result: { wrong: "schema" },
+      }),
+    );
+
+    const failure = await creating.catch((error: unknown) => error);
+    expect(failure).toMatchObject({ kind: "protocol", code: "PROTOCOL_VIOLATION", outcome: "unknown" });
+    expect(scenario.client.getSnapshot().status).toBe("protocol-error");
+  });
+
+  it("keeps a control slot free when every ordinary slot is taken", async () => {
+    const scenario = createScenario();
+    await scenario.ready();
+
+    const ordinary = Array.from({ length: 128 }, () => scenario.client.sessions.list().catch(() => undefined));
+    await expect(scenario.client.resync()).resolves.toBeUndefined();
+
+    const refused = scenario.client.sessions.list();
+    await expect(refused).rejects.toMatchObject({ kind: "client", reason: "capacity" });
+
+    scenario.client.disconnect();
+    await Promise.all(ordinary);
+  });
+});
