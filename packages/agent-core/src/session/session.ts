@@ -58,20 +58,117 @@ export function restoreSession(id: string, events: readonly SessionEvent[]): Ses
         `session "${id}" cannot be restored: expected seq ${seq}, found seq ${event.seq}`,
       );
     }
+    recorded.push(freezeEvent(event));
+  }
 
-    // Frozen exactly the way `append` freezes: a restored event is no more mutable
-    // than a recorded one, down to the arrays the payload owns.
-    // One cast, as in `append`: the correlated union cannot be re-derived from a
-    // spread even though every branch is structurally identical here.
-    recorded.push(
-      Object.freeze({
-        ...event,
-        data: Object.freeze(ownedPayload({ ...event.data })),
-      }) as SessionEvent,
+  return new EventLogSession(id, recorded, events.length);
+}
+
+/**
+ * A bounded, contiguous window onto a session's committed log.
+ *
+ * A window exists because a long conversation must not be loaded whole to continue
+ * it. It carries the two positions a caller cannot derive from the array — where the
+ * window starts and where the session's committed log ends — so that `events()` is
+ * honestly "these recent turns" and `append` continues the real numbering rather than
+ * restarting from the array's length.
+ *
+ * The window must be a suffix of committed history: contiguous, in order, and ending
+ * exactly at `nextSeq`. `baseSeq === nextSeq` is the legal empty window (no turns
+ * loaded yet). Loading one is the caller's obligation — the array carries no session
+ * id — and a window that does not fit these rules is refused rather than repaired.
+ */
+export interface SessionWindow {
+  /** The seq of the window's first event. */
+  readonly baseSeq: number;
+  /** The session's committed next seq: the window covers exactly `[baseSeq, nextSeq)`. */
+  readonly nextSeq: number;
+  readonly events: readonly SessionEvent[];
+}
+
+/**
+ * Rebuilds a session from a bounded window of its committed log.
+ *
+ * Same immutability and numbering discipline as `restoreSession`, with two
+ * differences that are the whole point of the window: the log starts at `baseSeq`
+ * rather than 0, and the next `append` continues from `nextSeq` rather than from the
+ * number of loaded events. A window is a view, never a rewrite: nothing here removes,
+ * renumbers or re-stamps an event that is still in storage.
+ *
+ * What a window claims is deliberately narrow. `events()` and `deriveMessages()` speak
+ * for the loaded window only — they never assert the whole session — and a window that
+ * is not a contiguous, turn-complete suffix of committed history is refused, because a
+ * half-loaded turn would present a broken conversation as a whole one.
+ */
+export function restoreSessionWindow(id: string, window: SessionWindow): Session {
+  const { baseSeq, nextSeq, events } = window;
+  if (!Number.isSafeInteger(baseSeq) || !Number.isSafeInteger(nextSeq) || baseSeq < 0 || nextSeq < baseSeq) {
+    throw new Error(`session "${id}" cannot be windowed: [${baseSeq}, ${nextSeq}) is not a position range`);
+  }
+  if (events.length !== nextSeq - baseSeq) {
+    throw new Error(
+      `session "${id}" cannot be windowed: [${baseSeq}, ${nextSeq}) needs ${nextSeq - baseSeq} events, found ${events.length}`,
     );
   }
 
-  return new EventLogSession(id, recorded);
+  assertWindowShape(id, baseSeq, events);
+  return new EventLogSession(id, events.map(freezeEvent), nextSeq);
+}
+
+/**
+ * One event, frozen the way `append` freezes: the envelope and the payload are
+ * copied, and the arrays the payload owns are copied with it, so a restored event
+ * is no more mutable than a recorded one.
+ *
+ * One cast, as in `append`: the correlated union cannot be re-derived from a spread
+ * even though every branch is structurally identical here.
+ */
+function freezeEvent(event: SessionEvent): SessionEvent {
+  return Object.freeze({
+    ...event,
+    data: Object.freeze(ownedPayload({ ...event.data })),
+  }) as SessionEvent;
+}
+
+/**
+ * One window's shape, checked against what a committed log can contain.
+ *
+ * Two things are proven here and nothing else: the seqs run unbroken from `baseSeq`,
+ * and every turn the window holds is closed inside it. The second is what makes
+ * "these are complete turns" a fact rather than a hope — a window that opens or closes
+ * inside a turn, or that nests one turn inside another, is not a suffix of settled
+ * history and cannot be presented as one.
+ */
+function assertWindowShape(id: string, baseSeq: number, events: readonly SessionEvent[]): void {
+  let openTurn: string | undefined;
+
+  for (let index = 0; index < events.length; index++) {
+    const event = events[index];
+    if (event === undefined) {
+      throw new Error(`session "${id}" cannot be windowed: its window has a hole at index ${index}`);
+    }
+    if (event.seq !== baseSeq + index) {
+      throw new Error(
+        `session "${id}" cannot be windowed: expected seq ${baseSeq + index}, found seq ${event.seq}`,
+      );
+    }
+
+    if (event.type === "turn/start") {
+      if (openTurn !== undefined) {
+        throw new Error(`session "${id}" cannot be windowed: turn "${openTurn}" is still open at seq ${event.seq}`);
+      }
+      openTurn = event.turnId;
+      continue;
+    }
+    if (openTurn === undefined) {
+      throw new Error(`session "${id}" cannot be windowed: ${event.type} at seq ${event.seq} has no open turn`);
+    }
+    if (event.type === "turn/end") openTurn = undefined;
+  }
+
+  if (openTurn !== undefined) {
+    throw new Error(`session "${id}" cannot be windowed: the window ends inside turn "${openTurn}"`);
+  }
 }
 
 /**
@@ -95,10 +192,19 @@ function ownedPayload<T extends object>(data: T): T {
 class EventLogSession implements Session {
   readonly id: string;
   private readonly log: SessionEvent[];
+  /**
+   * The seq the next `append` will use.
+   *
+   * It is a number of its own, not `log.length`: a windowed session holds part of a
+   * longer log, and continuing the conversation must continue the real numbering
+   * rather than restart from the number of events this process happens to hold.
+   */
+  private nextSeq: number;
 
-  constructor(id: string, recorded: readonly SessionEvent[] = []) {
+  constructor(id: string, recorded: readonly SessionEvent[] = [], nextSeq: number = recorded.length) {
     this.id = id;
     this.log = [...recorded];
+    this.nextSeq = nextSeq;
   }
 
   append(input: SessionEventInput): SessionEvent {
@@ -107,11 +213,12 @@ class EventLogSession implements Session {
     const event = Object.freeze({
       type: input.type,
       turnId: input.turnId,
-      seq: this.log.length,
+      seq: this.nextSeq,
       time: Date.now(),
       data: Object.freeze(ownedPayload({ ...input.data })),
     }) as SessionEvent;
 
+    this.nextSeq += 1;
     this.log.push(event);
     return event;
   }

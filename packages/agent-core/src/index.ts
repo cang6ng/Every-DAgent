@@ -14,8 +14,8 @@ export type {
   TurnEndReason,
   TurnStartData,
 } from "./session/session-event.js";
-export { createSession, restoreSession } from "./session/session.js";
-export type { Session } from "./session/session.js";
+export { createSession, restoreSession, restoreSessionWindow } from "./session/session.js";
+export type { Session, SessionWindow } from "./session/session.js";
 export { createMemorySessionStore } from "./session/session-store.js";
 export type { SessionStore } from "./session/session-store.js";
 
