@@ -140,6 +140,7 @@ function coverage(items: readonly CanonicalItem[], parts: Partial<HistoryCoverag
     behind: false,
     nextCursor: null,
     items,
+    segments: [],
     ...parts,
   };
 }

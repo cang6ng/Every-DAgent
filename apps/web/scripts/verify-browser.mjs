@@ -52,7 +52,7 @@ const REQUIRED = [
       "marks a max-steps run as limited, not completed",
       "marks a failed run as failed and keeps its partial text out of history",
       "shows a plugin activation failure as a safe summary without a retry",
-      "renders a non-JSON tool input as unavailable and keeps tool text inert",
+      "refuses a non-JSON tool input before any tool runs, and keeps tool text inert",
       "renders a dangerous tool result as inert text without executing it",
     ],
   },

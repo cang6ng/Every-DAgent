@@ -6,8 +6,8 @@
  * The bar in every case is the same: the page says what actually happened and
  * nothing more. A cancel request is not a stop, `limited` is not a completion,
  * a failed run's draft is not history, an error plugin has no retry, and a
- * tool input the host could not project is shown as unavailable rather than
- * guessed at.
+ * tool step the durable profile cannot carry is refused before any tool runs —
+ * shown as the failure it is, never as a call that was guessed at.
  */
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -230,42 +230,33 @@ describe("the shell when things go wrong, in a real browser", () => {
   );
 
   it.skipIf(browser === undefined)(
-    "renders a non-JSON tool input as unavailable and keeps tool text inert",
+    "refuses a non-JSON tool input before any tool runs, and keeps tool text inert",
     async () => {
-      const { session } = await openShell();
+      const { acceptance, session } = await openShell();
 
-      await enablePlugin(session, "calculator");
+      await enablePlugin(session, "text-stats");
       await createSession(session);
       await sendText(session, "奇怪输入");
 
-      await session.waitFor(
-        'document.querySelector("[data-testid=tool-input-unavailable]") !== null ? "yes" : ""',
-        (value) => value === "yes",
-        20000,
-        "the unavailable input",
-      );
-      expect(await session.evaluate<string>(textOf('[data-testid="tool-input-unavailable"]'))).toContain("无法表示为 JSON");
-      // The failed tool result is shown as a failure, not explained away — and
-      // this waits for this round's result text itself rather than for a status
-      // that could have been reached by something else.
-      await session.waitFor(
-        textOf('[data-testid="tool-result-content"]'),
-        (value) => value.includes("finite"),
-        20000,
-        "this round's tool result text",
-      );
-      await session.waitFor(runStatus, (value) => value.includes("已完成"), 20000, "the run with a failed tool call to finish");
+      // The step cannot be part of a durable conversation, so it is refused
+      // before the tool is reached: the tool's own execution count stays zero,
+      // and the page is told the run failed rather than shown a tool call that
+      // never existed.
+      await session.waitFor(runStatus, (value) => value.includes("失败"), 20000, "the refused run to be shown as failed");
+      expect(acceptance.textStats.executions).toEqual([]);
+      expect(await session.evaluate<string>(countOf('[data-testid="tool-card"]'))).toBe("0");
+      expect(await session.evaluate<string>(countOf('[data-testid="tool-input-unavailable"]'))).toBe("0");
+      expect(await session.evaluate<string>(countOf('[data-testid="msg-assistant"]'))).toBe("0");
 
       // What a tool or a message carries is text, never a program. The echo
-      // being waited on has to be *this* round's: the first round already left
-      // an assistant message behind, so "any message containing 收到" would let
-      // these assertions run against the wrong output.
+      // being waited on has to be *this* round's: the refused round left no
+      // assistant message behind, so the first one that appears is this one.
       const scriptText = "<script>window.__pwned = 1</script>";
       await sendText(session, scriptText);
-      await session.waitFor(countOf('[data-testid="msg-assistant"]'), (value) => value === "2", 15000, "this round's echo to arrive");
+      await session.waitFor(countOf('[data-testid="msg-assistant"]'), (value) => value === "1", 15000, "this round's echo to arrive");
       expect(
         await session.evaluate<string>(
-          `document.querySelectorAll('[data-testid="msg-assistant"]')[1]?.textContent ?? ""`,
+          `document.querySelectorAll('[data-testid="msg-assistant"]')[0]?.textContent ?? ""`,
         ),
       ).toContain(scriptText);
       expect(await session.evaluate<boolean>('String(window.__pwned) === "undefined"')).toBe(true);

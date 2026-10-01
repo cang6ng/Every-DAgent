@@ -59,6 +59,7 @@ describe("dependency boundary", () => {
         "connection.ts",
         "dispatch.ts",
         "errors.ts",
+        "guard.ts",
         "history.ts",
         "host.ts",
         "index.ts",

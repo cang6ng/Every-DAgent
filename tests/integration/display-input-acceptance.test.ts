@@ -1,18 +1,22 @@
 /**
- * Acceptance J at the Host → Client boundary: what a tool input looks like
- * when it cannot be shown, and what it must not cost.
+ * Acceptance J at the Host → Client boundary: what happens to a tool input the
+ * durable JSON profile cannot carry.
  *
- * Every case here is a value JSON cannot carry: `undefined`, a bigint, a
- * non-finite number, a function, a sparse array, a `Date`, a `Map`, a class
- * instance, a cycle, and an object with its own `toJSON`. For each of them the
- * published projection must be an honest `unavailable` — not a subset, not a
- * cleaned-up copy, not the output of the user's `toJSON` — while the real tool
- * receives the original value, unchanged and exactly once. The JSON-safe case
- * is the other half: the projection is a complete deep snapshot, and later
- * edits to the original do not reach through it.
+ * v2 answers this before anything depends on it. Every case here is a value
+ * JSON cannot carry: `undefined`, a bigint, a non-finite number, a function, a
+ * sparse array, a `Date`, a `Map`, a class instance, a cycle, and an object with
+ * its own `toJSON`. For each of them the managed execution refuses the model
+ * step it arrived in — before the tool is dispatched, before an assistant record
+ * is written, before any canonical tool call exists — so the tool count is zero
+ * and nothing is fabricated to stand in for the call. A refused step is also
+ * not *read*: the guard never invokes an accessor or a `toJSON` to decide.
+ *
+ * The JSON-safe case is the other half: the projection is a complete deep
+ * snapshot, later edits to the original do not reach through it, and the tool
+ * still receives the object the model produced.
  */
 
-import type { JsonValue } from "@every-dagent/protocol";
+import type { CanonicalItem } from "@every-dagent/protocol";
 import { createClient } from "@every-dagent/client";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -47,16 +51,24 @@ const UNSHOWABLE: readonly Case[] = [
   { name: "a Map", value: new Map([["k", "v"]]) },
   { name: "a class instance", value: new (class Point { readonly x = 1 })() },
   { name: "a cycle", value: circular() },
-  { name: "a custom toJSON", value: { toJSON: (): JsonValue => "rewritten" } },
+  { name: "a custom toJSON", value: { toJSON: (): string => "rewritten" } },
 ];
 
 async function runWithInput(input: unknown): Promise<{
-  readonly projection: { readonly kind: string; readonly value?: unknown; readonly reason?: unknown } | null;
-  readonly received: unknown;
+  readonly canonical: readonly CanonicalItem[];
   readonly executions: number;
+  readonly received: unknown;
+  readonly status: string;
 }> {
   const fixture = demoPlugin("echo", "echo", "echo answered");
-  const model = scriptedModel([toolReply("call-1", "echo", input), textReply("done")]);
+  // The model repeats the same refused step — three scripted attempts, which is
+  // exactly what the loop's retry budget spends — so the turn ends as a model
+  // failure, deterministically, with no valid step to hide it.
+  const refusedStep = async function* (): AsyncGenerator<{ readonly type: "tool-call"; readonly call: { readonly callId: string; readonly name: string; readonly input: unknown } } | { readonly type: "done" }> {
+    yield { type: "tool-call", call: { callId: "call-1", name: "echo", input } };
+    yield { type: "done" };
+  };
+  const model = scriptedModel([refusedStep, refusedStep, refusedStep]);
   const platform = createHostPlatform({ modelClient: model.client, plugins: [fixture.plugin] });
   open.push({ close: () => platform.shutdown() });
 
@@ -66,34 +78,36 @@ async function runWithInput(input: unknown): Promise<{
   const { session } = await client.sessions.create();
   const started = await client.runs.start({
     sessionId: session.sessionId,
-    submissionId: `sub-${fixture.executions.length}`,
+    submissionId: `sub-${fixture.executions.length}-${String(input)}`,
     text: "use the tool",
   });
 
   await waitFor(() => runSettled(client.getSnapshot(), started.run.runId), { what: "the run to settle" });
   const canonical = (await client.sessions.history({ sessionId: session.sessionId })).page.items;
-  const call = canonical.find((item) => item.kind === "tool-call");
-  const projection =
-    call !== undefined && call.kind === "tool-call"
-      ? (call.input as { kind: string; value?: unknown; reason?: unknown })
-      : null;
+  const run = await client.runs.get({ runId: started.run.runId });
   client.disconnect();
 
   return {
-    projection,
-    received: fixture.executions[0]?.input,
+    canonical,
     executions: fixture.executions.length,
+    received: fixture.executions[0]?.input,
+    status: run.run.status,
   };
 }
 
 describe("a tool input the wire cannot carry", () => {
-  it.each(UNSHOWABLE)("projects $name as unavailable, and the real tool still gets it", async (testCase) => {
+  it.each(UNSHOWABLE)("refuses $name before the tool can run", async (testCase) => {
     const outcome = await runWithInput(testCase.value);
 
-    expect(outcome.projection).toEqual({ kind: "unavailable", reason: "not-json-safe" });
-    // The tool received the original value — the same reference — exactly once.
-    expect(outcome.executions).toBe(1);
-    expect(outcome.received).toBe(testCase.value);
+    // The step was refused, so nothing was dispatched and nothing was invented
+    // to stand in for the call that never became canonical.
+    expect(outcome.executions).toBe(0);
+    expect(outcome.received).toBeUndefined();
+    expect(outcome.canonical.some((item) => item.kind === "tool-call")).toBe(false);
+    expect(outcome.canonical.some((item) => item.kind === "tool-result")).toBe(false);
+    expect(outcome.canonical.some((item) => item.kind === "assistant")).toBe(false);
+    // And the run says so honestly instead of completing on a step it refused.
+    expect(outcome.status).toBe("failed");
   });
 });
 
@@ -110,7 +124,11 @@ describe("a tool input the wire can carry", () => {
     await client.connect();
     await client.plugins.enable({ pluginId: "echo" });
     const { session } = await client.sessions.create();
-    const started = await client.runs.start({ sessionId: session.sessionId, submissionId: "sub-snapshot", text: "use the tool" });
+    const started = await client.runs.start({
+      sessionId: session.sessionId,
+      submissionId: "sub-snapshot",
+      text: "use the tool",
+    });
 
     await waitFor(() => runSettled(client.getSnapshot(), started.run.runId), { what: "the run to settle" });
 

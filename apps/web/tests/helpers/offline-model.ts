@@ -179,10 +179,11 @@ export function offlineModel(): OfflineModel {
       return;
     }
 
-    if (text.includes(MARKER.exotic) && !sawToolResult(request, "calculator")) {
-      // `NaN` is not JSON; the host must project the input as unavailable
-      // rather than inventing a value for it. The real tool still receives it.
-      yield { type: "tool-call", call: { callId: nextCallId(), name: "calculator", input: { a: Number.NaN, b: 1 } } };
+    if (text.includes(MARKER.exotic) && !sawToolResult(request, "text-stats")) {
+      // `NaN` is not JSON, so a durable conversation cannot carry this step.
+      // The host refuses it before the tool can run: the acceptance asserts the
+      // refusal by counting the tool's own executions, which must stay at zero.
+      yield { type: "tool-call", call: { callId: nextCallId(), name: "text-stats", input: { text: Number.NaN } } };
       yield { type: "done" };
       return;
     }
