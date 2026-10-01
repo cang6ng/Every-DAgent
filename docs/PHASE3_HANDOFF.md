@@ -8,7 +8,7 @@
 | 项目 | 当前事实 |
 | --- | --- |
 | Branch | `rewrite/runtime-lite` |
-| Code baseline | `a104e96` — `test(web): add phase 3 shell acceptance coverage`；P3.4/P3.5 封存基线，随本次 sealing commit 一并 push。实现提交为 `83842c7` — `feat(web): add generic agent shell` |
+| Code baseline | `1dc71d4` — `test(web): verify live and canonical tool result safety`；最终 re-seal 的代码/测试基线（含 post-seal repair 链 `b8a5f85` → `426036e` → `9e21e4f` → `1dc71d4`），随本次 sealing commit 一并 push。P3.4/P3.5 交付提交为 `83842c7` — `feat(web): add generic agent shell` 与 `a104e96` — `test(web): add phase 3 shell acceptance coverage` |
 | Phase 3 SPEC baseline | `d5d1525a0c168651569ea99dd2fdb89f1fba6dc7` — `docs: freeze Phase 3 platform architecture`；规范内容未改，仅状态行随封存同步 |
 | Phase 1 | **COMPLETE**；历史真实 provider 人工 PASS 与自动验证证据见 Phase 1 HANDOFF |
 | Phase 2 | **COMPLETE**；四包已交付，独立复审与 HANDOFF 轻量审查 PASS，用户已确认封存；217 offline tests passed、Phase 2 real-provider NOT RUN |
@@ -17,39 +17,52 @@
 | P3.2 — Host Application Boundary | **COMPLETE**；`@every-dagent/host` 已实现，Targeted Re-review 最终 PASS |
 | P3.3 — Client Core + Transport Proof | **COMPLETE**；`@every-dagent/client` 与 `apps/web` transport 已实现，Final Closure Audit PASS（32/32 CLOSED） |
 | P3.4 — Generic Web Shell | **COMPLETE**；`apps/web` browser shell、应用服务器与构建已交付（`83842c7`） |
-| P3.5 — Platform Acceptance | **COMPLETE**；验收矩阵、真实浏览器 gate 与 focused implementation review 均 PASS（`a104e96`） |
-| Phase 3 | **COMPLETE**；P3.0–P3.5 全部交付并封存 |
-| Focused implementation review（P3.4/P3.5） | **PASS — 0 BLOCKER / 0 MAJOR / 6 MINOR**；6 项全部修复并有回归证据（见下） |
-| Phase 3 当前授权 | 仅本次封存（HANDOFF 更新、sealing commit、push）；**不授权 Phase 4**，不授权调用真实 provider |
-| Next | **Phase 4 未开始**；如需进入需新的授权与 Plan。Phase 3 SPEC §21 的 future scope 仍然成立 |
+| P3.5 — Platform Acceptance | **COMPLETE**；验收矩阵与真实浏览器 gate 交付（`a104e96`）；post-seal review 问题（R01–R12）全部修复后重新封板（`1dc71d4`） |
+| Phase 3 | **COMPLETE**；P3.0–P3.5 全部交付，R01–R12 = 12/12 CLOSED 后重新封板 |
+| Independent Focused Review（对已 push 的早期 seal 复核） | 初始 **FAIL — 0 BLOCKER / 5 MAJOR / 7 MINOR**（R01–R12）；post-seal repair 后 **R01–R12 = 12 / 12 CLOSED，0 BLOCKER / 0 MAJOR / 0 MINOR，READY TO RE-SEAL: YES**（历史与证据见下） |
+| Phase 3 当前授权 | 仅本次 re-seal（HANDOFF 更新、sealing commit、push）；**不授权 Phase 4**，不授权调用真实 provider |
+| Next | **Phase 3 重新封板完成，Phase 4 ready（未授权）**；如需进入需新的授权与 Plan。Phase 3 SPEC §21 的 future scope 仍然成立 |
 
 ### P3.4 / P3.5 Sealing Baseline / Verification
 
 P3.4 交付 `apps/web` 的 Generic Web Shell：browser 层（React，只消费 `@every-dagent/client` 公共入口与 `ClientSnapshot`）、应用服务器（page server + 原 P3.3 binding + 公开 `Host` 的组合）、构建（esbuild：page bundle + runnable server bundle）与命令行入口。原 P3.3 的七个 transport 文件、`apps/web` 三个 public exports、以及 `protocol`/`host`/`client`/`agent-core`/`plugin-system`/`plugin-calculator`/`model-pi-ai` 的生产代码与公共接口全部零改动。
 
-两个提交原样保留，未 squash/amend：
+交付与早期 seal 的提交原样保留，未 squash/amend：
 
-- `83842c7` — `feat(web): add generic agent shell`
-- `a104e96` — `test(web): add phase 3 shell acceptance coverage`
+- `83842c7` — `feat(web): add generic agent shell`（实现）
+- `a104e96` — `test(web): add phase 3 shell acceptance coverage`（验收）
+- `0f23000` — `docs: seal phase 3 platform`（早期 seal 文档，已 push）
 
-| 检查 | 实测结果（本轮） |
+早期 seal push 后，独立 focused review 判定 **FAIL（0 BLOCKER / 5 MAJOR / 7 MINOR，R01–R12）**。这是对已 push 的早期 seal 做的 post-seal repair；repair 按 finding 追加、原提交未 amend/未 squash：
+
+- `b8a5f85` — `fix(web): close the focused-review findings in the shell and page server`
+- `426036e` — `test(web): add a regression for each focused-review finding`
+- `9e21e4f` — `fix(web): close remaining focused-review gaps`
+- `1dc71d4` — `test(web): verify live and canonical tool result safety`（R11 残余：test-only gate 锁定 live 阶段，释放后再验证 canonical）
+
+最终裁决：**R01–R12 = 12 / 12 CLOSED；0 BLOCKER / 0 MAJOR / 0 MINOR OPEN；READY TO RE-SEAL: YES**。
+
+| 检查 | 实测结果（最终 re-seal 轮，code baseline `1dc71d4`） |
 | --- | --- |
-| `pnpm typecheck`（根 + `apps/web/tsconfig.browser.json`） | PASS |
-| Protocol + Host + Client tests | **508 PASS** |
-| Web（no-browser） | **164 PASS / 14 SKIP**（SKIP 全部为真实浏览器用例，离线按设计跳过） |
-| Memory carrier | **13 PASS** |
-| Platform acceptance | **20 PASS** |
-| Boundary / ownership（protocol/host/client/web/shell/public） | **48 PASS** |
-| Old offline regression（21 files） | **217 PASS**；既有测试完整保留 |
-| Full offline（显式排除 real-provider，no-browser） | **985 PASS / 14 SKIP / 0 FAIL**（82 files / 999 tests） |
-| Real Chrome browser acceptance（strict gate） | **14 / 14 PASS，0 SKIP**；真实 Chrome 153.0.8010.53 |
+| `pnpm typecheck`（根 + `apps/web/tsconfig.browser.json`） | PASS；browser 项目真实包含全部 **16 个 browser source** + `http-channel` + rendering test（program 实测；有回归防止 include 被继承的 `exclude` 静默清空） |
+| Protocol + Host + Client tests | **159 + 169 + 180 = 508 PASS** |
+| Web（no-browser） | **181 PASS / 16 SKIP**（SKIP 全部为真实浏览器用例，离线按设计跳过；SKIP 不计 PASS） |
+| 既有套件（`tests/integration` + agent-core / plugin-system / plugin-calculator / model-pi-ai） | **32 files / 313 PASS / 0 FAIL**（含 platform acceptance 20、memory carrier 13） |
+| Boundary / ownership | **19 PASS**（`boundary.test.ts` 11：七个 transport 文件的每个相对 import 按解析后的真实目标校验；`shell-boundary.test.ts` 8：三层分层与浏览器图） |
+| Old offline regression | 既有套件全部通过（见上，0 FAIL）；较早期记录数字只增不减 |
+| Full offline（显式排除 real-provider 与 `.zcode/**`，no-browser） | **1002 PASS / 16 SKIP / 0 FAIL**（83 files / 1018 tests） |
+| Real Chrome browser acceptance（strict gate） | **16 / 16 PASS，0 SKIP**；真实 Chrome 153.0.8010.53 |
 | `pnpm build:web` | PASS（`dist/server.mjs` + `dist/public/{index.html,styles.css,app.js}`） |
 | `git diff --check` | PASS |
 | Real provider | **NOT RUN** |
 
-真实浏览器 14 例 = 原 P3.3 transport smoke 1 例（保留未改）+ 新 Shell 13 例（连接与目录、流式完成、calculator 卡片、第二插件卡片、reload 恢复、busy 与取消、limited、failed、插件失败、非 JSON 输入与惰性文本、断线重连、丢应答待确认、Host 重启）。`node apps/web/scripts/verify-browser.mjs` 在缺少浏览器、用例改名、零收集或出现 SKIP/todo 时一律失败——离线 no-browser 结果与真实浏览器 PASS 分开记账。验收期间生成了页面截图用于人工视觉 sanity（连接态、完成态、工具卡片态），布局、可读性与状态呈现正常。
+真实浏览器 16 例 = 原 P3.3 transport smoke 1 例（保留未改）+ Shell 15 例（连接与目录、流式完成、calculator 卡片、第二插件卡片、late create 应答不夺 selection/草稿、reload 恢复、busy 与取消、limited、failed、插件失败、非 JSON 输入、危险 tool-result 惰性、断线重连、丢应答待确认、Host 重启）。`node apps/web/scripts/verify-browser.mjs` 在缺少浏览器、用例改名、零收集或出现 SKIP/todo 时一律失败——离线 no-browser 结果与真实浏览器 PASS 分开记账，绝不把 SKIP 记为 PASS。验收期间生成了页面截图用于人工视觉 sanity（连接态、完成态、工具卡片态），布局、可读性与状态呈现正常。
 
-Focused implementation review（范围：冻结架构边界、React 状态归属、Client 公共 API、reconnect/run UX、通用渲染、浏览器行为、测试覆盖）结论 **PASS（0 BLOCKER / 0 MAJOR / 6 MINOR）**，6 个 MINOR 全部修复：IPv6 loopback 拼写、`--binding` 启动错误未捕获、page 双拼写 origin 白名单、在途提交时的草稿清理、browser 项目 typecheck 接线、两个未使用导出；其中 4 项附带新增回归（含真实浏览器断言）。
+**最终能力（已交付、可用）**：Generic React Web Shell；React-free Client；会话列表 / 新建 / 选择（selection 绑定 hostInstanceId）；canonical + live 分离的会话渲染；流式输出；通用 tool call / result 卡片（含危险文本按 inert text 渲染，经真实工具路径与真实 Chrome 验收）；插件状态与生命周期 UI（error 插件无可操作按钮）；cancel / limited / failed / reconnect 的诚实呈现（cancel requested ≠ stopped、limited ≠ completed）；unknown-write outcome UX（不自动重发，显式查询或同 submissionId 重发）；真实 HTTP/SSE transport；reconnect / resync；browser / server 依赖隔离与严格 boundary 强制；真实 Chrome 严格验收 gate。
+
+**未改的冻结边界**：Protocol 独立（不依赖 Core / provider / UI）；Host 权威；Client React-free；`ClientSnapshot` 是 presentation truth；live ≠ canonical；accepted ≠ completed；cancel requested ≠ stopped；非幂等写入不自动 replay；production reverse 业务注册表仍为空、`host.describe` 仍声明 `reverseRequests=false`；AG-UI / MCP / MCP Apps 仍是未来 adapter 方向。
+
+早期 focused implementation review（范围：冻结架构边界、React 状态归属、Client 公共 API、reconnect/run UX、通用渲染、浏览器行为、测试覆盖）曾判定 PASS（0 BLOCKER / 0 MAJOR / 6 MINOR）并修复 6 项；随后对已 push 的 seal 复核判定 FAIL（0 / 5 / 7，R01–R12），repair 后 **12 / 12 CLOSED、0 / 0 / 0**。两段历史都在上方提交链中保留。
 
 新增 production dependency（已批准、精确锁版）：`react@19.3.0`、`react-dom@19.3.0`，以及 workspace 依赖 `@every-dagent/client`、`@every-dagent/host`。新增根 devDependencies：`esbuild@0.28.2`、`@types/react@19.3.0`、`@types/react-dom@19.3.0`。
 
@@ -128,13 +141,13 @@ P3.3 交付能力：React-free `@every-dagent/client`（connect / reconnect / re
 | P3.2 — Host Application Boundary | 组合、目录、执行协调、取消、投影、snapshot/subscription | **COMPLETE** |
 | P3.3 — Client Core + Transport Proof | React-free client、CLI fixture、一个 Web binding、双向 seam | **COMPLETE** |
 | P3.4 — Generic Web Shell | Chat/Sessions/Plugins/Host 状态与通用工具卡片 | **COMPLETE**；`83842c7` |
-| P3.5 — Platform Acceptance | 替换、竞争、断线、JSON 与兼容性验收及独立审查 | **COMPLETE**；`a104e96`，focused review PASS 后封存 |
+| P3.5 — Platform Acceptance | 替换、竞争、断线、JSON 与兼容性验收及独立审查 | **COMPLETE**；`a104e96` + post-seal repair 至 `1dc71d4`；R01–R12 全 CLOSED 后重新封板 |
 
 各 milestone 的 Goal / Deliverables / DoD / Forbidden Scope 见 SPEC §20；A/B/C/F/G/H/I/J/K 验收见 §19。本 HANDOFF 不复制全部 API、测试矩阵或逐文件实施步骤。
 
 ## 4. Next Window / Scope Discipline
 
-**Phase 3 已封存。Next = Phase 4（未授权）。**
+**Phase 3 已重新封板（PHASE 3 COMPLETE，READY FOR PHASE 4）；Phase 4 未授权。**
 
 此后如需进入 Phase 4 或扩展 v1 之外的任何能力，需要新的授权与 Plan；本文件存在不构成任何实施或 Git 授权。仍未交付的 future scope 见 §1（rich tool UI、HITL、OAuth、durable pause/resume、multi-agent、workflow、marketplace、hot reload、外部协议 adapter、desktop、Settings/凭据产品、真实 provider 的常规化）。
 
