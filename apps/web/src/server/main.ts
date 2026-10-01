@@ -219,10 +219,16 @@ export async function runShellCli(
     return code;
   }
 
-  let shell: ShellServer;
   let host: Host;
   try {
     host = await loadCompositionHost(parsed.mode.module);
+  } catch (error) {
+    io.err(error instanceof Error ? error.message : "the shell could not start");
+    return 1;
+  }
+
+  let shell: ShellServer;
+  try {
     shell = await startShellServer({
       host,
       staticRoot,
@@ -230,7 +236,19 @@ export async function runShellCli(
       ...(parsed.port === undefined ? {} : { port: parsed.port }),
     });
   } catch (error) {
+    // The host exists from here on, so a shell that cannot start must not walk
+    // away from it: an un-shut-down host keeps whatever the composition gave it
+    // — runtimes, plugins, timers — alive with no page ever attached.
     io.err(error instanceof Error ? error.message : "the shell could not start");
+    try {
+      await host.shutdown();
+    } catch (shutdownError) {
+      io.err(
+        `and the composed host could not be released: ${
+          shutdownError instanceof Error ? shutdownError.message : "unknown failure"
+        }`,
+      );
+    }
     return 1;
   }
 

@@ -16,7 +16,7 @@ export interface RunStripProps {
   readonly run: RunSnapshot;
   readonly cancelling: boolean;
   readonly canWrite: boolean;
-  readonly onCancel(runId: string): void;
+  onCancel(runId: string): void;
 }
 
 export function RunStrip(props: RunStripProps) {

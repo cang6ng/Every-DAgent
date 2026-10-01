@@ -19,7 +19,7 @@ export interface ComposerProps {
   readonly atRunLimit: boolean;
   readonly startingRun: boolean;
   /** Resolves `true` when the submission left the client (accepted or unknown). */
-  readonly onSend(text: string): Promise<boolean>;
+  onSend(text: string): Promise<boolean>;
 }
 
 export function Composer(props: ComposerProps) {

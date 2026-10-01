@@ -19,8 +19,8 @@ export interface SessionsPanelProps {
   readonly ui: ShellUiState;
   readonly selected: SessionSnapshot | null;
   readonly canWrite: boolean;
-  readonly onCreate(): void;
-  readonly onSelect(sessionId: string): void;
+  onCreate(): void;
+  onSelect(sessionId: string): void;
 }
 
 export function SessionsPanel(props: SessionsPanelProps) {

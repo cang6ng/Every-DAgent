@@ -94,24 +94,28 @@ export function Conversation(props: ConversationProps) {
                 <span className="msg__role">你</span>
                 <p className="msg__text">{activeRun.text}</p>
               </div>
-              {activeRun.live.map((item) =>
-                item.kind === "text" ? (
-                  <div className="msg msg--assistant msg--live" data-testid="live-text" key={item.itemId}>
-                    <span className="msg__role">助手（生成中）</span>
-                    <p className="msg__text">{item.text}</p>
-                  </div>
-                ) : (
-                  <ToolCallCard
-                    key={item.itemId}
-                    name={item.name}
-                    callId={item.callId}
-                    invocationId={item.invocationId}
-                    input={item.input}
-                    result={item.result}
-                    live
-                  />
-                ),
-              )}
+              {/* `activeRunOf` only ever hands over accepted/running runs, whose
+                  `live` is a timeline; the guard states that invariant where the
+                  union type cannot prove it. */}
+              {activeRun.live !== null &&
+                activeRun.live.map((item) =>
+                  item.kind === "text" ? (
+                    <div className="msg msg--assistant msg--live" data-testid="live-text" key={item.itemId}>
+                      <span className="msg__role">助手（生成中）</span>
+                      <p className="msg__text">{item.text}</p>
+                    </div>
+                  ) : (
+                    <ToolCallCard
+                      key={item.itemId}
+                      name={item.name}
+                      callId={item.callId}
+                      invocationId={item.invocationId}
+                      input={item.input}
+                      result={item.result}
+                      live
+                    />
+                  ),
+                )}
             </li>
           )}
         </ol>

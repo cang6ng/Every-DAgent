@@ -14,7 +14,7 @@
  * reachable from another machine would be a different security proposition.
  */
 
-import { createReadStream, statSync } from "node:fs";
+import { createReadStream, realpathSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { extname, join, resolve, sep } from "node:path";
@@ -64,14 +64,49 @@ function isLoopbackPeer(remote: string | undefined): boolean {
 }
 
 /**
+ * The path a request target names, or `undefined` when it cannot be parsed.
+ *
+ * The base is the origin this server answers on with brackets included, so an
+ * IPv6 address yields a URL the parser accepts. A target the parser rejects
+ * (`http://[`, an unbalanced bracket in an absolute-form request) is answered
+ * as a bad request by the caller rather than thrown here: a throw inside a
+ * request listener would take the whole page server down with it.
+ */
+function requestPath(target: string, host: string, port: number): string | undefined {
+  try {
+    return new URL(target, `http://${host}:${port}`).pathname;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether one resolved path is the other or lives under it. */
+function contains(root: string, candidate: string): boolean {
+  if (process.platform === "win32") {
+    // Windows paths are case-insensitive, and realpath keeps the on-disk
+    // spelling of each component, so both sides are compared case-folded.
+    const foldedRoot = root.toLowerCase();
+    const folded = candidate.toLowerCase();
+    return folded === foldedRoot || folded.startsWith(foldedRoot + sep);
+  }
+  return candidate === root || candidate.startsWith(root + sep);
+}
+
+/**
  * The file a request path names, or `undefined` when it names nothing inside
  * the root.
  *
  * The check is on the resolved path, not on the spelling: `..` segments, an
  * encoded slash, a NUL or an absolute path all end up either inside the root
  * or refused — there is no filter that a second decoding step could slip past.
+ *
+ * The second resolution is the physical one. A path can sit inside the root
+ * lexically and still point out of it — a symlink or a Windows junction works
+ * exactly that way — so the file that will actually be opened is resolved with
+ * `realpath` and checked against the root's real path too. An alias that stays
+ * inside the root keeps working; one that leaves is a miss.
  */
-function fileFor(root: string, requestPath: string): string | undefined {
+function fileFor(realRoot: string, root: string, requestPath: string): string | undefined {
   let decoded: string;
   try {
     decoded = decodeURIComponent(requestPath);
@@ -81,15 +116,14 @@ function fileFor(root: string, requestPath: string): string | undefined {
   if (decoded.includes("\0")) return undefined;
 
   const candidate = resolve(join(root, decoded));
-  if (candidate !== root && !candidate.startsWith(root + sep)) return undefined;
+  if (!contains(root, candidate)) return undefined;
 
   try {
     const stats = statSync(candidate);
-    if (stats.isDirectory()) {
-      const index = join(candidate, "index.html");
-      return statSync(index).isFile() ? index : undefined;
-    }
-    return stats.isFile() ? candidate : undefined;
+    const file = stats.isDirectory() ? join(candidate, "index.html") : candidate;
+    const real = realpathSync(file);
+    if (!contains(realRoot, real)) return undefined;
+    return statSync(real).isFile() ? real : undefined;
   } catch {
     return undefined;
   }
@@ -97,6 +131,16 @@ function fileFor(root: string, requestPath: string): string | undefined {
 
 export async function startStaticServer(options: StaticServerOptions): Promise<StaticServer> {
   const root = resolve(options.root);
+  // The root's physical location, resolved once: every served file is checked
+  // against it, so a link placed inside the root cannot become a way out of it.
+  // A root that does not exist keeps its lexical form — every request is a miss
+  // either way, and a page server is not the place to diagnose the layout.
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(root);
+  } catch {
+    realRoot = root;
+  }
   const address = options.address ?? "127.0.0.1";
   if (!isLoopbackAddress(address)) {
     throw new Error("the page server listens on loopback only");
@@ -154,8 +198,12 @@ export async function startStaticServer(options: StaticServerOptions): Promise<S
       return;
     }
 
-    const url = new URL(request.url ?? "/", `http://${address}:${port()}`);
-    const file = fileFor(root, url.pathname === "/" ? "/index.html" : url.pathname);
+    const path = requestPath(request.url ?? "/", host, port());
+    if (path === undefined) {
+      respond(request, response, 400, "bad request target");
+      return;
+    }
+    const file = fileFor(realRoot, root, path === "/" ? "/index.html" : path);
     if (file === undefined) {
       respond(request, response, 404, "not found");
       return;

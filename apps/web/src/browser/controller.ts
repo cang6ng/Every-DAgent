@@ -140,6 +140,21 @@ const MISUSE_HINTS: Readonly<Record<string, string>> = Object.freeze({
   capacity: "客户端的未完成请求已达上限",
 });
 
+/**
+ * The in-flight operation a plugin has, if it has one.
+ *
+ * The read is own-property only. A plugin id may legally be `constructor` (the
+ * protocol's id grammar allows it), and an unguarded `pending[id]` read would
+ * find `Object.prototype.constructor`, report the plugin as permanently busy,
+ * and lock it out of both lifecycle operations.
+ */
+export function pluginPendingOf(
+  pending: Readonly<Record<string, "enable" | "disable">>,
+  pluginId: string,
+): "enable" | "disable" | undefined {
+  return Object.hasOwn(pending, pluginId) ? pending[pluginId] : undefined;
+}
+
 /** One client error, as a sentence for a person. */
 export function explainError(error: unknown): string {
   if (error instanceof ClientError) {
@@ -320,10 +335,19 @@ function createController(internals: ControllerInternals): ShellController {
       // The instance is captured before the call: an instance observed after a
       // failure is not evidence of where the request went.
       const instance = describedHostInstance(client.getSnapshot());
+      // The selection the user had when the create started. A selection made
+      // *while* the answer was in flight is theirs — the late answer must not
+      // take it back, and with it the composer and the draft it holds.
+      const selectionBefore = state.selection;
       set({ creatingSession: true });
       try {
         const { session } = await client.sessions.create();
-        if (instance !== null) setSelection({ hostInstanceId: instance, sessionId: session.sessionId });
+        if (instance === null) return;
+        if (state.selection === selectionBefore) {
+          setSelection({ hostInstanceId: instance, sessionId: session.sessionId });
+        } else {
+          addNotice("info", "新会话已创建；你已切换到其他会话，未自动切换选择。");
+        }
       } catch (error) {
         await classifyWriteFailure(
           error,
@@ -384,7 +408,7 @@ function createController(internals: ControllerInternals): ShellController {
     },
 
     async setPluginEnabled(pluginId: string, enabled: boolean): Promise<void> {
-      if (state.pluginPending[pluginId] !== undefined) return;
+      if (pluginPendingOf(state.pluginPending, pluginId) !== undefined) return;
       const instance = describedHostInstance(client.getSnapshot());
       const operation = enabled ? "enable" : "disable";
       set({ pluginPending: Object.freeze({ ...state.pluginPending, [pluginId]: operation }) });

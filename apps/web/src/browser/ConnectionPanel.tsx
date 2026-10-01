@@ -20,9 +20,9 @@ import type { ShellUiState } from "./controller.js";
 export interface ConnectionPanelProps {
   readonly snapshot: ClientSnapshot;
   readonly ui: ShellUiState;
-  readonly onConnectTo(origin: string): void;
-  readonly onReconnect(): void;
-  readonly onDisconnect(): void;
+  onConnectTo(origin: string): void;
+  onReconnect(): void;
+  onDisconnect(): void;
 }
 
 export function ConnectionPanel(props: ConnectionPanelProps) {

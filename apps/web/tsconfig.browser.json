@@ -5,5 +5,7 @@
     "types": [],
     "jsx": "react-jsx"
   },
-  "include": ["src/client/http-channel.ts", "src/browser", "tests/shell-rendering.test.tsx"]
+  "include": ["src/client/http-channel.ts", "src/browser", "tests/shell-rendering.test.tsx"],
+  "//": "The root exclude (which keeps the browser half out of the Node project) is inherited and would silently drop this project's whole include; overriding it here is what makes the include real.",
+  "exclude": ["dist"]
 }

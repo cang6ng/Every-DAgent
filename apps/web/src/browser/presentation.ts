@@ -107,32 +107,47 @@ export function connectionView(snapshot: ClientSnapshot): StatusView {
   const hostNote = PRESENTATION_HOST_NOTES[snapshot.presentationHost];
   const errorNote =
     snapshot.error === null ? null : `${snapshot.error.message}（${snapshot.error.code}）`;
-  const detail = [errorNote, hostNote].filter((note) => note !== null).join(" ");
+  const hostAndError = [errorNote, hostNote].filter((note) => note !== null).join(" ");
+
+  // Every status that can still display a presentation says what that
+  // presentation is. A "正在同步" chip above a panel full of the previous
+  // host's sessions — or of the last synchronized ones — would otherwise read
+  // as if those facts had just been confirmed against the current host.
+  const staleNote = snapshot.stale ? "展示的是最后一次同步的内容。" : null;
+  const carried = [hostAndError, staleNote].filter((part) => part !== null && part !== "").join(" ");
+  const carriedOrNone = carried === "" ? null : carried;
 
   switch (snapshot.status) {
     case "disconnected":
-      return { label: "未连接", tone: "neutral", detail: detail === "" ? null : detail };
+      return { label: "未连接", tone: "neutral", detail: carriedOrNone };
     case "connecting":
-      return { label: "正在连接", tone: "active", detail: null };
+      return { label: "正在连接", tone: "active", detail: carriedOrNone };
     case "connected":
-      return { label: "已连接（未同步）", tone: "active", detail: null };
+      return { label: "已连接（未同步）", tone: "active", detail: carriedOrNone };
     case "syncing":
-      return { label: "正在同步", tone: "active", detail: null };
+      return { label: "正在同步", tone: "active", detail: carriedOrNone };
     case "ready":
       return snapshot.stale
-        ? { label: "已就绪（展示已过期）", tone: "warn", detail: hostNote ?? "展示的是最后一次同步的内容；写操作已停用。" }
+        ? {
+            label: "已就绪（展示已过期）",
+            tone: "warn",
+            detail:
+              hostNote === null
+                ? "展示的是最后一次同步的内容；写操作已停用。"
+                : `${hostNote} 展示的是最后一次同步的内容；写操作已停用。`,
+          }
         : { label: "已就绪", tone: "ok", detail: null };
     case "lost":
       return {
         label: "连接已断开",
         tone: "warn",
-        detail: `${detail === "" ? "" : `${detail} `}展示的是最后一次同步的内容；运行不会被自动取消。`,
+        detail: `${hostAndError === "" ? "" : `${hostAndError} `}展示的是最后一次同步的内容；运行不会被自动取消。`,
       };
     case "protocol-error":
       return {
         label: "协议错误（已停止）",
         tone: "error",
-        detail: `${detail === "" ? "" : `${detail} `}客户端已关闭该连接，不会自动无限重试。`,
+        detail: `${hostAndError === "" ? "" : `${hostAndError} `}客户端已关闭该连接，不会自动无限重试。`,
       };
   }
 }

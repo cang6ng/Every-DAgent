@@ -12,7 +12,7 @@
 import type { ClientSnapshot } from "@every-dagent/client";
 
 import { pluginFailureView } from "./presentation.js";
-import type { ShellUiState } from "./controller.js";
+import { pluginPendingOf, type ShellUiState } from "./controller.js";
 
 export interface PluginsPanelProps {
   readonly snapshot: ClientSnapshot;
@@ -20,7 +20,7 @@ export interface PluginsPanelProps {
   readonly canWrite: boolean;
   /** Any run in flight: the host admits no plugin mutation while one is. */
   readonly hostBusy: boolean;
-  readonly onSetEnabled(pluginId: string, enabled: boolean): void;
+  onSetEnabled(pluginId: string, enabled: boolean): void;
 }
 
 export function PluginsPanel(props: PluginsPanelProps) {
@@ -44,7 +44,7 @@ export function PluginsPanel(props: PluginsPanelProps) {
       ) : (
         <ul className="plugins">
           {plugins.map((plugin) => {
-            const busy = pending[plugin.id] !== undefined;
+            const busy = pluginPendingOf(pending, plugin.id) !== undefined;
             const transition = plugin.status === "enabling" || plugin.status === "disabling";
             const failed = plugin.status === "error";
             const blocked = !props.canWrite || props.hostBusy || busy;
