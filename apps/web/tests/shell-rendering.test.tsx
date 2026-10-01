@@ -116,6 +116,37 @@ describe("the connection chip and panel", () => {
     );
     expect(markup).toContain("断开连接不会取消正在运行的任务");
   });
+
+  it("keeps the previous-host and stale notes while a connection is not ready", () => {
+    // A panel full of the previous host's facts under a "正在同步" chip is
+    // exactly where a reader would take them for confirmed, current facts —
+    // every unsettled status has to keep saying what the presentation is.
+    for (const status of ["disconnected", "connecting", "connected", "syncing"] as const) {
+      const markup = renderToStaticMarkup(
+        <ConnectionPanel
+          snapshot={snapshot({ status, stale: true, presentationHost: "previous" })}
+          ui={uiState()}
+          onConnectTo={noop}
+          onReconnect={noop}
+          onDisconnect={noop}
+        />,
+      );
+      expect(markup, `${status} must carry the previous-host note`).toContain("展示的是上一个 Host 的内容，仅供参考。");
+      expect(markup, `${status} must carry the stale note`).toContain("展示的是最后一次同步的内容。");
+    }
+
+    // And a syncing page with nothing to show yet has nothing to warn about.
+    const empty = renderToStaticMarkup(
+      <ConnectionPanel
+        snapshot={snapshot({ status: "syncing", stale: false, presentation: null, presentationHost: "none" })}
+        ui={uiState()}
+        onConnectTo={noop}
+        onReconnect={noop}
+        onDisconnect={noop}
+      />,
+    );
+    expect(empty).not.toContain("展示的是最后一次同步的内容。");
+  });
 });
 
 describe("the conversation", () => {
@@ -254,6 +285,26 @@ describe("the plugin panel", () => {
     expect(markup).toContain("data-testid=\"plugins-busy\"");
     expect(markup).toContain("disabled");
   });
+
+  it("does not mistake an inherited property for a pending plugin", () => {
+    // A plugin id may legally be `constructor`; reading the pending map
+    // unguarded would find `Object.prototype.constructor` and render the
+    // plugin as permanently mid-operation, with its button disabled.
+    const inherited: readonly PluginSummary[] = [
+      { id: "constructor", name: "Constructor", version: "1.0.0", permissions: [], status: "disabled" },
+    ];
+    const markup = renderToStaticMarkup(
+      <PluginsPanel
+        snapshot={snapshot({ presentation: { hostInstanceId: INSTANCE, watermark: { streamId: "s", sequence: 1 }, sessions: [], runs: [], plugins: inherited } })}
+        ui={uiState()}
+        canWrite
+        hostBusy={false}
+        onSetEnabled={noop}
+      />,
+    );
+    expect(markup).toContain("data-testid=\"plugin-enable\" data-plugin-id=\"constructor\"");
+    expect(markup).not.toContain("启用中…");
+  });
 });
 
 describe("notices and unconfirmed writes", () => {
@@ -301,6 +352,47 @@ describe("notices and unconfirmed writes", () => {
     );
     expect(markup).toContain("Host 已更换");
     expect(markup).toContain("data-testid=\"unknown-refresh\"");
+  });
+
+  it("identifies each unconfirmed operation by the ids its panels use", () => {
+    // Two lost answers of the same kind are otherwise indistinguishable text:
+    // the record has to name the session, the submission, the run, the plugin
+    // or the host instance it concerns, in the same short forms used around it.
+    const markup = renderToStaticMarkup(
+      <NoticesPanel
+        ui={uiState({
+          unknownWrites: [
+            {
+              id: "u1",
+              kind: "start",
+              hostInstanceId: "11111111-2222-3333-4444-555555555555",
+              createdAt: 0,
+              sessionId: "aaaaaaaa-1111-2222-3333-444444444444",
+              submissionId: "bbbbbbbb-1111-2222-3333-444444444444",
+              text: "算一下 6*7 顺带解释一下每一步怎么来的，越详细越好",
+            },
+            { id: "u2", kind: "cancel", hostInstanceId: "11111111-2222-3333-4444-555555555555", createdAt: 0, runId: "cccccccc-1111-2222-3333-444444444444" },
+            { id: "u3", kind: "plugin", hostInstanceId: "11111111-2222-3333-4444-555555555555", createdAt: 0, pluginId: "calculator", operation: "disable" },
+          ],
+        })}
+        snapshot={snapshot()}
+        canWrite
+        onCheck={noop}
+        onResubmit={noop}
+        onRefresh={noop}
+        onDismiss={noop}
+        onDismissNotice={noop}
+      />,
+    );
+    expect(markup).toContain("data-testid=\"unknown-meta\"");
+    expect(markup).toContain("会话 aaaaaaaa");
+    expect(markup).toContain("提交 bbbbbbbb");
+    // The prompt is recognisable, and a long one is cut rather than dropped in.
+    expect(markup).toContain("内容「算一下 6*7 顺带解释一下每一步怎么来");
+    expect(markup).not.toContain("越详细越好");
+    expect(markup).toContain("运行 cccccccc");
+    expect(markup).toContain("插件 calculator · 停用");
+    expect(markup).toContain("Host 11111111");
   });
 });
 

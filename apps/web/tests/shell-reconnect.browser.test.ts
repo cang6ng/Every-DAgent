@@ -127,6 +127,9 @@ describe("the shell across reconnects, in a real browser", () => {
       // The host really did accept and run it, exactly once.
       await session.waitFor(countOf('[data-testid="unknown-item"]'), (value) => value === "1", 5000, "the unconfirmed record");
       expect(acceptance.model.requests.length).toBe(1);
+      // One submission on the wire, counted at the transport itself: a dedup on
+      // the host would hide a replay from every count below the binding.
+      expect(acceptance.controls.startRequests()).toBe(1);
 
       // After a reconnect the history shows the run; the record is still open
       // until the user resolves it, and nothing was sent twice.
@@ -135,6 +138,7 @@ describe("the shell across reconnects, in a real browser", () => {
       await session.waitFor(textOf('[data-testid="msg-assistant"]'), (value) => value.includes("收到：你好"), 15000, "the run the host really executed");
       expect(await session.evaluate<string>(countOf('[data-testid="unknown-item"]'))).toBe("1");
       expect(acceptance.model.requests.length).toBe(1);
+      expect(acceptance.controls.startRequests()).toBe(1);
 
       // The explicit check resolves it against the host.
       await session.click('[data-testid="unknown-check"]');
@@ -146,6 +150,7 @@ describe("the shell across reconnects, in a real browser", () => {
       );
       expect(await session.evaluate<boolean>('document.body.textContent.includes("已被 Host 接受")')).toBe(true);
       expect(acceptance.model.requests.length).toBe(1);
+      expect(acceptance.controls.startRequests()).toBe(1);
 
       expect(session.uncaughtExceptions()).toEqual([]);
     },
@@ -187,8 +192,10 @@ describe("the shell across reconnects, in a real browser", () => {
       await session.waitFor(textOf('[data-testid="sessions-empty"]'), (value) => value.length > 0, 10000, "the empty directory of the new host");
       expect(await session.evaluate<string>(countOf('[data-testid="msg-assistant"]'))).toBe("0");
       expect(await session.evaluate<string>(countOf('[data-testid="session-item"][data-selected=true]'))).toBe("0");
-      // And nothing was replayed onto it.
+      // And nothing was replayed onto it — stated as transport requests, so a
+      // replay the new host's dedup would swallow could not hide.
       expect(second.model.requests.length).toBe(0);
+      expect(second.controls.startRequests()).toBe(0);
 
       expect(session.uncaughtExceptions()).toEqual([]);
     },

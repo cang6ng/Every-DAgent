@@ -24,38 +24,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ProtocolChannel } from "@every-dagent/protocol";
 
 import { startHttpBinding } from "../src/index.js";
+import { findBrowser } from "./helpers/chrome-cdp.js";
 
 const FIXTURE = fileURLToPath(new URL("fixtures/transport-smoke.html", import.meta.url));
 
-const BROWSER_CANDIDATES = [
-  "C:/Program Files/Google/Chrome/Application/chrome.exe",
-  "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
-  "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
-  "/usr/bin/google-chrome",
-  "/usr/bin/chromium",
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-];
-
-/**
- * Whether this machine has a browser to run the smoke in.
- *
- * `EVERY_DAGENT_NO_BROWSER` exists so the reporting test can exercise the
- * missing-browser path on a machine that has one; it is a test hook, not a
- * production switch.
- */
-function findBrowser(): string | undefined {
-  if (process.env["EVERY_DAGENT_NO_BROWSER"] === "1") return undefined;
-  for (const candidate of BROWSER_CANDIDATES) {
-    try {
-      readFileSync(candidate);
-      return candidate;
-    } catch {
-      continue;
-    }
-  }
-  return undefined;
-}
-
+// The same probe the shell's browser files use, on purpose: the strict gate
+// names one browser via EVERY_DAGENT_BROWSER, and a smoke with its own private
+// list would be free to drive a different one — or none — while the gate
+// reported on what it found.
 const browser = findBrowser();
 
 async function delay(ms: number): Promise<void> {

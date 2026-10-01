@@ -10,8 +10,8 @@
  * could not quietly loosen anything that was already checked here.
  */
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -76,6 +76,64 @@ function importSpecifiers(source: string): string[] {
   return specifiers;
 }
 
+/** A relative specifier resolved against the file that wrote it, the way TypeScript resolves it. */
+function resolveRelative(from: string, specifier: string): string {
+  const base = posix.normalize(posix.join(posix.dirname(from), specifier)).replace(/\.js$/, "");
+  // A `.js` specifier may name a `.ts` or a `.tsx` file; probing for the file
+  // that actually exists is what lets the walk compare *targets*. A specifier
+  // that names nothing still resolves to a path — which is exactly why the
+  // caller must check the result against the allowed set.
+  for (const extension of [".ts", ".tsx"]) {
+    if (existsSync(join(srcRoot, base + extension))) return base + extension;
+  }
+  return `${base}.ts`;
+}
+
+/**
+ * The transport walk itself, with the source of a file injected.
+ *
+ * Every edge is judged by the file the specifier *resolves to*, not by the
+ * spelling of the specifier: a relative import that lands inside the server
+ * composition is an offender no matter how it is written — `../server/x.js`,
+ * a backslash spelling, a path that only normalizes after joining. The real
+ * tree is walked with `readFileSync`; the synthetic edge in the test below uses
+ * a stubbed reader to prove the rule itself, not just the current tree.
+ */
+function walkBrowserChannel(read: (file: string) => string | undefined): {
+  readonly visited: Set<string>;
+  readonly offenders: string[];
+} {
+  const visited = new Set<string>();
+  const offenders: string[] = [];
+  const queue = ["client/http-channel.ts"];
+
+  while (queue.length > 0) {
+    const file = queue.shift();
+    if (file === undefined || visited.has(file)) continue;
+    visited.add(file);
+    const source = read(file);
+    if (source === undefined) {
+      offenders.push(`${file}: could not be read`);
+      continue;
+    }
+    for (const specifier of importSpecifiers(source)) {
+      if (specifier === "@every-dagent/protocol") continue;
+      if (!specifier.startsWith(".")) {
+        offenders.push(`${file}: ${specifier}`);
+        continue;
+      }
+      const target = resolveRelative(file, specifier);
+      if (!TRANSPORT_FILES.includes(target)) {
+        offenders.push(`${file}: ${specifier} → ${target}`);
+        continue;
+      }
+      queue.push(target);
+    }
+  }
+
+  return { visited, offenders };
+}
+
 describe("dependency boundary", () => {
   it("keeps the source tree to the planned modules", () => {
     expect([...srcRelative].sort()).toEqual([...TRANSPORT_FILES, ...BROWSER_FILES, ...SERVER_FILES].sort());
@@ -110,38 +168,44 @@ describe("dependency boundary", () => {
     }
   });
 
-  it("keeps everything the browser entry can reach inside the browser half", () => {
-    // The entry is a real consuming path, so the check follows its imports
-    // rather than trusting that a file happened to stay small.
-    const visited = new Set<string>();
-    const queue = ["client/http-channel.ts"];
-    const offenders: string[] = [];
-
-    while (queue.length > 0) {
-      const file = queue.shift();
-      if (file === undefined || visited.has(file)) continue;
-      visited.add(file);
-      const source = readFileSync(join(srcRoot, file), "utf8");
-      for (const specifier of importSpecifiers(source)) {
-        // A browser module may reach its own files and the protocol contract —
-        // nothing else: no node builtin, no server implementation, no host.
-        const allowed = specifier === "@every-dagent/protocol" || specifier.startsWith(".");
-        if (!allowed || specifier.includes("server/")) {
-          offenders.push(`${file}: ${specifier}`);
-          continue;
-        }
-        // Only relative specifiers name a file to follow; the protocol package is
-        // a leaf this walk does not need to open.
-        if (!specifier.startsWith(".")) continue;
-        const resolved = join(file, "..", specifier).replace(/\\/g, "/").replace(/\.js$/, ".ts");
-        queue.push(resolved);
+  it("keeps everything the browser channel can reach inside the transport files", () => {
+    // The channel is a real consuming path, so the check follows its imports by
+    // resolving each relative specifier to the file it names — the transport
+    // may reach its own files and the protocol contract, and nothing else: no
+    // node builtin, no server implementation, no host.
+    const { visited, offenders } = walkBrowserChannel((file) => {
+      try {
+        return readFileSync(join(srcRoot, file), "utf8");
+      } catch {
+        return undefined;
       }
-    }
+    });
 
     expect(offenders).toEqual([]);
     // The graph really was walked: the transport primitives are in it.
     expect([...visited].some((file) => file.startsWith("transport/"))).toBe(true);
-    expect([...visited].some((file) => file.includes("server"))).toBe(false);
+    expect([...visited].every((file) => TRANSPORT_FILES.includes(file))).toBe(true);
+  });
+
+  it("refuses an edge into the server composition however the specifier is spelled", () => {
+    // The rule is about the resolved target, so an escape is caught by where it
+    // lands — including spellings a substring check would sail past.
+    const escapes = [
+      // The obvious one.
+      '../server/static-server.js',
+      // A spelling no `includes("server/")` catches.
+      '..\\server\\static-server.js',
+      // Resolves into the server composition only after normalization.
+      './.././server/main.js',
+      // A path that names nothing at all is not an allowed edge either.
+      '../server/not-a-file.js',
+    ];
+    for (const specifier of escapes) {
+      const { offenders } = walkBrowserChannel((file) =>
+        file === "client/http-channel.ts" ? `import { x } from ${JSON.stringify(specifier)};` : "",
+      );
+      expect(offenders, `${specifier} must be an offender`).not.toEqual([]);
+    }
   });
 
   it("carries no host, provider, UI or framework dependency in the transport", () => {

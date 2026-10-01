@@ -11,7 +11,8 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -30,6 +31,23 @@ let outDir: string;
 let pages: StaticServer;
 let shell: ShellServer;
 const closers: (() => Promise<void>)[] = [];
+
+/** One raw HTTP exchange, byte for byte, so a malformed target can be sent. */
+function rawRequest(port: number, payload: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    let received = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.write(payload));
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+    });
+    socket.on("close", () => {
+      resolve(received);
+    });
+    socket.on("error", reject);
+  });
+}
 
 async function waitFor(predicate: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -77,6 +95,62 @@ describe("the page server", () => {
     // path, not a way out of the root.
     expect((await fetch(`${pages.origin}/..%2f..%2fpackage.json`)).status).toBe(404);
     expect((await fetch(`${pages.origin}/`, { method: "POST" })).status).toBe(405);
+  });
+
+  it("serves pages over an IPv6 loopback base", async () => {
+    // `::1` used to be accepted as an address but crashed the process on the
+    // first request: the URL base was built from the raw address, and
+    // `http://::1:PORT` is not a URL anything can parse.
+    const ipv6 = await startStaticServer({ root: join(outDir, "public"), address: "::1" });
+    try {
+      expect(ipv6.origin.startsWith("http://[::1]:")).toBe(true);
+      const response = await fetch(`${ipv6.origin}/`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('id="root"');
+    } finally {
+      await ipv6.close();
+    }
+  });
+
+  it("follows a link that stays inside the root and refuses one that leaves it", async () => {
+    // A symlink or junction inside the root is a path that is lexically inside
+    // and physically outside; only resolving the physical target tells them
+    // apart, and only the alias that stays in may be served.
+    const rootDir = join(outDir, "link-root");
+    const escapeDir = join(outDir, "link-outside");
+    mkdirSync(join(rootDir, "inner"), { recursive: true });
+    mkdirSync(escapeDir, { recursive: true });
+    writeFileSync(join(rootDir, "index.html"), "<!doctype html><p>inside</p>");
+    writeFileSync(join(rootDir, "inner", "page.html"), "<!doctype html><p>inner</p>");
+    writeFileSync(join(escapeDir, "secret.txt"), "should-never-be-served");
+    writeFileSync(join(escapeDir, "index.html"), "should-never-be-served either");
+    const linkType = process.platform === "win32" ? "junction" : "dir";
+    symlinkSync(join(rootDir, "inner"), join(rootDir, "alias"), linkType);
+    symlinkSync(escapeDir, join(rootDir, "escape"), linkType);
+
+    const server = await startStaticServer({ root: rootDir });
+    try {
+      expect((await fetch(`${server.origin}/alias/page.html`)).status).toBe(200);
+      expect((await fetch(`${server.origin}/escape/secret.txt`)).status).toBe(404);
+      expect((await fetch(`${server.origin}/escape/`)).status).toBe(404);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("answers a malformed request target instead of dying with it", async () => {
+    // A request target the URL parser refuses must be a 400 on that one
+    // connection — not an exception thrown inside the request listener, which
+    // would end the process and every other page request with it.
+    const port = Number(new URL(pages.origin).port);
+    const malformed = await rawRequest(
+      port,
+      `GET http://[ HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`,
+    );
+    expect(malformed).toContain("400");
+
+    const still = await fetch(`${pages.origin}/`);
+    expect(still.status).toBe(200);
   });
 });
 
@@ -170,6 +244,42 @@ describe("the shell command line", () => {
 
     expect(code).toBe(0);
     expect(pageStatus).toBe(200);
+  });
+
+  it("shuts the composed host down when the page server cannot start", async () => {
+    // The host exists before the page server is even attempted, so a shell that
+    // refuses to start must release it: otherwise the composition's runtime and
+    // plugins stay alive with no page that could ever attach.
+    const marker = join(outDir, "host-shutdown.marker");
+    const compositionPath = join(outDir, "composition-failing-start.mjs");
+    writeFileSync(
+      compositionPath,
+      [
+        'import { writeFileSync } from "node:fs";',
+        'import { createHost } from "./server.mjs";',
+        "export function createShellHost() {",
+        '  const host = createHost({ modelClient: { stream: async function* () { yield { type: "done" }; } }, plugins: [] });',
+        "  return {",
+        "    attach: (channel) => host.attach(channel),",
+        `    shutdown: async () => { await host.shutdown(); writeFileSync(${JSON.stringify(marker)}, "released"); },`,
+        "  };",
+        "}",
+        "",
+      ].join("\n"),
+    );
+
+    const lines: string[] = [];
+    const io = { out: (line: string) => lines.push(line), err: (line: string) => lines.push(line) };
+    try {
+      // `0.0.0.0` is not loopback: the page server refuses it, deterministically.
+      const code = await runShellCli(["--composition", compositionPath, "--address", "0.0.0.0"], io);
+      expect(code).toBe(1);
+      expect(lines.join("\n")).toContain("loopback only");
+      expect(existsSync(marker), "the composed host must have been shut down").toBe(true);
+    } finally {
+      rmSync(compositionPath, { force: true });
+      rmSync(marker, { force: true });
+    }
   });
 
   it("composes a host from a module, serves it, and closes on the stop signal", async () => {

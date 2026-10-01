@@ -222,16 +222,31 @@ describe("the shell when things go wrong, in a real browser", () => {
         "the unavailable input",
       );
       expect(await session.evaluate<string>(textOf('[data-testid="tool-input-unavailable"]'))).toContain("无法表示为 JSON");
-      // The failed tool result is shown as a failure, not explained away.
+      // The failed tool result is shown as a failure, not explained away — and
+      // this waits for this round's result text itself rather than for a status
+      // that could have been reached by something else.
+      await session.waitFor(
+        textOf('[data-testid="tool-result-content"]'),
+        (value) => value.includes("finite"),
+        20000,
+        "this round's tool result text",
+      );
       await session.waitFor(runStatus, (value) => value.includes("已完成"), 20000, "the run with a failed tool call to finish");
-      expect(await session.evaluate<string>(textOf('[data-testid="tool-result-content"]'))).toContain("finite");
 
-      // What a tool or a message carries is text, never a program.
-      await sendText(session, '<script>window.__pwned = 1</script>');
-      await session.waitFor(textOf('[data-testid="msg-assistant"]'), (value) => value.includes("收到："), 15000, "the echo");
+      // What a tool or a message carries is text, never a program. The echo
+      // being waited on has to be *this* round's: the first round already left
+      // an assistant message behind, so "any message containing 收到" would let
+      // these assertions run against the wrong output.
+      const scriptText = "<script>window.__pwned = 1</script>";
+      await sendText(session, scriptText);
+      await session.waitFor(countOf('[data-testid="msg-assistant"]'), (value) => value === "2", 15000, "this round's echo to arrive");
+      expect(
+        await session.evaluate<string>(
+          `document.querySelectorAll('[data-testid="msg-assistant"]')[1]?.textContent ?? ""`,
+        ),
+      ).toContain(scriptText);
       expect(await session.evaluate<boolean>('String(window.__pwned) === "undefined"')).toBe(true);
       expect(await session.evaluate<boolean>('document.querySelectorAll("img").length === 0')).toBe(true);
-      expect(await session.evaluate<boolean>('document.body.textContent.includes("<script>window.__pwned = 1</script>")')).toBe(true);
 
       expect(session.uncaughtExceptions()).toEqual([]);
     },

@@ -189,6 +189,40 @@ describe("the generic shell in a real browser", () => {
   );
 
   it.skipIf(browser === undefined)(
+    "keeps a newer selection and its draft when a create answer arrives late",
+    async () => {
+      const { acceptance, session } = await openShell();
+
+      const first = await createSession(session);
+      await createSession(session);
+
+      // The next create answer is held back — parked, not dropped — and the
+      // user moves on before it lands: picks another session, types a draft.
+      acceptance.controls.holdNextCreateAnswer();
+      await session.click('[data-testid="new-session"]');
+      await session.click(`[data-testid="session-item"][data-session-id="${first}"]`);
+      await session.type('[data-testid="composer-input"]', "还没发出去的草稿");
+
+      const selectedId =
+        `document.querySelector('[data-testid="session-item"][data-selected="true"]')?.getAttribute("data-session-id") ?? ""`;
+      const draft = `document.querySelector('[data-testid="composer-input"]')?.value ?? ""`;
+      expect(await session.evaluate<string>(selectedId)).toBe(first);
+      expect(await session.evaluate<string>(draft)).toBe("还没发出去的草稿");
+
+      acceptance.controls.releaseCreateAnswer();
+
+      // The late answer lands — the new session shows up in the list...
+      await session.waitFor(countOf('[data-testid="session-item"]'), (value) => value === "3", 15000, "the created session to appear");
+      // ...and neither the user's selection nor the draft in it moved.
+      expect(await session.evaluate<string>(selectedId)).toBe(first);
+      expect(await session.evaluate<string>(draft)).toBe("还没发出去的草稿");
+
+      expect(session.uncaughtExceptions()).toEqual([]);
+    },
+    90000,
+  );
+
+  it.skipIf(browser === undefined)(
     "restores the session selection after a page reload",
     async () => {
       const { acceptance, session } = await openShell();

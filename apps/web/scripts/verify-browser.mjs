@@ -41,6 +41,7 @@ const REQUIRED = [
       "creates a session and completes a streamed run",
       "shows calculator calls and results as generic cards",
       "shows a second plugin's tool through the same generic card",
+      "keeps a newer selection and its draft when a create answer arrives late",
       "restores the session selection after a page reload",
     ],
   },

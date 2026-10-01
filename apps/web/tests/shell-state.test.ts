@@ -328,6 +328,30 @@ describe("sessions and selection", () => {
     expect(controller.getState().creatingSession).toBe(false);
   });
 
+  it("keeps a selection the user made while a create was still in flight", async () => {
+    // The late answer belongs to a request from before the user picked another
+    // session; selecting the new session here would take back that choice — and
+    // with it the composer and whatever draft it was holding.
+    const { client, storage, controller } = makeController();
+    let release: (() => void) | undefined;
+    client.onCreate = () =>
+      new Promise((resolve) => {
+        release = () => {
+          resolve({ session: sessionFixture("session-9") });
+        };
+      });
+
+    const creating = controller.createSession();
+    controller.selectSession("session-4");
+    release?.();
+    await creating;
+
+    expect(controller.getState().selection).toEqual({ hostInstanceId: INSTANCE, sessionId: "session-4" });
+    expect(storage.read()).toEqual({ hostInstanceId: INSTANCE, sessionId: "session-4" });
+    // Silence would leave the user wondering where the new session went.
+    expect(controller.getState().notices.at(-1)?.text).toContain("未自动切换");
+  });
+
   it("scopes a selection to the presentation's host", () => {
     const { controller } = makeController(
       snapshotFixture({ presentation: presentationFixture({ hostInstanceId: "another-host" }) }),
@@ -365,6 +389,33 @@ describe("cancel and plugin operations", () => {
     expect(controller.getState().unknownWrites).toHaveLength(1);
     expect(controller.getState().notices.at(-1)?.text).toContain("插件当前不可操作");
     expect(controller.getState().pluginPending).toEqual({});
+  });
+
+  it("treats a plugin id that names an inherited property like any other id", async () => {
+    // `constructor` is a legal plugin id under the protocol's id grammar, and
+    // the pending map is a plain record: an unguarded read finds
+    // `Object.prototype.constructor` and the plugin is locked out of both
+    // operations as if one were always in flight.
+    const { client, controller } = makeController();
+    let release: (() => void) | undefined;
+    client.onEnable = () =>
+      new Promise((resolve) => {
+        release = () => {
+          resolve({ plugin: pluginFixture("constructor", "enabled") });
+        };
+      });
+
+    const enabling = controller.setPluginEnabled("constructor", true);
+    // Own property, not the inherited one: the operation really started.
+    expect(Object.hasOwn(controller.getState().pluginPending, "constructor")).toBe(true);
+    release?.();
+    await enabling;
+
+    expect(client.calls.filter((call) => call.method === "plugins.enable")).toHaveLength(1);
+    expect(controller.getState().pluginPending).toEqual({});
+    // Not busy, and not a lost answer: an ordinary operation, correctly recorded.
+    expect(controller.getState().notices.filter((notice) => notice.tone === "error")).toEqual([]);
+    expect(controller.getState().unknownWrites).toEqual([]);
   });
 });
 

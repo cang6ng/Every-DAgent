@@ -30,10 +30,22 @@ export interface ShellControls {
   dropNextStartResponse(): void;
   /** How many times a response was dropped this way. */
   readonly drops: number;
+  /** Holds the next `sessions.create` answer until `releaseCreateAnswer` is called. */
+  holdNextCreateAnswer(): void;
+  /** Releases a held create answer, if one is held. */
+  releaseCreateAnswer(): void;
   /** Ends every open connection without touching the host or its runs. */
   closeConnections(): void;
   /** Open logical connections, as the binding sees them. */
   connections(): number;
+  /**
+   * Every `runs.start` request that actually crossed the binding.
+   *
+   * This is the count "nothing was replayed" has to be stated in: a host's
+   * submission dedup would swallow a duplicate request, and a model request
+   * count would never see it — only the transport sees what was really sent.
+   */
+  startRequests(): number;
 }
 
 /**
@@ -118,21 +130,26 @@ function createWard(): Ward {
   const connections = new Set<ProtocolChannel>();
   let armed = false;
   let drops = 0;
+  let holdCreate = false;
+  let heldCreateAnswer: (() => void) | null = null;
+  let startRequestsSeen = 0;
 
   return {
     wrap: (channel: ProtocolChannel): ProtocolChannel => {
       connections.add(channel);
       /** The request ids this connection carries that belong to `runs.start`. */
-      const startRequests = new Set<string>();
+      const startRequestIds = new Set<string>();
+      /** The request ids this connection carries that belong to `sessions.create`. */
+      const createRequests = new Set<string>();
       return {
         send(frame: string): void {
+          const parsed = safeParse(frame);
           if (armed) {
-            const parsed = safeParse(frame);
             if (
               parsed !== null &&
               parsed.kind === "host-response" &&
               typeof parsed.requestId === "string" &&
-              startRequests.has(parsed.requestId)
+              startRequestIds.has(parsed.requestId)
             ) {
               // The answer is lost with the connection that carried it: the
               // client can no longer learn whether the host accepted the run.
@@ -143,19 +160,33 @@ function createWard(): Ward {
               return;
             }
           }
+          if (
+            holdCreate &&
+            parsed !== null &&
+            parsed.kind === "host-response" &&
+            typeof parsed.requestId === "string" &&
+            createRequests.has(parsed.requestId)
+          ) {
+            // Parked, not dropped: the answer exists and will arrive, just not
+            // yet — the window a user gets to move on before it lands.
+            holdCreate = false;
+            heldCreateAnswer = () => {
+              channel.send(frame);
+            };
+            return;
+          }
           channel.send(frame);
         },
         listen(listener): () => void {
           return channel.listen({
             onFrame(frame: string): void {
               const parsed = safeParse(frame);
-              if (
-                parsed !== null &&
-                parsed.kind === "client-request" &&
-                parsed.method === "runs.start" &&
-                typeof parsed.requestId === "string"
-              ) {
-                startRequests.add(parsed.requestId);
+              if (parsed !== null && parsed.kind === "client-request" && typeof parsed.requestId === "string") {
+                if (parsed.method === "runs.start") {
+                  startRequestIds.add(parsed.requestId);
+                  startRequestsSeen += 1;
+                }
+                if (parsed.method === "sessions.create") createRequests.add(parsed.requestId);
               }
               listener.onFrame(frame);
             },
@@ -177,6 +208,14 @@ function createWard(): Ward {
       get drops(): number {
         return drops;
       },
+      holdNextCreateAnswer(): void {
+        holdCreate = true;
+      },
+      releaseCreateAnswer(): void {
+        const resume = heldCreateAnswer;
+        heldCreateAnswer = null;
+        resume?.();
+      },
       closeConnections(): void {
         for (const channel of [...connections]) {
           connections.delete(channel);
@@ -185,6 +224,9 @@ function createWard(): Ward {
       },
       connections(): number {
         return connections.size;
+      },
+      startRequests(): number {
+        return startRequestsSeen;
       },
     },
   };
