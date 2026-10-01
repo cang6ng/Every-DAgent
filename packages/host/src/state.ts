@@ -32,11 +32,12 @@ import type {
   SessionSummary,
   TerminalRunSnapshot,
 } from "@every-dagent/protocol";
+import { MAX_TITLE_CHARS, PROTOCOL_VERSION, encodeFrame } from "@every-dagent/protocol";
 
 import { storedProtocolError } from "./errors.js";
-import { encodeCursor, readSessionPage } from "./history.js";
+import { encodeCursor, readSessionPage, sessionSummaryOf } from "./history.js";
 import type { Lease, RegistryGate } from "./registry-gate.js";
-import { encodedBytes, type Repository, type RunRecord } from "./repository.js";
+import { encodedBytes, heaviestAcceptedText, type Repository, type RunRecord, type SessionRecord } from "./repository.js";
 import type { ReverseOutcome, ReverseProfile, ReverseTimer } from "./reverse.js";
 
 /**
@@ -564,6 +565,177 @@ export function captureHostSnapshot(state: HostState, streamId: string): HostSna
   }
 
   return snapshot;
+}
+
+// ---------------------------------------------------------------------------
+// What a cut can never shrink away.
+// ---------------------------------------------------------------------------
+
+/** The shape of every identity this host or the Core mints: a UUID's 36 bytes. */
+const MINTED_ID = "00000000-0000-4000-8000-000000000000";
+
+/**
+ * The unshrinkable core of one published cut.
+ *
+ * A snapshot may honestly reduce itself — terminal runs and sessions that point
+ * at no run are windows — but two things it can never drop: the session that
+ * owns the executing run, and that run. The static catalogue travels with every
+ * cut as well. Those three, composed from the same DTO builders the real cut
+ * uses, are exactly the frame a client would be sent; that is what makes this
+ * the right thing for a check made before the state exists.
+ */
+export function snapshotCoreOf(
+  state: HostState,
+  streamId: string,
+  session: SessionSummary,
+  run: RunSummary,
+): HostSnapshot {
+  const revisions = state.repository.revisions;
+  return Object.freeze({
+    hostInstanceId: state.hostInstanceId,
+    watermark: Object.freeze({ streamId, sequence: 0 }),
+    storage: Object.freeze({
+      storageId: state.repository.storageId,
+      retention: state.repository.retention,
+      schemaVersion: state.repository.schemaVersion,
+    }),
+    collections: revisions,
+    sessions: Object.freeze({
+      items: Object.freeze([session]),
+      collectionRevision: revisions.sessions,
+      nextCursor: null,
+      hasMore: false,
+    }),
+    runs: Object.freeze({
+      items: Object.freeze([run]),
+      collectionRevision: revisions.runs,
+      nextCursor: null,
+      hasMore: false,
+    }),
+    plugins: Object.freeze(state.pluginOrder.map((pluginId) => pluginSummaryOf(state, pluginId))),
+  });
+}
+
+/**
+ * The heaviest run summary one legal execution can produce.
+ *
+ * The accepted input is the store's own record bound, escaped the way the frame
+ * will escape it, and every identity is the size the host mints them at; the
+ * status is the one a run reaches while it can still be executing, which is the
+ * heaviest terminal-less shape a cut has to carry.
+ */
+function heaviestRunSummary(state: HostState, sessionId: string, runId: string): RunSummary {
+  return runSummaryOfRecord(
+    Object.freeze({
+      runId,
+      submissionId: MINTED_ID,
+      sessionId,
+      text: heaviestAcceptedText(state.limits.maxRecordBytes),
+      acceptedAt: 0,
+      startedAt: 0,
+      endedAt: null,
+      hostInstanceId: state.hostInstanceId,
+      status: "running" as const,
+      endReason: null,
+      errorCode: null,
+      executionKnowledge: null,
+      turnId: MINTED_ID,
+      cancelRequested: false,
+    }),
+    null,
+  );
+}
+
+/**
+ * The heaviest cut a legal state can force.
+ *
+ * Used where a state does not exist yet: at startup, to refuse a configuration
+ * that leaves no room for any run at all, and before an admission, to refuse an
+ * input whose accepted run could never be published inside one frame.
+ */
+export function snapshotOfHeaviestState(state: HostState, streamId: string): HostSnapshot {
+  const sessionId = MINTED_ID;
+  const runId = MINTED_ID;
+  const session = sessionSummaryOf({
+    sessionId,
+    generation: 1,
+    // A title is bounded in code units, so the heaviest one is made of units
+    // that escape the most: an unpaired surrogate costs six bytes in JSON.
+    title: "\ud800".repeat(MAX_TITLE_CHARS),
+    createdAt: 0,
+    updatedAt: 0,
+    metadataRevision: 0,
+    historyRevision: 0,
+    committedSeq: 0,
+    status: "ready",
+    blockedReason: null,
+    activeRunId: runId,
+  });
+  return snapshotCoreOf(state, streamId, session, heaviestRunSummary(state, sessionId, runId));
+}
+
+/**
+ * The heaviest cut one specific admission would force.
+ *
+ * Same composition as the general case, but with the input and the submission
+ * identity the caller actually offered, and the session summary exactly as the
+ * admission transaction will leave it — so the frame checked is the frame the
+ * accepted run would have to travel in.
+ */
+export function snapshotOfProspectiveRun(
+  state: HostState,
+  streamId: string,
+  session: SessionRecord,
+  offer: { readonly runId: string; readonly submissionId: string; readonly text: string; readonly acceptedAt: number },
+): HostSnapshot {
+  const summary = sessionSummaryOf({
+    ...session,
+    activeRunId: offer.runId,
+    metadataRevision: session.metadataRevision + 1,
+    updatedAt: offer.acceptedAt,
+  });
+  const run = runSummaryOfRecord(
+    Object.freeze({
+      runId: offer.runId,
+      submissionId: offer.submissionId,
+      sessionId: session.sessionId,
+      text: offer.text,
+      acceptedAt: offer.acceptedAt,
+      // The clock order a running run must show: acceptance first, a start at
+      // or after it, and no end.
+      startedAt: offer.acceptedAt,
+      endedAt: null,
+      hostInstanceId: state.hostInstanceId,
+      status: "running" as const,
+      endReason: null,
+      errorCode: null,
+      executionKnowledge: null,
+      turnId: MINTED_ID,
+      cancelRequested: false,
+    }),
+    null,
+  );
+  return snapshotCoreOf(state, streamId, summary, run);
+}
+
+/**
+ * Whether one composed cut fits the frame it has to travel in.
+ *
+ * The protocol's own encoder decides it, on the frame a subscriber would really
+ * be sent — so a check made before a state exists and the response a client
+ * later receives are never two different questions.
+ */
+export function snapshotFrameFits(state: HostState, snapshot: HostSnapshot): boolean {
+  return encodeFrame(
+    { kind: "host-response", method: "subscriptions.open" },
+    {
+      kind: "host-response",
+      protocolVersion: PROTOCOL_VERSION,
+      hostInstanceId: state.hostInstanceId,
+      requestId: "prepare",
+      result: { snapshot },
+    },
+  ).success;
 }
 
 /** The last position a predicate accepts, or -1. */

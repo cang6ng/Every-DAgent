@@ -132,11 +132,17 @@ describe("a tool input the wire can carry", () => {
 
     await waitFor(() => runSettled(client.getSnapshot(), started.run.runId), { what: "the run to settle" });
 
-    // The tool really received the original object.
-    expect(fixture.executions[0]?.input).toBe(original);
+    // The tool received that value as an owned copy — the same facts, not the
+    // caller's object: the input is isolated the moment the host takes the call
+    // over, so nothing the provider does later can reach what ran.
+    expect(fixture.executions[0]?.input).toEqual(original);
+    expect(fixture.executions[0]?.input).not.toBe(original);
 
-    // Edit the original after publication: what the client holds must not move.
+    // Edit the original after publication: neither the executed copy nor what
+    // the client holds may move.
     (original.payload.items as number[]).push(4);
+    const executed = fixture.executions[0]?.input as { readonly payload: { readonly items: number[] } };
+    expect(executed.payload.items).toEqual([1, 2, 3]);
 
     const committed = (await client.sessions.history({ sessionId: session.sessionId })).page.items;
     const call = committed.find((item) => item.kind === "tool-call");

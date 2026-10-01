@@ -48,7 +48,8 @@ import {
 import { HOST_LIMITS } from "./limits.js";
 import { defaultTitle, readHistoryPage, readRunPage, readSessionPage, sessionSummaryOf } from "./history.js";
 import { answerReversePending, dropReverseForStream } from "./reverse.js";
-import { cancelRun, readRun, startRun } from "./run.js";
+import { blockCorruptedSession, cancelRun, readRun, startRun } from "./run.js";
+import { StoreUntrustedError } from "./repository.js";
 import {
   captureHostSnapshot,
   newId,
@@ -247,7 +248,13 @@ function dispatchClientRequest(
 
   switch (request.method) {
     case "sessions.list": {
-      const page = readSessionPage(state.repository, request.params.cursor, request.params.limit);
+      let page;
+      try {
+        page = readSessionPage(state.repository, request.params.cursor, request.params.limit);
+      } catch (error) {
+        answerReadFailure(state, connection, requestId, error, undefined);
+        return;
+      }
       if ("failure" in page) {
         replyError(state, connection, requestId, staleCursorError());
         return;
@@ -274,7 +281,13 @@ function dispatchClientRequest(
       return;
 
     case "sessions.get": {
-      const record = state.repository.getSession(request.params.sessionId);
+      let record;
+      try {
+        record = state.repository.getSession(request.params.sessionId);
+      } catch (error) {
+        answerReadFailure(state, connection, requestId, error, undefined);
+        return;
+      }
       if (record === undefined) {
         replyError(state, connection, requestId, protocolError("SESSION_NOT_FOUND"));
         return;
@@ -295,11 +308,11 @@ function dispatchClientRequest(
       let outcome;
       try {
         outcome = readHistoryPage(state.repository, request.params.sessionId, request.params.cursor, request.params.limit);
-      } catch {
+      } catch (error) {
         // Durable facts that do not agree with what they claim to be are
         // refused, not repaired: the page is not served, and the caller is told
         // the host could not answer rather than shown a rewritten conversation.
-        replyError(state, connection, requestId, protocolError("INTERNAL_ERROR"));
+        answerReadFailure(state, connection, requestId, error, request.params.sessionId);
         return;
       }
       if (outcome.kind === "session-not-found") {
@@ -362,18 +375,20 @@ function dispatchClientRequest(
       return;
 
     case "runs.list": {
-      if (state.repository.getSession(request.params.sessionId) === undefined) {
-        replyError(state, connection, requestId, protocolError("SESSION_NOT_FOUND"));
-        return;
-      }
+      let known;
       let page;
       try {
+        known = state.repository.getSession(request.params.sessionId);
+        if (known === undefined) {
+          replyError(state, connection, requestId, protocolError("SESSION_NOT_FOUND"));
+          return;
+        }
         page = readRunPage(state.repository, request.params.sessionId, request.params.cursor, request.params.limit);
-      } catch {
+      } catch (error) {
         // A run whose recorded range is not the turn the index holds is a fact
         // this host did not write; the page that would carry it is refused
         // rather than served with one rewritten entry.
-        replyError(state, connection, requestId, protocolError("INTERNAL_ERROR"));
+        answerReadFailure(state, connection, requestId, error, request.params.sessionId);
         return;
       }
       if ("failure" in page) {
@@ -458,12 +473,12 @@ function dispatchClientRequest(
       let snapshot;
       try {
         snapshot = captureHostSnapshot(state, streamId);
-      } catch {
+      } catch (error) {
         // The cut could not be composed at all — a directory that cannot be
         // read, or a state that cannot be published inside one frame after
         // every honest reduction. The caller is told the host failed rather
         // than left waiting for a cut that will never arrive.
-        replyError(state, connection, requestId, protocolError("INTERNAL_ERROR"));
+        answerReadFailure(state, connection, requestId, error, undefined);
         return;
       }
       const result: OperationMap["subscriptions.open"]["result"] = { snapshot };
@@ -819,6 +834,34 @@ function sendSuccess(
     requestId,
     protocolError(encoded.failure.reason === "FRAME_TOO_LARGE" ? "LIMIT_EXCEEDED" : "INTERNAL_ERROR"),
   );
+}
+
+/**
+ * What a failed durable read means on the wire.
+ *
+ * A connection that could not end its transaction cannot say what the store
+ * holds: that is a store the host cannot answer from at all — no client's
+ * mistake, and not evidence about anything — so the caller gets
+ * STORAGE_UNAVAILABLE rather than an answer read off rows that may never land.
+ *
+ * Corruption is the other case. A session whose committed canonical is not what
+ * it claims is blocked durably, so no later run executes against a history the
+ * host cannot read, and the caller is told the host could not answer instead of
+ * being served a repaired fact.
+ */
+function answerReadFailure(
+  state: HostState,
+  connection: ConnectionState,
+  requestId: string,
+  error: unknown,
+  sessionId: string | undefined,
+): void {
+  if (error instanceof StoreUntrustedError) {
+    replyError(state, connection, requestId, storageUnavailableError());
+    return;
+  }
+  if (sessionId !== undefined) blockCorruptedSession(state, sessionId);
+  replyError(state, connection, requestId, protocolError("INTERNAL_ERROR"));
 }
 
 function replyError(

@@ -37,6 +37,7 @@ import {
   runToolCallEvent,
   runToolResultEvent,
   runUpdatedEvent,
+  sessionUpdatedEvent,
   type EventBuilder,
 } from "./connection.js";
 import {
@@ -53,12 +54,14 @@ import {
   CommitOutcomeUnknownError,
   encodedBytes,
   encodeStoredData,
+  StoreUntrustedError,
   submissionHash,
   toSessionEvent,
   userRecordFits,
   type CommitTurnInput,
   type CommitTurnResult,
   type RunRecord,
+  type SessionRecord,
   type StoredRecord,
 } from "./repository.js";
 import {
@@ -69,6 +72,8 @@ import {
   retireRun,
   runSnapshotOf,
   runSnapshotOfRecord,
+  snapshotFrameFits,
+  snapshotOfProspectiveRun,
   terminalSnapshotOfRecord,
   trackTask,
   type HostState,
@@ -124,7 +129,13 @@ export function startRun(
   if (state.closing) return operationFailed(shuttingDownError());
 
   const inputHash = submissionHash(params.sessionId, params.text);
-  const known = state.repository.getSubmission(params.submissionId);
+  let known;
+  try {
+    known = state.repository.getSubmission(params.submissionId);
+  } catch (error) {
+    if (error instanceof StoreUntrustedError) return operationFailed(storageUnavailableError());
+    return operationFailed(protocolError("INTERNAL_ERROR"));
+  }
   if (known !== undefined) {
     if (known.state === "retired") return operationFailed(protocolError("SUBMISSION_RETIRED"));
     if (known.sessionId !== params.sessionId || known.inputHash !== inputHash) {
@@ -137,6 +148,33 @@ export function startRun(
 
   if (state.storageFault) return operationFailed(storageUnavailableError());
 
+  const runId = newId();
+  const acceptedAt = Date.now();
+
+  // The safe answer has to exist before the input is accepted. The cut a
+  // subscriber would receive is composed exactly as this admission would leave
+  // it — this session, this run, this input and this submission identity — and
+  // held to one frame; a request whose accepted run could never be published is
+  // refused as a request, while nothing durable has happened yet.
+  let sessionRecord;
+  try {
+    sessionRecord = state.repository.getSession(params.sessionId);
+  } catch (error) {
+    if (error instanceof StoreUntrustedError) return operationFailed(storageUnavailableError());
+    return operationFailed(protocolError("INTERNAL_ERROR"));
+  }
+  // Only a session that could really take this run is judged this way; a
+  // blocked or busy one has its own, already-durable answer.
+  if (sessionRecord !== undefined && sessionRecord.status === "ready" && sessionRecord.activeRunId === null) {
+    const prospective = snapshotOfProspectiveRun(state, "prepare:stream", sessionRecord, {
+      runId,
+      submissionId: params.submissionId,
+      text: params.text,
+      acceptedAt,
+    });
+    if (!snapshotFrameFits(state, prospective)) return operationFailed(limitExceededError());
+  }
+
   // Waiting is not an option the contract offers, so the decision is made by
   // execution order: either this call has the registry or it does not. A ready
   // session that already has a run is exactly this case — the run holding it
@@ -144,9 +182,6 @@ export function startRun(
   // the session cannot be used.
   const lease = state.gate.tryAcquire("execution");
   if (lease === undefined) return operationFailed(protocolError("HOST_BUSY"));
-
-  const runId = newId();
-  const acceptedAt = Date.now();
 
   let admission;
   try {
@@ -301,7 +336,12 @@ export function cancelRun(state: HostState, runId: string): OperationOutcome<Run
       : operationFailed(storageUnavailableError());
   }
 
-  const record = state.repository.getRun(runId);
+  let record: RunRecord | undefined;
+  try {
+    record = state.repository.getRun(runId);
+  } catch (error) {
+    return operationFailed(error instanceof StoreUntrustedError ? storageUnavailableError() : protocolError("INTERNAL_ERROR"));
+  }
   if (record === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
   if (record.status === "accepted" || record.status === "running") {
     // Reconciliation runs before this host is ready, so an unfinished run with
@@ -325,23 +365,42 @@ export function readRun(state: HostState, params: { readonly runId?: string; rea
   if (params.runId !== undefined) {
     const live = state.runs.get(params.runId);
     if (live !== undefined) return operationSucceeded({ run: runSnapshotOf(live) });
-    const record = state.repository.getRun(params.runId);
+    let record: RunRecord | undefined;
+    try {
+      record = state.repository.getRun(params.runId);
+    } catch (error) {
+      return operationFailed(error instanceof StoreUntrustedError ? storageUnavailableError() : protocolError("INTERNAL_ERROR"));
+    }
     if (record === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
-    if (!servesRun(state, record)) return operationFailed(protocolError("INTERNAL_ERROR"));
+    if (!servesRun(state, record)) {
+      // The record and the history it claims disagree: this host will not
+      // describe the run, and it will not execute this session again either.
+      blockCorruptedSession(state, record.sessionId);
+      return operationFailed(protocolError("INTERNAL_ERROR"));
+    }
     return operationSucceeded({ run: runSnapshotOfRecord(record, storedError(record.errorCode)) });
   }
 
   const submissionId = params.submissionId;
   if (submissionId === undefined) return operationFailed(protocolError("INVALID_REQUEST"));
-  const known = state.repository.getSubmission(submissionId);
-  if (known === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
-  if (known.state === "retired") return operationFailed(protocolError("SUBMISSION_RETIRED"));
-  if (known.runId === null) return operationFailed(protocolError("RUN_NOT_FOUND"));
-  const live = state.runs.get(known.runId);
-  if (live !== undefined) return operationSucceeded({ run: runSnapshotOf(live) });
-  const record = state.repository.getRun(known.runId);
+  let known;
+  let record: RunRecord | undefined;
+  try {
+    known = state.repository.getSubmission(submissionId);
+    if (known === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
+    if (known.state === "retired") return operationFailed(protocolError("SUBMISSION_RETIRED"));
+    if (known.runId === null) return operationFailed(protocolError("RUN_NOT_FOUND"));
+    const live = state.runs.get(known.runId);
+    if (live !== undefined) return operationSucceeded({ run: runSnapshotOf(live) });
+    record = state.repository.getRun(known.runId);
+  } catch (error) {
+    return operationFailed(error instanceof StoreUntrustedError ? storageUnavailableError() : protocolError("INTERNAL_ERROR"));
+  }
   if (record === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
-  if (!servesRun(state, record)) return operationFailed(protocolError("INTERNAL_ERROR"));
+  if (!servesRun(state, record)) {
+    blockCorruptedSession(state, record.sessionId);
+    return operationFailed(protocolError("INTERNAL_ERROR"));
+  }
   return operationSucceeded({ run: runSnapshotOfRecord(record, storedError(record.errorCode)) });
 }
 
@@ -352,6 +411,36 @@ export function servesRun(state: HostState, record: RunRecord): boolean {
     return state.repository.verifyRunHistory(record);
   } catch {
     return false;
+  }
+}
+
+/**
+ * Blocks a session whose durable canonical cannot be read as the fact it claims.
+ *
+ * It is the one safe response to corruption found while reading: the host will
+ * not execute against a history it cannot trust, so the session stops accepting
+ * runs — durably, so a restart cannot un-block it — while staying readable,
+ * renameable and deletable. Nothing is repaired, discarded or rewritten here,
+ * and no other session is affected: a corrupt conversation is not a reason to
+ * stop the host.
+ */
+export function blockCorruptedSession(state: HostState, sessionId: string): void {
+  let record: SessionRecord | undefined;
+  try {
+    record = state.repository.blockCorruptSession(sessionId, Date.now());
+  } catch {
+    // A store that cannot record the block says so to every later read; the
+    // refusal to answer is what matters here.
+    return;
+  }
+  if (record === undefined || record.status !== "blocked") return;
+
+  try {
+    const build = sessionUpdatedEvent(sessionSummaryOf(record), state.repository.revisions);
+    assertEventBuilds(state, build);
+    publishEvent(state, build);
+  } catch {
+    // A subscriber that cannot be told changes nothing about the durable block.
   }
 }
 
@@ -803,8 +892,12 @@ function commitTerminal(state: HostState, run: RunEntry, batch: TerminalBatch): 
         // The batch may or may not be recorded, and nothing the host could say
         // would be true. The run stays unfinished for this host's own readers —
         // exactly the state a restart reconciles to `interrupted` — and every
-        // later write is refused until the store can be trusted again.
+        // later write is refused until the store can be trusted again. The live
+        // entry goes with it: an executing run with a timeline is this host's
+        // memory, and letting that memory stand in for an outcome storage never
+        // confirmed is what this branch exists to prevent.
         markStorageFault(state);
+        retireRun(state, run);
         return false;
       }
       if (attempt === 2) {
@@ -836,8 +929,9 @@ function commitTerminal(state: HostState, run: RunEntry, batch: TerminalBatch): 
  * claim storage is entitled to contradict, and the honest statement is the one
  * the durable record makes: an unfinished run, which the next start reconciles
  * to `interrupted`. Refusing to invent that outcome is the whole point of the
- * rule; the run keeps its unfinished live state and every later write reports
- * the store as unavailable.
+ * rule — and the live entry is released with it, so that statement is what
+ * queries actually get: the durable record, not a timeline of a turn that was
+ * never kept. Every later write reports the store as unavailable.
  */
 function failRun(state: HostState, run: RunEntry): void {
   const failure = protocolError("INTERNAL_ERROR");
@@ -862,6 +956,12 @@ function failRun(state: HostState, run: RunEntry): void {
       if (error instanceof CommitOutcomeUnknownError) markStorageFault(state);
     }
   }
+
+  // Nothing durable holds this run's outcome, so this host cannot describe one.
+  // What it can do is stop describing the execution it was watching: the entry
+  // leaves the live map, and the run is answered from the record — unfinished,
+  // and honestly without a timeline.
+  retireRun(state, run);
 }
 
 /**

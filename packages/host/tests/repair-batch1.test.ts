@@ -27,7 +27,7 @@ import { MAX_FRAME_BYTES, MAX_PAGE_BYTES } from "@every-dagent/protocol";
 import type { HostState } from "../src/state.js";
 import { composeHost } from "../src/host.js";
 import type { ComposedHost } from "../src/host.js";
-import { encodeStoredData } from "../src/repository.js";
+import { encodedBytes, encodeStoredData, toSessionEvent } from "../src/repository.js";
 import type { Repository, StoredRecord } from "../src/repository.js";
 import {
   abortAwareReply,
@@ -394,11 +394,15 @@ describe("R02 commit outcome reconciliation", () => {
     expect(interference.injected()).toBe(1);
     interference.restore();
 
-    // Nothing was fabricated: no terminal event, and the run is not described
-    // as finished even though the durable record actually says completed.
+    // Nothing was fabricated: the host publishes no terminal it could not
+    // prove. What it must not do either is keep presenting the execution it was
+    // watching as a live run — the entry is released, and a query is answered by
+    // the durable record, which here really did land.
     expect(client.events.filter((event) => event.type === "run.ended")).toHaveLength(0);
     const queried = await client.call("runs.get", { runId });
-    expect(queried.result?.run.live).not.toBeNull();
+    expect(queried.result?.run.status).toBe("completed");
+    expect(queried.result?.run.live).toBeNull();
+    expect(composed.repository.getRun(runId)?.status).toBe("completed");
 
     // New execution is refused while the store cannot be trusted.
     const refused = await client.call("runs.start", {
@@ -478,14 +482,58 @@ describe("R05 corruption is refused", () => {
       expect(page.error?.code).toBe("INTERNAL_ERROR");
       expect(page.result).toBeUndefined();
 
-      // A run on this session cannot load a legal window, so it does not
-      // execute: the model is never handed the corrupted log.
+      // Confirming the corruption is itself the point at which this session
+      // stops being executable: it is blocked durably, so a new run is refused
+      // before admission and the model is never handed the corrupted log.
+      expect(composed.repository.getSession("s-1")?.status).toBe("blocked");
+      const refused = await client.call("runs.start", {
+        sessionId: "s-1",
+        submissionId: nextId("sub"),
+        text: "next",
+      });
+      expect(refused.error?.code).toBe("SESSION_UNAVAILABLE");
+      expect(refused.result).toBeUndefined();
+      expect(model.requests).toHaveLength(0);
+
+      // The block is a fact, not this process's mood: a restart reads it back.
+      client.detach();
+      await composed.host.shutdown();
+
+      const restarted = composeTestHost({ modelClient: model.client, location: path });
+      const again = connect(restarted.host);
+      await again.describe();
+      const stillRefused = await again.call("runs.start", {
+        sessionId: "s-1",
+        submissionId: nextId("sub"),
+        text: "later",
+      });
+      expect(stillRefused.error?.code).toBe("SESSION_UNAVAILABLE");
+      expect(restarted.repository.getSession("s-1")?.status).toBe("blocked");
+      again.detach();
+      await restarted.host.shutdown();
+    });
+  });
+
+  it("stops a run whose own window cannot be read, and blocks the session", async () => {
+    await withTempDir(async (dir) => {
+      const path = join(dir, "window.db");
+      await seed(path);
+      const database = new DatabaseSync(path);
+      database.prepare("UPDATE session_events SET data = 'not-json' WHERE type = 'message/user'").run();
+      database.close();
+
+      // No page is read first: the corruption is found while loading the
+      // window the run would execute against, and the run ends as a host
+      // failure rather than executing against a history it cannot trust.
+      const model = scriptedModel([textReply("later")]);
+      const composed = composeTestHost({ modelClient: model.client, location: path });
+      const client = connect(composed.host);
+      await client.describe();
       const started = await client.call("runs.start", {
         sessionId: "s-1",
         submissionId: nextId("sub"),
         text: "next",
       });
-      expect(started.result).toBeDefined();
       const terminal = await awaitRunTerminal(client, started.result?.run.runId as string);
       expect(terminal.status).toBe("failed");
       expect(model.requests).toHaveLength(0);
@@ -815,14 +863,9 @@ describe("R09 terminal run retention", () => {
 describe("R10 window byte budget", () => {
   const BUDGET = 256 * 1024;
 
-  function encodedRange(repository: Repository, sessionId: string, baseSeq: number): number {
-    const read = repository.readTurnWindow(sessionId, 16, BUDGET);
-    void baseSeq;
-    return read.records.reduce(
-      (total, record) =>
-        total + Buffer.byteLength(record.data, "utf8") + Buffer.byteLength(record.turnId, "utf8") + 64,
-      0,
-    );
+  /** The window's real cost: the events exactly as the Core takes them. */
+  function representationBytes(records: readonly StoredRecord[]): number {
+    return encodedBytes(records.map(toSessionEvent));
   }
 
   it.each([
@@ -837,12 +880,7 @@ describe("R10 window byte budget", () => {
     }
 
     const read = composed.repository.readTurnWindow("s-1", 16, BUDGET);
-    const bytes = read.records.reduce(
-      (total, record) =>
-        total + Buffer.byteLength(record.data, "utf8") + Buffer.byteLength(record.turnId, "utf8") + 64,
-      0,
-    );
-    expect(bytes).toBeLessThanOrEqual(BUDGET);
+    expect(representationBytes(read.records)).toBeLessThanOrEqual(BUDGET);
     expect(read.baseSeq).toBeGreaterThan(0);
 
     await composed.host.shutdown();
@@ -862,11 +900,10 @@ describe("R10 window byte budget", () => {
 
     // A budget that fits the newest turn but not the one before it stops there
     // rather than reaching further back.
-    const newestOnly = composed.repository.readTurnWindow("s-1", 16, 512);
-    if (newestOnly.records.length > 0) {
-      expect(newestOnly.baseSeq).toBe(4);
-    }
-    void encodedRange;
+    const newest = composed.repository.readHistory("s-1", 100, 50).records.slice(4);
+    const newestOnly = composed.repository.readTurnWindow("s-1", 16, representationBytes(newest));
+    expect(newestOnly.records).toHaveLength(4);
+    expect(newestOnly.baseSeq).toBe(4);
 
     await composed.host.shutdown();
   });

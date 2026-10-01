@@ -36,7 +36,8 @@ import { PROTOCOL_VERSION, validateMessage } from "@every-dagent/protocol";
 
 import { closeConnection, createConnection, observePlugin } from "./connection.js";
 import { handleFrame } from "./dispatch.js";
-import { guardedModelClient } from "./guard.js";
+import { guardedModelClient, openTurnOf } from "./guard.js";
+import type { StepTurnIdentity } from "./guard.js";
 import { HOST_LIMITS } from "./limits.js";
 import { projectPluginInfo } from "./projection.js";
 import { openRepository } from "./repository.js";
@@ -44,7 +45,15 @@ import type { Repository } from "./repository.js";
 import { createReverseTrigger } from "./reverse.js";
 import type { ReverseProfile, ReverseTrigger } from "./reverse.js";
 import { createRegistryGate } from "./registry-gate.js";
-import { captureHostSnapshot, newId, pluginSummaryOf, type ConnectionState, type HostState } from "./state.js";
+import {
+  captureHostSnapshot,
+  newId,
+  pluginSummaryOf,
+  snapshotFrameFits,
+  snapshotOfHeaviestState,
+  type ConnectionState,
+  type HostState,
+} from "./state.js";
 import { encodeFrame } from "@every-dagent/protocol";
 
 const HOST_NAME = "every-dagent-host";
@@ -157,9 +166,13 @@ export function composeHost(options: HostOptions, internals: HostInternals): Com
     const contextBuilder = options.contextBuilder ?? createDefaultContextBuilder();
     const loop = createAgentLoop({
       // The composition's client, with the durable step guard in front of it:
-      // a step whose records could never be stored is refused before it can
-      // declare a tool call, so nothing executes that could not be kept.
-      modelClient: guardedModelClient(options.modelClient, HOST_LIMITS.maxRecordBytes),
+      // a step that cannot be owned as JSON, or whose records could never be
+      // stored at the turn's own identity, is refused before it can declare a
+      // tool call — so nothing executes that could not be kept.
+      modelClient: guardedModelClient(options.modelClient, {
+        maxRecordBytes: HOST_LIMITS.maxRecordBytes,
+        turnOf: (): StepTurnIdentity | undefined => currentStepTurn(state),
+      }),
       tools: registry,
       contextBuilder,
     });
@@ -229,14 +242,41 @@ export function composeHost(options: HostOptions, internals: HostInternals): Com
 }
 
 /**
- * Checks at construction that the host can describe the state it starts in.
+ * The turn the host is executing right now, for the step guard.
+ *
+ * The host runs at most one execution at a time and the window it loaded is the
+ * Core's own log, so the turn open in that log is the turn the step being
+ * streamed belongs to. It is read from the log — not from the host's observed
+ * state — because observation is asynchronous: what the guard needs is the
+ * identity the commit will really use, not a race to catch up with the stream.
+ */
+function currentStepTurn(state: HostState): StepTurnIdentity | undefined {
+  for (const run of state.runs.values()) {
+    if (run.terminal !== undefined || run.window === undefined) continue;
+    const turnId = openTurnOf(run.window.session);
+    if (turnId !== undefined) return { turnId };
+  }
+  return undefined;
+}
+
+/**
+ * Checks at construction that the host can describe the state it starts in —
+ * and every state a legal run can leave behind.
  *
  * The check is the real thing, not a schema-shaped approximation: the snapshot
  * a subscriber would receive is composed and encoded with the protocol's own
  * encoder, so the frame limit that decides whether a client can ever subscribe
  * is decided *here*, while the composition can still see why. A finite static
- * configuration — the plugin catalogue among it — that could not travel is
- * refused at startup instead of producing a host whose every subscribe fails.
+ * configuration that could not travel is refused at startup instead of
+ * producing a host whose every subscribe fails.
+ *
+ * Describing the state *now* is not enough on its own: a host that starts empty
+ * and accepts a maximal input afterwards would be a host no client can
+ * re-subscribe to. So the heaviest state a legal run can force — the static
+ * catalogue plus one session and the executing run it owns, at the store's own
+ * input bound — is composed the same way and held to the same frame. A
+ * configuration that leaves no room for any run is refused here, which is the
+ * only point at which the composition can still see the problem.
  */
 function assertSelfDescription(state: HostState): void {
   const result: OperationMap["subscriptions.open"]["result"] = {
@@ -286,6 +326,12 @@ function assertSelfDescription(state: HostState): void {
   );
   if (!catalogueFrame.success) {
     throw new Error("the plugin catalogue this host was configured with cannot be published inside one frame");
+  }
+
+  // And the configuration has to leave room for what a legal run adds to it:
+  // one session and the run it owns, at the largest input the store accepts.
+  if (!snapshotFrameFits(state, snapshotOfHeaviestState(state, "prepare:stream"))) {
+    throw new Error("the configuration this host was given leaves no room for a legal run inside one frame");
   }
 }
 

@@ -49,6 +49,16 @@ type WriteVerdict<T> =
   | { readonly kind: "absent" }
   | { readonly kind: "indeterminate" };
 
+/**
+ * What a connection can say about a transaction it tried to end.
+ *
+ * `ended` is a fact about the connection: no transaction is open, so a read
+ * through it sees committed rows and only committed rows. `open` is a rollback
+ * that did not happen — the transaction is still there, and so are its
+ * uncommitted rows. `unknown` is a connection that cannot even be asked.
+ */
+type TransactionState = "ended" | "open" | "unknown";
+
 /** The schema generation this build writes and reads. */
 export const SCHEMA_VERSION = 1;
 
@@ -292,6 +302,23 @@ export class CommitOutcomeUnknownError extends Error {
   }
 }
 
+/**
+ * A connection whose own reads can no longer be taken as the store's facts.
+ *
+ * It is the state a connection is left in when a transaction could not be
+ * ended: whatever that transaction wrote is still visible to this connection,
+ * so a read here could answer with rows the store never made durable — and a
+ * terminal read off uncommitted rows is exactly the fabricated outcome the
+ * commit rules exist to prevent. Reads through such a connection are refused
+ * until a trustworthy view of the same store has been re-established.
+ */
+export class StoreUntrustedError extends Error {
+  constructor(detail: string) {
+    super(`the store cannot be read as its own committed facts: ${detail}`);
+    this.name = "StoreUntrustedError";
+  }
+}
+
 export interface RepositoryLimits {
   /** The most one encoded durable record may occupy, envelope included. */
   readonly maxRecordBytes: number;
@@ -341,6 +368,16 @@ export interface Repository {
   commitTurn(input: CommitTurnInput): CommitTurnResult;
   failRun(input: HostFaultInput): CommitTurnResult;
   requestCancel(runId: string, at: number): RunRecord;
+  /**
+   * Blocks one session whose committed canonical could not be read as fact.
+   *
+   * A corruption found while reading a session's history or a run's recorded
+   * outcome is a fact about that session: nothing may execute against a history
+   * the host cannot trust. The block is durable, keeps the session readable,
+   * renameable and deletable, and is the same safe state a run with an unknown
+   * outcome leaves behind — there is no unblock operation in this phase.
+   */
+  blockCorruptSession(sessionId: string, at: number): SessionRecord | undefined;
   renameSession(input: RenameInput): RenameOutcome;
   deleteSession(input: DeleteInput): DeleteOutcome;
   reconcileInterrupted(hostInstanceId: string, at: number): ReconcileResult;
@@ -460,10 +497,49 @@ export function storedToolCalls(data: string): readonly StoredToolCall[] | undef
   return out;
 }
 
+/**
+ * Whether a stored value is a display input, exactly.
+ *
+ * `kind: "json"` is a claim that there is a JSON value to show, and the claim is
+ * only taken with the value actually present and JSON-safe: a record that says
+ * "json" and holds nothing is corruption, not an input that reads back as
+ * `undefined`. `kind: "unavailable"` is the one fixed reason this host writes,
+ * so any other word is a shape it did not produce.
+ */
 function isDisplayInput(value: unknown): value is DisplayInput {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const kind = (value as Record<string, unknown>)["kind"];
-  return kind === "json" || kind === "unavailable";
+  const record = value as Record<string, unknown>;
+  if (record["kind"] === "unavailable") return record["reason"] === "not-json-safe";
+  if (record["kind"] !== "json") return false;
+  return "value" in record && validateJsonValue(record["value"]).success;
+}
+
+/** Whether two display inputs show the same thing, key order aside. */
+function sameDisplayInput(left: DisplayInput, right: DisplayInput): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "unavailable" || right.kind === "unavailable") {
+    return left.kind === "unavailable" && right.kind === "unavailable" && left.reason === right.reason;
+  }
+  return sameJsonValue(left.value, right.value);
+}
+
+/** Whether two JSON values are the same value, key order aside. */
+function sameJsonValue(left: JsonValue, right: JsonValue): boolean {
+  if (left === right) return true;
+  if (typeof left !== "object" || typeof right !== "object" || left === null || right === null) return false;
+
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((item, index) => sameJsonValue(item, right[index] as JsonValue));
+  }
+
+  const leftKeys = Object.keys(left);
+  const rightRecord = right as { readonly [key: string]: JsonValue };
+  if (leftKeys.length !== Object.keys(rightRecord).length) return false;
+  const leftRecord = left as { readonly [key: string]: JsonValue };
+  return leftKeys.every(
+    (key) => Object.prototype.hasOwnProperty.call(rightRecord, key) && sameJsonValue(leftRecord[key] as JsonValue, rightRecord[key] as JsonValue),
+  );
 }
 
 export function parsePayload(data: string): Record<string, unknown> | undefined {
@@ -662,13 +738,22 @@ export function assertStoredRange(
    */
   let declarable = false;
   let openTurn: string | undefined;
-  let declared = 0;
+  /**
+   * The calls an assistant record declared and no `tool/call` has answered yet.
+   *
+   * The declaration is the claim and the call record is the fact: a tool call
+   * that is not the one declared — a different id, a different name, a different
+   * input — is a log where the model was told something the tools were not, and
+   * a declared call with no record behind it is the same lie the other way
+   * round. Both are refused here.
+   */
+  const declared: { readonly callId: string; readonly name: string; readonly input: DisplayInput }[] = [];
   let awaitingResult = false;
   let openCall: { readonly callId: string; readonly name: string } | undefined;
 
   const resolveBeforeTurnEnd = (seq: number): void => {
     if (awaitingResult) throw new CorruptRecordError(`turn end at seq ${seq} leaves a tool call unanswered`);
-    if (declared > 0) throw new CorruptRecordError(`turn end at seq ${seq} leaves declared tool calls unrecorded`);
+    if (declared.length > 0) throw new CorruptRecordError(`turn end at seq ${seq} leaves declared tool calls unrecorded`);
   };
 
   for (let index = 0; index < records.length; index++) {
@@ -712,21 +797,30 @@ export function assertStoredRange(
     switch (record.type) {
       case "message/assistant": {
         if (awaitingResult) throw new CorruptRecordError("an assistant record interrupts an unanswered tool call");
-        if (declared > 0) throw new CorruptRecordError("an assistant record interrupts tool calls it never recorded");
+        if (declared.length > 0) throw new CorruptRecordError("an assistant record interrupts tool calls it never recorded");
         const calls = storedToolCalls(record.data);
         if (calls === undefined) throw new CorruptRecordError("an assistant record's calls cannot be read back");
-        declared += calls.length;
+        declared.push(...calls.map((call) => ({ callId: call.callId, name: call.name, input: call.input })));
         declarable = true;
         break;
       }
       case "tool/call": {
         if (awaitingResult) throw new CorruptRecordError("a tool call interrupts an unanswered tool call");
         const parsed = parseStoredRecord(record);
+        const display = storedDisplay(record.data);
+        if (display === undefined) throw new CorruptRecordError("a tool call record's input cannot be read back");
         if (declarable) {
-          if (declared <= 0) {
+          const claim = declared.shift();
+          if (claim === undefined) {
             throw new CorruptRecordError(`a tool call at seq ${record.seq} was never declared by an assistant record`);
           }
-          declared -= 1;
+          if (
+            claim.callId !== parsed["callId"] ||
+            claim.name !== parsed["name"] ||
+            !sameDisplayInput(claim.input, display)
+          ) {
+            throw new CorruptRecordError(`a tool call at seq ${record.seq} is not the call an assistant record declared`);
+          }
         }
         openCall = { callId: parsed["callId"] as string, name: parsed["name"] as string };
         awaitingResult = true;
@@ -885,15 +979,51 @@ export function openRepository(options: RepositoryOptions): Repository {
     throw new StorageOpenError("a durable store needs a location; an empty path is not a database");
   }
   const ephemeral = options.location === ":memory:";
+
   let database: DatabaseSync;
   try {
-    database = new DatabaseSync(options.location);
+    database = openDatabase(options.location);
+  } catch (error) {
+    throw error instanceof StorageOpenError ? error : new StorageOpenError(describeFailure(error));
+  }
+
+  try {
+    const repository = new SqliteRepository(
+      database,
+      ephemeral ? "ephemeral" : "durable",
+      ephemeral ? null : options.location,
+      options.limits,
+    );
+    repository.assertIdentified();
+    return repository;
+  } catch (error) {
+    try {
+      database.close();
+    } catch {
+      // The connection is already unusable; the open failure is what matters.
+    }
+    throw error instanceof StorageOpenError ? error : new StorageOpenError(describeFailure(error));
+  }
+}
+
+/**
+ * Opens one connection: ownership, pragmas, schema.
+ *
+ * This is the whole open sequence, and it is deliberately one function so that
+ * re-establishing a trustworthy view of a store after an unjudgeable write is
+ * the same operation as opening it the first time — a fresh connection can only
+ * see committed facts, which is exactly what makes it trustworthy.
+ */
+function openDatabase(location: string): DatabaseSync {
+  let database: DatabaseSync;
+  try {
+    database = new DatabaseSync(location);
   } catch (error) {
     throw new StorageOpenError(describeFailure(error));
   }
 
   try {
-    if (!ephemeral) {
+    if (location !== ":memory:") {
       // Fail fast, and hold what is taken: with `EXCLUSIVE` locking the file
       // lock is kept for the connection's life, so ownership is a fact another
       // process can observe rather than a promise this one makes to itself.
@@ -909,9 +1039,7 @@ export function openRepository(options: RepositoryOptions): Repository {
     // must not stay locked by the connection that refused it, or nobody could
     // even look at the file to see what is wrong with it.
     migrate(database);
-    const repository = new SqliteRepository(database, ephemeral ? "ephemeral" : "durable", options.limits);
-    repository.assertIdentified();
-    return repository;
+    return database;
   } catch (error) {
     try {
       database.close();
@@ -920,6 +1048,14 @@ export function openRepository(options: RepositoryOptions): Repository {
     }
     throw error instanceof StorageOpenError ? error : new StorageOpenError(describeFailure(error));
   }
+}
+
+/** The storage identity a connection can see, if it records one. */
+function readStorageId(database: DatabaseSync): string | undefined {
+  const row = database.prepare("SELECT value FROM meta WHERE key = 'storageId'").get() as
+    | { readonly value?: string }
+    | undefined;
+  return typeof row?.value === "string" ? row.value : undefined;
 }
 
 function migrate(database: DatabaseSync): void {
@@ -981,11 +1117,25 @@ export function encodedBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
+/**
+ * The longest turn identity a stored record may carry.
+ *
+ * Turn identities are minted by the Core as UUIDs, and the store enforces this
+ * exact bound on every record it accepts. That is what lets an input be judged
+ * before its turn exists — the check uses the largest identity the store will
+ * ever write, so a record that passes is a record the store takes, and for the
+ * identities this runtime really mints the two numbers are the same one.
+ */
+export const MAX_TURN_ID_BYTES = 36;
+
+/** Whether a record of this encoded payload fits, once its identity is charged for. */
+function payloadFits(data: string, identityBytes: number, maxRecordBytes: number): boolean {
+  return Buffer.byteLength(data, "utf8") + identityBytes + RECORD_OVERHEAD_BYTES <= maxRecordBytes;
+}
+
 /** Whether a settled record of these encoded bytes could be stored whole. */
 export function recordFits(data: string, turnId: string, maxRecordBytes: number): boolean {
-  return (
-    Buffer.byteLength(data, "utf8") + Buffer.byteLength(turnId, "utf8") + RECORD_OVERHEAD_BYTES <= maxRecordBytes
-  );
+  return payloadFits(data, Buffer.byteLength(turnId, "utf8"), maxRecordBytes);
 }
 
 /**
@@ -993,39 +1143,88 @@ export function recordFits(data: string, turnId: string, maxRecordBytes: number)
  *
  * Checked against the record as it will actually be written, not against the
  * raw text: JSON escaping is what turns 16 KiB of control characters into a
- * record the store would refuse. A refusal here means the input was never
- * accepted, never model-bound and never tool-bound.
+ * record the store would refuse. The identity is the store's own declared
+ * bound, because this input's turn has not been opened yet — and the store
+ * enforces that bound on every record it takes, so the check and the write
+ * agree by construction. A refusal here means the input was never accepted,
+ * never model-bound and never tool-bound.
  */
 export function userRecordFits(text: string, maxRecordBytes: number): boolean {
-  return recordFits(JSON.stringify({ text }), "", maxRecordBytes);
+  return payloadFits(JSON.stringify({ text }), MAX_TURN_ID_BYTES, maxRecordBytes);
 }
 
 /**
- * Whether one model step's assistant declaration and its calls can be stored.
+ * The heaviest input the store would still accept, as a value.
  *
- * Both the declaration and each call become their own durable record, so both
- * are measured. This is deliberately only representability: no truncation, no
- * dropping a call, no rewriting arguments — a step that cannot be stored whole
- * is a step that does not run.
+ * A control character is the most expensive character there is — six bytes once
+ * escaped — so the input that weighs most is one made of nothing else, at the
+ * length where its record exactly fills the bound. It is what "a legal input"
+ * means for any check that has to model one before it exists.
+ */
+export function heaviestAcceptedText(maxRecordBytes: number): string {
+  const payload = Buffer.byteLength(JSON.stringify({ text: "" }), "utf8");
+  const escaped = maxRecordBytes - MAX_TURN_ID_BYTES - RECORD_OVERHEAD_BYTES - payload;
+  return "\u0000".repeat(Math.max(0, Math.floor(escaped / 6)));
+}
+
+/**
+ * The encoded payloads one model step will be stored as: its assistant
+ * declaration, then each of its calls.
+ *
+ * Built through `encodeStoredData`, the one payload builder the commit path
+ * uses, so what is measured here is the record that will be written — the same
+ * escaping, the same field assembly, the same builder — and not a second
+ * estimate that could drift from it.
+ */
+export function stepRecordPayloads(
+  step: {
+    readonly text: string;
+    readonly toolCalls: readonly { readonly callId: string; readonly name: string; readonly input: unknown }[];
+  },
+  turnId: string,
+): readonly string[] {
+  const assistant: SessionEvent = {
+    type: "message/assistant",
+    turnId,
+    seq: 0,
+    time: 0,
+    data: { text: step.text, toolCalls: step.toolCalls.map((call) => ({ callId: call.callId, name: call.name, input: call.input })) },
+  };
+  const payloads = [encodeStoredData(assistant)];
+  for (const call of step.toolCalls) {
+    const event: SessionEvent = {
+      type: "tool/call",
+      turnId,
+      seq: 0,
+      time: 0,
+      data: { callId: call.callId, name: call.name, input: call.input },
+    };
+    payloads.push(encodeStoredData(event));
+  }
+  return payloads;
+}
+
+/**
+ * Whether one model step's assistant declaration and its calls can be stored,
+ * told the turn the step belongs to.
+ *
+ * Both the declaration and each call become their own durable record, so each is
+ * measured — with the step's real turn identity, through the store's own
+ * builder, against the store's own bound. This is deliberately only
+ * representability: no truncation, no dropping a call, no rewriting arguments —
+ * a step that cannot be stored whole is a step that does not run, and it is
+ * refused before any of its tools are dispatched.
  */
 export function stepRecordsFit(
-  step: { readonly text: string; readonly toolCalls: readonly { readonly callId: string; readonly name: string; readonly input: unknown }[] },
+  step: {
+    readonly text: string;
+    readonly toolCalls: readonly { readonly callId: string; readonly name: string; readonly input: unknown }[];
+  },
+  turnId: string,
   maxRecordBytes: number,
 ): boolean {
-  const assistant = JSON.stringify({
-    text: step.text,
-    toolCalls: step.toolCalls.map((call) => ({
-      callId: call.callId,
-      name: call.name,
-      input: displayOf(call.input),
-    })),
-  });
-  if (!recordFits(assistant, "", maxRecordBytes)) return false;
-  for (const call of step.toolCalls) {
-    const data = JSON.stringify({ callId: call.callId, name: call.name, input: displayOf(call.input) });
-    if (!recordFits(data, "", maxRecordBytes)) return false;
-  }
-  return true;
+  const identityBytes = Buffer.byteLength(turnId, "utf8");
+  return stepRecordPayloads(step, turnId).every((data) => payloadFits(data, identityBytes, maxRecordBytes));
 }
 
 /** What one run's accepted input costs the recent-run window, envelope included. */
@@ -1041,22 +1240,30 @@ class SqliteRepository implements Repository {
   readonly storageId: string;
   readonly retention: "durable" | "ephemeral";
   readonly schemaVersion = SCHEMA_VERSION;
-  private readonly database: DatabaseSync;
+  private database: DatabaseSync;
+  /** The file behind the connection, or `null` when the store is this connection. */
+  private readonly location: string | null;
   private readonly limits: RepositoryLimits;
+  /** Whether a read through this connection can still be the store's own answer. */
+  private trusted = true;
   private closed = false;
 
-  constructor(database: DatabaseSync, retention: "durable" | "ephemeral", limits: RepositoryLimits) {
+  constructor(
+    database: DatabaseSync,
+    retention: "durable" | "ephemeral",
+    location: string | null,
+    limits: RepositoryLimits,
+  ) {
     this.database = database;
     this.retention = retention;
+    this.location = location;
     this.limits = limits;
     this.storageId = this.readOrCreateStorageId();
   }
 
   private readOrCreateStorageId(): string {
-    const row = this.database.prepare("SELECT value FROM meta WHERE key = 'storageId'").get() as
-      | { readonly value?: string }
-      | undefined;
-    if (typeof row?.value === "string" && row.value.length > 0) return row.value;
+    const recorded = readStorageId(this.database);
+    if (recorded !== undefined && recorded.length > 0) return recorded;
 
     const storageId = globalThis.crypto.randomUUID();
     this.database.prepare("INSERT INTO meta (key, value) VALUES ('storageId', ?)").run(storageId);
@@ -1065,15 +1272,15 @@ class SqliteRepository implements Repository {
 
   /** The identity is re-read from storage, so a botched first write cannot hide. */
   assertIdentified(): void {
-    const row = this.database.prepare("SELECT value FROM meta WHERE key = 'storageId'").get() as
-      | { readonly value?: string }
-      | undefined;
-    if (row?.value !== this.storageId) throw new StorageOpenError("the storage identity could not be recorded");
+    if (readStorageId(this.database) !== this.storageId) {
+      throw new StorageOpenError("the storage identity could not be recorded");
+    }
     const version = readUserVersion(this.database);
     if (version !== SCHEMA_VERSION) throw new StorageOpenError("the schema version could not be recorded");
   }
 
   get revisions(): CollectionRevisions {
+    this.assertTrusted();
     const rows = this.database.prepare("SELECT name, revision FROM collections").all() as {
       readonly name?: string;
       readonly revision?: number;
@@ -1109,26 +1316,35 @@ class SqliteRepository implements Repository {
    * `indeterminate` is a store that cannot answer, which is neither.
    */
   private write<T>(act: () => T, verify: () => WriteVerdict<T>): T {
+    this.assertTrusted();
     this.database.exec("BEGIN IMMEDIATE");
     let value: T;
     try {
       value = act();
     } catch (error) {
-      if (this.rollback()) throw error;
-      // The rollback itself failed, so the transaction API cannot say what
-      // happened. The batch's own evidence is the only remaining witness.
-      const verdict = this.reach(verify);
-      if (verdict.kind === "committed") return verdict.value;
-      throw new CommitOutcomeUnknownError(describeFailure(error));
+      // The transaction is ended before anything is asked of the store: only a
+      // connection with no open transaction reads committed facts, and the
+      // batch's own rows would otherwise answer the question about the batch.
+      const state = this.endTransaction();
+      if (state !== "ended") {
+        this.distrust();
+        throw new CommitOutcomeUnknownError(describeFailure(error));
+      }
+      throw error;
     }
 
     try {
       this.database.exec("COMMIT");
     } catch (error) {
-      // A COMMIT that reported an error may or may not have committed; a
-      // successful one leaves nothing to roll back. Both are settled by asking
-      // the facts, never by assuming the receipt told the truth.
-      this.rollback();
+      // A COMMIT that reported an error may or may not have committed. That is
+      // settled by the batch's own evidence — but only once the transaction is
+      // known to be over: while it is still open, the evidence query would read
+      // the batch's uncommitted rows and call them durable.
+      const state = this.endTransaction();
+      if (state !== "ended") {
+        this.distrust();
+        throw new CommitOutcomeUnknownError(describeFailure(error));
+      }
       const verdict = this.reach(verify);
       if (verdict.kind === "committed") return verdict.value;
       if (verdict.kind === "absent") throw error;
@@ -1137,15 +1353,81 @@ class SqliteRepository implements Repository {
     return value;
   }
 
-  /** Ends a transaction that did not commit; `false` means it could not be ended. */
-  private rollback(): boolean {
+  /**
+   * Ends the transaction this connection is in, and says what is known about it.
+   *
+   * A rollback that runs is one fact: the transaction is over and none of its
+   * rows are durable, which is what makes a read through this connection the
+   * store's own answer again. A rollback that reports an error is not a fact at
+   * all — it may have had nothing to roll back (a commit that landed) or it may
+   * have failed with the transaction still open — so the connection itself is
+   * asked, and a connection that cannot answer is not trusted to be readable.
+   */
+  private endTransaction(): TransactionState {
     try {
       this.database.exec("ROLLBACK");
-      return true;
     } catch {
-      // Either the transaction is already over or the connection is unusable;
-      // both are answered by the evidence query, not by guessing here.
-      return false;
+      // Answered by the question below, not by guessing here.
+    }
+    try {
+      return this.database.isTransaction ? "open" : "ended";
+    } catch {
+      return "unknown";
+    }
+  }
+
+  /** Refuses a read or a write through a connection this host cannot trust. */
+  private assertTrusted(): void {
+    if (!this.trusted) {
+      throw new StoreUntrustedError("the connection still holds a transaction it could not end");
+    }
+  }
+
+  /**
+   * Stops trusting this connection, and tries to obtain a trustworthy view of
+   * the same store instead.
+   *
+   * For a durable store a fresh connection *is* that view: it can only see
+   * committed facts, so the batch that could not be judged stays judged by what
+   * the store actually holds. The replacement is verified before it is adopted
+   * — same storage identity, same schema — and a store that lives only inside
+   * this connection (an in-memory one) has no such view to re-establish, so it
+   * stays unreadable rather than showing rows that may never have landed.
+   */
+  private distrust(): void {
+    this.trusted = false;
+    if (this.location === null) return;
+
+    // Ownership is the lock, and the lock belongs to the connection: the old one
+    // is released before a replacement can take it.
+    try {
+      this.database.close();
+    } catch {
+      // A connection that cannot close is not one to re-read from either.
+      return;
+    }
+
+    let replacement: DatabaseSync | undefined;
+    try {
+      replacement = openDatabase(this.location);
+      if (readStorageId(replacement) !== this.storageId) {
+        throw new StorageOpenError("the storage identity changed");
+      }
+      if (readUserVersion(replacement) !== SCHEMA_VERSION) {
+        throw new StorageOpenError("the schema version changed");
+      }
+      this.database = replacement;
+      this.trusted = true;
+    } catch {
+      if (replacement !== undefined) {
+        try {
+          replacement.close();
+        } catch {
+          // Unusable either way; this repository stays refused.
+        }
+      }
+      // Nothing trustworthy is left to read, so nothing is read: the connection
+      // that would answer is gone, and `assertTrusted` refuses every access.
     }
   }
 
@@ -1169,11 +1451,13 @@ class SqliteRepository implements Repository {
   // -------------------------------------------------------------------------
 
   getSession(sessionId: string): SessionRecord | undefined {
+    this.assertTrusted();
     const row = this.database.prepare("SELECT * FROM sessions WHERE session_id = ?").get(sessionId);
     return row === undefined ? undefined : sessionOf(row as Row);
   }
 
   getDeletedSession(sessionId: string): number | undefined {
+    this.assertTrusted();
     const row = this.database.prepare("SELECT generation FROM deleted_sessions WHERE session_id = ?").get(sessionId) as
       | { readonly generation?: number }
       | undefined;
@@ -1181,6 +1465,7 @@ class SqliteRepository implements Repository {
   }
 
   listSessions(limit: number, after: SessionCursorKey | null): SessionPage {
+    this.assertTrusted();
     // One row over the bound, so "there is more" is answered by the read
     // rather than inferred from a count that would itself be unbounded.
     const rows =
@@ -1201,11 +1486,13 @@ class SqliteRepository implements Repository {
   }
 
   getRun(runId: string): RunRecord | undefined {
+    this.assertTrusted();
     const row = this.database.prepare("SELECT * FROM runs WHERE run_id = ?").get(runId);
     return row === undefined ? undefined : runOf(row as Row);
   }
 
   getSubmission(submissionId: string): SubmissionRecord | undefined {
+    this.assertTrusted();
     const row = this.database
       .prepare("SELECT submission_id, session_id, input_hash, run_id, state FROM submissions WHERE submission_id = ?")
       .get(submissionId) as Row | undefined;
@@ -1220,6 +1507,7 @@ class SqliteRepository implements Repository {
   }
 
   listRunsBySession(sessionId: string, limit: number, after: RunCursorKey | null): RunPage {
+    this.assertTrusted();
     const rows =
       after === null
         ? (this.database
@@ -1240,6 +1528,7 @@ class SqliteRepository implements Repository {
   }
 
   listRecentRuns(limit: number, maxBytes: number): RecentRunPage {
+    this.assertTrusted();
     // One row past the bound, so "there is more" is answered by the read that
     // would have returned it, not guessed from the count that fits.
     const rows = this.database
@@ -1265,36 +1554,69 @@ class SqliteRepository implements Repository {
   }
 
   listUnfinishedRuns(): readonly RunRecord[] {
+    this.assertTrusted();
     const rows = this.database
       .prepare("SELECT * FROM runs WHERE status IN ('accepted', 'running') ORDER BY accepted_at, run_id")
       .all() as Row[];
     return Object.freeze(rows.map(runOf));
   }
 
+  /**
+   * Whether a run's terminal agrees with the history the store holds.
+   *
+   * The range, the turn index, the run's own terminal and the session's
+   * high-water all became true in one commit, so agreeing with one another is
+   * the only proof that this run's history is its own. The rules are the ones
+   * the store's own writes imply: a run that never committed a turn — a host
+   * failure, an interrupted run, one still unfinished — carries no range, and a
+   * run whose status claims a settled turn, `completed` above all, must carry
+   * the range, the turn row and the reason that claim implies. A status that
+   * names a committed turn and holds no range is a record disagreeing with
+   * itself, and is refused exactly like one pointing at somebody else's turn.
+   */
   verifyRunHistory(run: RunRecord): boolean {
-    const range = this.database
+    this.assertTrusted();
+    const stored = this.database
       .prepare("SELECT committed_from_seq, committed_to_seq FROM runs WHERE run_id = ?")
       .get(run.runId) as
       | { readonly committed_from_seq?: number | null; readonly committed_to_seq?: number | null }
       | undefined;
-    if (range === undefined) return false;
+    if (stored === undefined) return false;
 
-    // A run that claims no committed history is consistent when its range is
-    // empty: a failed or interrupted run whose turn never settled may carry a
-    // turn id it never got to commit, and that is not an inconsistency.
-    if (range.committed_from_seq === null && range.committed_to_seq === null) return true;
+    const from = typeof stored["committed_from_seq"] === "number" ? stored["committed_from_seq"] : null;
+    const to = typeof stored["committed_to_seq"] === "number" ? stored["committed_to_seq"] : null;
+
+    if (from === null || to === null) {
+      if (from !== null || to !== null) return false;
+      return (
+        run.status === "accepted" ||
+        run.status === "running" ||
+        run.status === "failed" ||
+        run.status === "interrupted"
+      );
+    }
+
     if (run.turnId === null) return false;
+    const expected = endReasonFor(run.status);
+    if (expected === undefined || run.endReason !== expected) return false;
 
     const turn = this.database
-      .prepare("SELECT start_seq, end_seq FROM turns WHERE session_id = ? AND turn_id = ?")
-      .get(run.sessionId, run.turnId) as { readonly start_seq?: number; readonly end_seq?: number } | undefined;
+      .prepare("SELECT start_seq, end_seq, reason FROM turns WHERE session_id = ? AND turn_id = ?")
+      .get(run.sessionId, run.turnId) as
+      | { readonly start_seq?: number; readonly end_seq?: number; readonly reason?: string }
+      | undefined;
     if (turn === undefined) return false;
-    // The turn index and the run's recorded range became true in one commit;
-    // agreeing with it is the only proof that this run's history is its own.
-    return range.committed_from_seq === turn.start_seq && range.committed_to_seq === turn.end_seq;
+    if (turn.start_seq !== from || turn.end_seq !== to || turn.reason !== expected) return false;
+
+    // History is never shortened, so the committed log this turn belongs to has
+    // to reach at least its end; a session that does not hold the turn is a run
+    // whose history is somewhere else.
+    const session = this.getSession(run.sessionId);
+    return session !== undefined && session.committedSeq >= to;
   }
 
   verifyTurnCommit(input: CommitTurnInput): "committed" | "absent" | "indeterminate" {
+    this.assertTrusted();
     try {
       const endSeq = input.turnStartSeq + input.records.length;
       const session = this.getSession(input.sessionId);
@@ -1332,6 +1654,7 @@ class SqliteRepository implements Repository {
   }
 
   readHistory(sessionId: string, beforeSeq: number, maxEvents: number): HistoryRead {
+    this.assertTrusted();
     if (beforeSeq <= 0 || maxEvents <= 0) {
       return { records: [], fromSeq: Math.max(0, beforeSeq), toSeq: Math.max(0, beforeSeq) };
     }
@@ -1347,56 +1670,49 @@ class SqliteRepository implements Repository {
     return { records, fromSeq, toSeq: beforeSeq };
   }
 
+  /**
+   * The newest whole turns whose *actual* representation fits the budget.
+   *
+   * The budget is spent on the representation itself, never on an estimate of
+   * it: each turn is read on its own, rebuilt as the very events the window
+   * hands to the Core, and encoded the way any structure is measured here —
+   * sequence, time, turn id, event kind, payload, JSON escaping and the
+   * array/object framing all included. The running total is that number.
+   *
+   * One turn at a time also keeps the read bounded: nothing is loaded to be
+   * judged and then not used, a turn that does not fit ends the window there —
+   * the newest one included — and no older turn is skipped in the hope that it
+   * fits where the newer one did not.
+   */
   readTurnWindow(sessionId: string, maxTurns: number, maxBytes: number): TurnWindowRead {
+    this.assertTrusted();
     const session = this.getSession(sessionId);
     const nextSeq = session?.committedSeq ?? 0;
     const turns = this.database
       .prepare("SELECT start_seq, end_seq FROM turns WHERE session_id = ? ORDER BY start_seq DESC LIMIT ?")
       .all(sessionId, maxTurns) as { readonly start_seq?: number; readonly end_seq?: number }[];
 
-    // The newest turn is examined first and the first turn that does not fit
-    // ends the window — whether that is an older one or the newest one itself.
-    // Nothing is skipped to reach an older turn, nothing oversized is forced
-    // in, and the running total is the budget that matters: a window is allowed
-    // to be smaller, or to hold no previous turns at all, but it is never
-    // allowed to exceed what it was given.
+    const taken: StoredRecord[] = [];
     let baseSeq = nextSeq;
-    let bytes = 0;
     for (const turn of turns) {
       const start = turn.start_seq;
       const end = turn.end_seq;
       if (typeof start !== "number" || typeof end !== "number") {
         throw new CorruptRecordError("the turn index holds a range that is not a range");
       }
-      const spanBytes = this.measureRange(sessionId, start, end);
-      if (bytes + spanBytes > maxBytes) break;
-      bytes += spanBytes;
+
+      const rows = this.database
+        .prepare("SELECT * FROM session_events WHERE session_id = ? AND seq >= ? AND seq < ? ORDER BY seq")
+        .all(sessionId, start, end) as Row[];
+      const candidate = [...rows.map(storedOf), ...taken];
+      const events = candidate.map(toSessionEvent);
+      if (encodedBytes(events) > maxBytes) break;
+
+      taken.splice(0, taken.length, ...candidate);
       baseSeq = start;
     }
 
-    if (baseSeq >= nextSeq) return { records: Object.freeze([]), baseSeq: nextSeq, nextSeq };
-    const rows = this.database
-      .prepare("SELECT * FROM session_events WHERE session_id = ? AND seq >= ? AND seq < ? ORDER BY seq")
-      .all(sessionId, baseSeq, nextSeq) as Row[];
-    return { records: Object.freeze(rows.map(storedOf)), baseSeq, nextSeq };
-  }
-
-  /**
-   * A range's real cost in bytes.
-   *
-   * `LENGTH` counts characters, and a character can be up to three UTF-8 bytes
-   * and up to six escaped bytes; a window measured that way is not bounded in
-   * what it actually loads. The cast to `BLOB` makes SQLite answer in bytes, and
-   * each record's envelope is charged for too, because it travels as well.
-   */
-  private measureRange(sessionId: string, fromSeq: number, toSeq: number): number {
-    const row = this.database
-      .prepare(
-        `SELECT COALESCE(SUM(LENGTH(CAST(data AS BLOB)) + LENGTH(CAST(turn_id AS BLOB)) + 64), 0) AS bytes
-           FROM session_events WHERE session_id = ? AND seq >= ? AND seq < ?`,
-      )
-      .get(sessionId, fromSeq, toSeq) as { readonly bytes?: number } | undefined;
-    return typeof row?.bytes === "number" ? row.bytes : 0;
+    return { records: Object.freeze(taken), baseSeq, nextSeq };
   }
 
   // -------------------------------------------------------------------------
@@ -1671,6 +1987,43 @@ class SqliteRepository implements Repository {
     );
   }
 
+  /**
+   * Blocks a session whose committed facts cannot be read as what they claim.
+   *
+   * It is written like any other session change: one transaction, a metadata
+   * revision, and a durable answer. A session that is already blocked, or gone,
+   * is left exactly as it is — blocking is not a repair, and there is nothing
+   * here that could undo one.
+   */
+  blockCorruptSession(sessionId: string, at: number): SessionRecord | undefined {
+    const current = this.getSession(sessionId);
+    if (current === undefined || current.status === "blocked") return current;
+
+    return this.write<SessionRecord | undefined>(
+      () => {
+        this.database
+          .prepare(
+            `UPDATE sessions SET
+               status = 'blocked', blocked_reason = 'host-fault',
+               metadata_revision = metadata_revision + 1, updated_at = ?
+             WHERE session_id = ?`,
+          )
+          .run(at, sessionId);
+        this.bump("sessions");
+        return this.getSession(sessionId);
+      },
+      () => {
+        const session = this.getSession(sessionId);
+        if (session !== undefined && session.status === "blocked") {
+          return { kind: "committed" as const, value: session };
+        }
+        return session === undefined
+          ? { kind: "indeterminate" as const }
+          : { kind: "absent" as const };
+      },
+    );
+  }
+
   renameSession(input: RenameInput): RenameOutcome {
     return this.write<RenameOutcome>(
       () => {
@@ -1818,10 +2171,27 @@ class SqliteRepository implements Repository {
   }
 
   private assertRecordFits(record: StoredRecord): void {
-    if (!recordFits(record.data, record.turnId, this.limits.maxRecordBytes)) {
-      const size = Buffer.byteLength(record.data, "utf8") + Buffer.byteLength(record.turnId, "utf8") + RECORD_OVERHEAD_BYTES;
+    const identityBytes = Buffer.byteLength(record.turnId, "utf8");
+    if (identityBytes > MAX_TURN_ID_BYTES || !recordFits(record.data, record.turnId, this.limits.maxRecordBytes)) {
+      const size = Buffer.byteLength(record.data, "utf8") + identityBytes + RECORD_OVERHEAD_BYTES;
       throw new RecordTooLargeError(`a ${record.type} record is ${size} bytes`);
     }
+  }
+}
+
+/** The turn-end reason a status that claims a settled turn must have been written with. */
+function endReasonFor(status: RunStatus): EndReason | undefined {
+  switch (status) {
+    case "completed":
+      return "completed";
+    case "limited":
+      return "max_steps";
+    case "cancelled":
+      return "cancelled";
+    case "failed":
+      return "error";
+    default:
+      return undefined;
   }
 }
 
