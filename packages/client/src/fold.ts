@@ -675,6 +675,15 @@ function liveRunAt(
  * `behind` is the honest gap marker: it is set when the session's committed
  * high-water moved past what has been loaded, so a reader can tell "this is the
  * end of the conversation" from "this is the end of what I have read".
+ *
+ * The loaded conversation is kept as the *pages* it was read as, oldest first,
+ * because a bounded client cache has to forget whole pages and no part of one:
+ * the flattened fields below are derived from the first and last page, and a
+ * page that is evicted moves `fromSeq` up rather than pretending a range was
+ * never read. Eviction is a smaller window — never a claim that history does not
+ * exist, that it is complete, or that the remaining range is contiguous with
+ * what is gone. It takes from the oldest end, so what is kept is the newest
+ * range the client read and `nextCursor` still continues below it.
  */
 export interface HistoryCoverage {
   readonly storageId: Id;
@@ -689,9 +698,146 @@ export interface HistoryCoverage {
   readonly behind: boolean;
   readonly nextCursor: Id | null;
   readonly items: readonly CanonicalItem[];
+  /** The loaded pages this coverage is made of, oldest first. */
+  readonly segments: readonly HistorySegment[];
+}
+
+/** One read page as it landed: the unit a bounded cache may forget. */
+export interface HistorySegment {
+  readonly fromSeq: number;
+  readonly toSeq: number;
+  readonly atStart: boolean;
+  readonly atFence: boolean;
+  /** The cursor that continues below this page, or `null` at the start. */
+  readonly cursorBelow: Id | null;
+  readonly items: readonly CanonicalItem[];
+  /** The encoded size of `items`, so the budget costs nothing to check. */
+  readonly bytes: number;
 }
 
 export type HistoryMap = Readonly<Record<Id, HistoryCoverage>>;
+
+/**
+ * How much of other sessions' history this client keeps.
+ *
+ * A presentation cache, not a store: what it holds is what has been read, and
+ * what it forgets can be read again. The bounds are deliberately simple and
+ * mostly generous — a reader scrolling through a long conversation keeps
+ * hundreds of items, and a client watching several sessions keeps pages for a
+ * handful of them — because their job is to make the cache finite, not to be
+ * tight. Durable history is untouched by any of this: forgetting is local, and
+ * the host still holds every page.
+ */
+export const HISTORY_CACHE_LIMITS = Object.freeze({
+  /** How many sessions may have loaded pages at once. */
+  maxSessions: 8,
+  /** How many items may be held across all sessions. */
+  maxItems: 600,
+  /** How many encoded bytes of items may be held across all sessions. */
+  maxBytes: 768 * 1024,
+});
+
+/** One page's encoded size: what it costs the cache to hold. */
+function segmentBytes(items: readonly CanonicalItem[]): number {
+  return utf8Bytes(JSON.stringify(items));
+}
+
+/**
+ * The bytes a string occupies as UTF-8.
+ *
+ * The client runs in browsers and in Node, so the measurement is the platform's
+ * own encoder where there is one; the fallback is the standard three-byte
+ * worst case, which over-counts nothing and never under-counts a real string.
+ */
+function utf8Bytes(text: string): number {
+  if (typeof TextEncoder === "function") return new TextEncoder().encode(text).length;
+  let bytes = 0;
+  for (const character of text) {
+    const code = character.codePointAt(0) ?? 0;
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+}
+
+/** The flattened view derived from a run of pages, oldest first. */
+function flatten(segments: readonly HistorySegment[], base: Omit<HistoryCoverage, "segments" | "items" | "fromSeq" | "toSeq" | "atStart" | "atFence" | "nextCursor">): HistoryCoverage {
+  // The extremes are found rather than assumed: the oldest page owns `fromSeq`
+  // and the cursor that continues below it, the newest owns `toSeq` and the
+  // fence flag, whatever order the pages happen to sit in.
+  let oldest: HistorySegment | undefined;
+  let newest: HistorySegment | undefined;
+  const items: CanonicalItem[] = [];
+  for (const segment of segments) {
+    if (oldest === undefined || segment.fromSeq < oldest.fromSeq) oldest = segment;
+    if (newest === undefined || segment.toSeq > newest.toSeq) newest = segment;
+    items.push(...segment.items);
+  }
+  items.sort((left, right) => left.seq - right.seq);
+
+  return Object.freeze({
+    ...base,
+    fromSeq: oldest?.fromSeq ?? 0,
+    toSeq: newest?.toSeq ?? 0,
+    atStart: oldest?.atStart ?? false,
+    atFence: newest?.atFence ?? false,
+    nextCursor: oldest?.cursorBelow ?? null,
+    items: Object.freeze(items),
+    segments: Object.freeze([...segments]),
+  });
+}
+
+/**
+ * Drops the newest loaded pages of one session until it fits the cache budget.
+ *
+ * Whole pages, and never the only page: a cache that forgot everything the
+ * moment a conversation got long would be useless. The end that goes is the one
+ * the reader is walking away from — the traversal only ever goes backwards, so
+ * the pages just read are the ones being looked at, and the newest pages are
+ * the ones a fresh traversal can bring back. What stays is exactly what was
+ * read, a contiguous range with its continuation cursor intact; what goes is
+ * reported as not loaded, never as not existing.
+ */
+function trimSegments(segments: readonly HistorySegment[]): readonly HistorySegment[] {
+  const kept = [...segments];
+  while (kept.length > 1) {
+    let items = 0;
+    let bytes = 0;
+    for (const segment of kept) {
+      items += segment.items.length;
+      bytes += segment.bytes;
+    }
+    if (items <= HISTORY_CACHE_LIMITS.maxItems && bytes <= HISTORY_CACHE_LIMITS.maxBytes) break;
+
+    // Forget the *newest* end, not the oldest: a reader is walking backwards,
+    // so the pages just read are the ones being looked at, and dropping the
+    // other end is what keeps the traversal continuous. `fromSeq` and the
+    // continuation cursor are untouched, the newer range simply stops being
+    // loaded — and comes back on the next traversal from the fence.
+    let newest = 0;
+    for (let index = 1; index < kept.length; index += 1) {
+      if ((kept[index]?.toSeq ?? 0) > (kept[newest]?.toSeq ?? 0)) newest = index;
+    }
+    kept.splice(newest, 1);
+  }
+  return Object.freeze(kept);
+}
+
+/** The total items and bytes a map holds, for cross-session eviction. */
+function cacheItems(history: HistoryMap): number {
+  let items = 0;
+  for (const coverage of Object.values(history)) {
+    for (const segment of coverage.segments) items += segment.items.length;
+  }
+  return items;
+}
+
+function cacheBytes(history: HistoryMap): number {
+  let bytes = 0;
+  for (const coverage of Object.values(history)) {
+    for (const segment of coverage.segments) bytes += segment.bytes;
+  }
+  return bytes;
+}
 
 /**
  * Records one page, merging it with what is already loaded.
@@ -700,6 +846,13 @@ export type HistoryMap = Readonly<Record<Id, HistoryCoverage>>;
  * the current coverage at its oldest end — extends it. Anything else replaces
  * it: a page from another fence or another revision is a different traversal,
  * and gluing two traversals together would present a conversation nobody read.
+ *
+ * The result is then brought back inside the client's cache budget. Other
+ * sessions' entries go first, least recently updated before more recent ones —
+ * and the entry being updated is the most recent by definition, so the page that
+ * was just read is never the one eviction takes. An entry that is gone entirely
+ * reads as "not loaded", which is what it is; the directory still lists the
+ * session, and asking again reads it back from the host.
  */
 export function applyHistoryPage(history: HistoryMap, page: HistoryPage): HistoryMap {
   const current = history[page.sessionId];
@@ -710,37 +863,52 @@ export function applyHistoryPage(history: HistoryMap, page: HistoryPage): Histor
     current.fenceSeq === page.fenceSeq &&
     page.coverage.toSeq === current.fromSeq;
 
-  if (!continues || current === undefined) {
-    return Object.freeze({
-      ...history,
-      [page.sessionId]: Object.freeze({
-        storageId: page.storageId,
-        sessionId: page.sessionId,
-        generation: page.generation,
-        historyRevision: page.historyRevision,
-        fenceSeq: page.fenceSeq,
-        fromSeq: page.coverage.fromSeq,
-        toSeq: page.coverage.toSeq,
-        atStart: page.atStart,
-        atFence: page.atFence,
-        behind: false,
-        nextCursor: page.nextCursor,
-        items: Object.freeze([...page.items]),
-      }),
-    });
+  const arriving: HistorySegment = Object.freeze({
+    fromSeq: page.coverage.fromSeq,
+    toSeq: page.coverage.toSeq,
+    atStart: page.atStart,
+    atFence: page.atFence,
+    cursorBelow: page.nextCursor,
+    items: Object.freeze([...page.items]),
+    bytes: segmentBytes(page.items),
+  });
+
+  // The arriving page is older than everything loaded (a traversal only ever
+  // walks backwards), so it goes in front and the pages stay oldest-first.
+  const segments = trimSegments(
+    continues && current !== undefined ? [arriving, ...current.segments] : [arriving],
+  );
+
+  const base = {
+    storageId: page.storageId,
+    sessionId: page.sessionId,
+    generation: page.generation,
+    historyRevision: page.historyRevision,
+    fenceSeq: page.fenceSeq,
+    behind: continues && current !== undefined ? current.behind : false,
+  };
+  const next = flatten(segments, base);
+
+  // Re-insert the touched session last, so the map's own order is "least
+  // recently read first" and eviction takes from the front.
+  const rest: Record<string, HistoryCoverage> = {};
+  for (const [key, value] of Object.entries(history)) {
+    if (key === page.sessionId) continue;
+    rest[key] = value;
+  }
+  rest[page.sessionId] = next;
+
+  while (
+    Object.keys(rest).length > HISTORY_CACHE_LIMITS.maxSessions ||
+    cacheItems(rest) > HISTORY_CACHE_LIMITS.maxItems ||
+    cacheBytes(rest) > HISTORY_CACHE_LIMITS.maxBytes
+  ) {
+    const oldest = Object.keys(rest)[0];
+    if (oldest === undefined || oldest === page.sessionId) break;
+    delete rest[oldest];
   }
 
-  return Object.freeze({
-    ...history,
-    [page.sessionId]: Object.freeze({
-      ...current,
-      historyRevision: page.historyRevision,
-      fromSeq: page.coverage.fromSeq,
-      atStart: page.atStart,
-      nextCursor: page.nextCursor,
-      items: Object.freeze([...page.items, ...current.items]),
-    }),
-  });
+  return Object.freeze(rest);
 }
 
 /** Applies one event's effect on what the client has read. */
