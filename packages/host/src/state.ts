@@ -34,15 +34,25 @@ import type {
 } from "@every-dagent/protocol";
 
 import { storedProtocolError } from "./errors.js";
-import { readSessionPage } from "./history.js";
+import { encodeCursor, readSessionPage } from "./history.js";
 import type { Lease, RegistryGate } from "./registry-gate.js";
-import type { Repository, RunRecord } from "./repository.js";
+import { encodedBytes, type Repository, type RunRecord } from "./repository.js";
 import type { ReverseOutcome, ReverseProfile, ReverseTimer } from "./reverse.js";
 
-/** Where the one open tool occurrence of a run currently sits in `live`. */
+/**
+ * Where the one open tool occurrence of a run currently sits — and whether it
+ * was ever shown.
+ *
+ * `index === undefined` is the whole point: the occurrence is tracked from the
+ * moment the Core reports it, so its result can be matched against it, while
+ * the *presentation* is what the live bound may drop. Nothing about execution
+ * or canonical pairing is allowed to depend on how much of the timeline a
+ * reader was shown.
+ */
 export interface OpenToolSlot {
-  readonly index: number;
+  readonly index: number | undefined;
   readonly invocationId: string;
+  readonly itemId: string;
   readonly callId: string;
   readonly name: string;
 }
@@ -66,14 +76,24 @@ export interface RunEntry {
   readonly runId: string;
   readonly submissionId: string;
   readonly sessionId: string;
-  readonly text: string;
+  /** The accepted input, while this host is the one executing it. */
+  text: string;
   readonly controller: AbortController;
   /** Held from before the run record existed until the drain has settled. */
   readonly lease: Lease;
   readonly acceptedAt: number;
   startedAt: number | null;
   turnId: string | null;
+  /** Whether this host has asked the execution to stop. Display state, not proof. */
   cancelRequested: boolean;
+  /**
+   * Whether storage confirmed the cancel intent.
+   *
+   * Kept apart from `cancelRequested` because they are different facts: the
+   * first is what this host asked for, the second is what the store recorded.
+   * Only the second may ever be reported as a durable success.
+   */
+  cancelDurable: boolean;
   stage: "accepted" | "running";
   live: LiveItem[];
   /** Encoded size of the published timeline, kept so the bound costs nothing to check. */
@@ -365,6 +385,28 @@ export function runEntryOf(state: HostState, runId: string): RunEntry {
   return entry;
 }
 
+/**
+ * Releases one run that has reached a durable terminal.
+ *
+ * A settled run is the repository's fact, not this host's memory. Its entry
+ * leaves the live map — the map holds what is executing, so a long-lived host
+ * does not grow one entry per run it ever ran — and the things it was carrying
+ * (the accepted input, the published timeline, the loaded history window) are
+ * dropped with it. Every later query is answered by the durable record, which
+ * is the authority for a terminal run; a client asking for the run id gets the
+ * same facts it would have gotten from the entry, and after the session is
+ * deleted it gets the deleted-session answer instead of a stale copy.
+ */
+export function retireRun(state: HostState, run: RunEntry): void {
+  state.runs.delete(run.runId);
+  run.text = "";
+  run.live = [];
+  run.liveBytes = 0;
+  run.window = undefined;
+  run.posTool = undefined;
+  run.textItemIndex = undefined;
+}
+
 export function pluginSummaryOf(state: HostState, pluginId: string): PluginSummary {
   const summary = state.plugins.get(pluginId);
   if (summary === undefined) throw new Error(`plugin "${pluginId}" has no published summary`);
@@ -404,6 +446,8 @@ const SNAPSHOT_SESSION_ITEMS = 20;
 const SNAPSHOT_RUN_ITEMS = 20;
 /** How much accepted input the snapshot's run window may carry in total. */
 const SNAPSHOT_RUN_TEXT_BYTES = 48 * 1024;
+/** What the frame envelope adds on top of the snapshot it carries. */
+const SNAPSHOT_FRAME_MARGIN = 1024;
 
 /**
  * One atomic cut of the published state.
@@ -414,6 +458,13 @@ const SNAPSHOT_RUN_TEXT_BYTES = 48 * 1024;
  * repository inside this synchronous step, so the snapshot is exactly what
  * storage held when it was taken.
  *
+ * The whole composition is then held to the frame it has to travel in: the
+ * windows are the part that can honestly shrink, so a snapshot that would not
+ * encode is reduced — run window first, then the directory — with `hasMore`
+ * telling the truth about what was left out. What it never does is publish a
+ * cut that claims completeness it does not have, or fail a subscriber whose
+ * state could have been shown in a smaller window.
+ *
  * The run window is built here rather than by a page reader because it spans
  * sessions: it is the bounded view a subscriber gets for free, not a client's
  * paginated read of one session's runs. The live run, if there is one, is
@@ -421,8 +472,8 @@ const SNAPSHOT_RUN_TEXT_BYTES = 48 * 1024;
  * a pointer to nothing.
  */
 export function captureHostSnapshot(state: HostState, streamId: string): HostSnapshot {
-  const sessions = readSessionPage(state.repository, undefined, SNAPSHOT_SESSION_ITEMS);
-  if ("failure" in sessions) throw new Error("the session directory could not be read");
+  const directory = readSessionPage(state.repository, undefined, SNAPSHOT_SESSION_ITEMS);
+  if ("failure" in directory) throw new Error("the session directory could not be read");
 
   const revisions = state.repository.revisions;
   const items: RunSummary[] = [];
@@ -435,38 +486,93 @@ export function captureHostSnapshot(state: HostState, streamId: string): HostSna
   };
 
   for (const run of state.runs.values()) {
-    // A settled run is the repository's to describe: its live entry still
-    // carries the last stage it ran in and no end at all, while the session
-    // has already cleared its active-run pointer — a pair no snapshot may
-    // publish, and one that would shadow the durable terminal record here.
+    // A settled run is the repository's to describe: its live entry is released
+    // the moment the terminal is durable, so anything still here is executing.
     if (run.terminal !== undefined) continue;
     include(liveRecordOf(run));
   }
 
   const recent = state.repository.listRecentRuns(SNAPSHOT_RUN_ITEMS, SNAPSHOT_RUN_TEXT_BYTES);
-  for (const record of recent) include(record);
-  const hasMoreRuns = recent.length >= SNAPSHOT_RUN_ITEMS || state.repository.listRecentRuns(SNAPSHOT_RUN_ITEMS + 1, SNAPSHOT_RUN_TEXT_BYTES).length > recent.length;
+  for (const record of recent.records) include(record);
 
-  const plugins = state.pluginOrder.map((pluginId) => pluginSummaryOf(state, pluginId));
+  let sessions = directory.page;
+  let runs = items;
+  let hasMoreRuns = recent.hasMore;
 
-  return Object.freeze({
-    hostInstanceId: state.hostInstanceId,
-    watermark: Object.freeze({ streamId, sequence: 0 }),
-    storage: Object.freeze({
-      storageId: state.repository.storageId,
-      retention: state.repository.retention,
-      schemaVersion: state.repository.schemaVersion,
-    }),
-    collections: revisions,
-    sessions: sessions.page,
-    runs: Object.freeze({
-      items: Object.freeze(items),
-      collectionRevision: revisions.runs,
-      nextCursor: null,
-      hasMore: hasMoreRuns,
-    }),
-    plugins: Object.freeze(plugins),
-  });
+  const compose = (): HostSnapshot =>
+    Object.freeze({
+      hostInstanceId: state.hostInstanceId,
+      watermark: Object.freeze({ streamId, sequence: 0 }),
+      storage: Object.freeze({
+        storageId: state.repository.storageId,
+        retention: state.repository.retention,
+        schemaVersion: state.repository.schemaVersion,
+      }),
+      collections: revisions,
+      sessions,
+      runs: Object.freeze({
+        items: Object.freeze(runs),
+        collectionRevision: revisions.runs,
+        nextCursor: null,
+        hasMore: hasMoreRuns,
+      }),
+      plugins: Object.freeze(state.pluginOrder.map((pluginId) => pluginSummaryOf(state, pluginId))),
+    });
+
+  let snapshot = compose();
+  const budget = state.limits.maxFrameBytes - SNAPSHOT_FRAME_MARGIN;
+
+  // Shrink honestly, and only in the ways the snapshot can account for: a
+  // terminal run leaves the window first, then a session that points at no
+  // run. The executing run and the session pointing at it are never dropped —
+  // they are the pair the cut exists for.
+  while (encodedBytes(snapshot) > budget) {
+    const droppable = lastIndexWhere(runs, (run) => run.status !== "accepted" && run.status !== "running");
+    if (droppable >= 0) {
+      runs = [...runs.slice(0, droppable), ...runs.slice(droppable + 1)];
+      hasMoreRuns = true;
+      snapshot = compose();
+      continue;
+    }
+    const lastSession = lastIndexWhere(sessions.items, (session) => session.activeRunId === null);
+    if (lastSession >= 0) {
+      const kept = sessions.items.filter((_, index) => index !== lastSession);
+      const last = kept[kept.length - 1];
+      sessions = Object.freeze({
+        items: Object.freeze(kept),
+        collectionRevision: sessions.collectionRevision,
+        nextCursor:
+          last === undefined
+            ? null
+            : encodeCursor({
+                v: 1,
+                kind: "sessions",
+                storageId: state.repository.storageId,
+                collectionRevision: revisions.sessions,
+                updatedAt: last.updatedAt,
+                sessionId: last.sessionId,
+              }),
+        hasMore: true,
+      });
+      snapshot = compose();
+      continue;
+    }
+    // Nothing left that may honestly be dropped, and it still does not fit.
+    // Publishing a cut that cannot travel would be a lie about the state; the
+    // caller answers with its own failure instead.
+    throw new Error("the snapshot cannot be published inside one frame");
+  }
+
+  return snapshot;
+}
+
+/** The last position a predicate accepts, or -1. */
+function lastIndexWhere<T>(items: readonly T[], accept: (item: T) => boolean): number {
+  for (let index = items.length - 1; index >= 0; index--) {
+    const item = items[index];
+    if (item !== undefined && accept(item)) return index;
+  }
+  return -1;
 }
 
 /**

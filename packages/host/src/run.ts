@@ -26,13 +26,7 @@
 
 import { restoreSessionWindow } from "@every-dagent/agent-core";
 import type { AgentRuntime, RuntimeEvent, Session, TurnEndReason } from "@every-dagent/agent-core";
-import type {
-  LiveToolItem,
-  OperationMap,
-  ProtocolError,
-  SessionSummary,
-  TerminalRunSnapshot,
-} from "@every-dagent/protocol";
+import type { LiveToolItem, OperationMap, ProtocolError } from "@every-dagent/protocol";
 
 import {
   assertEventBuilds,
@@ -43,7 +37,6 @@ import {
   runToolCallEvent,
   runToolResultEvent,
   runUpdatedEvent,
-  sessionUpdatedEvent,
   type EventBuilder,
 } from "./connection.js";
 import {
@@ -56,11 +49,16 @@ import {
 import { sessionSummaryOf } from "./history.js";
 import { ProjectionError, projectDisplayInput, projectSettledTurn } from "./projection.js";
 import {
+  assertStoredRange,
+  CommitOutcomeUnknownError,
+  encodedBytes,
   encodeStoredData,
-  RecordTooLargeError,
   submissionHash,
   toSessionEvent,
+  userRecordFits,
+  type CommitTurnInput,
   type CommitTurnResult,
+  type RunRecord,
   type StoredRecord,
 } from "./repository.js";
 import {
@@ -68,6 +66,7 @@ import {
   newId,
   operationFailed,
   operationSucceeded,
+  retireRun,
   runSnapshotOf,
   runSnapshotOfRecord,
   terminalSnapshotOfRecord,
@@ -87,6 +86,9 @@ const WINDOW_MAX_BYTES = 256 * 1024;
 /** How much live timeline one run may publish before the view is marked truncated. */
 const MAX_LIVE_ITEMS = 200;
 const MAX_LIVE_BYTES = 128 * 1024;
+
+/** What one live item's own envelope costs on top of its encoded content. */
+const LIVE_ITEM_OVERHEAD = 192;
 
 /**
  * Accepts one submission, or reports why it was refused.
@@ -110,6 +112,13 @@ export function startRun(
   if (textBytes > state.limits.maxInputBytes) {
     // Refused before admission, so nothing is recorded that could not be
     // answered later: the input bound is checked while it is still a request.
+    return operationFailed(limitExceededError());
+  }
+  if (!userRecordFits(params.text, state.limits.maxRecordBytes)) {
+    // The raw bound is not the durable bound. A 16 KiB input of control
+    // characters escapes to far more than one record may hold, and that is
+    // knowable now — before a submission, a run, a model call or a tool. An
+    // input whose user fact could never be stored is refused as a request.
     return operationFailed(limitExceededError());
   }
   if (state.closing) return operationFailed(shuttingDownError());
@@ -150,8 +159,12 @@ export function startRun(
       hostInstanceId: state.hostInstanceId,
       acceptedAt,
     });
-  } catch {
-    markStorageFault(state);
+  } catch (error) {
+    // The admission's own evidence already decided this: a lost receipt whose
+    // batch landed returns `admitted` above, so reaching here means the batch
+    // either provably did not land or could not be judged. Either way nothing
+    // may execute on it, and nothing is announced.
+    if (error instanceof CommitOutcomeUnknownError) markStorageFault(state);
     lease.release();
     return operationFailed(storageUnavailableError());
   }
@@ -194,6 +207,7 @@ export function startRun(
     startedAt: null,
     turnId: null,
     cancelRequested: false,
+    cancelDurable: false,
     stage: "accepted",
     live: [],
     liveBytes: 0,
@@ -240,33 +254,49 @@ export function startRun(
  * waits for the turn to stop: the caller gets the current snapshot, and the
  * run's real outcome arrives when the Core settles.
  *
- * A store that cannot record the intent is reported as a failure rather than
- * dressed up as a durable request — but it never stops the abort. Stopping work
- * is the one thing a broken store must not prevent.
+ * Two facts are deliberately kept apart, because they are not the same fact:
+ * `cancelRequested` is that *this host* asked the execution to stop, and
+ * `cancelDurable` is that storage confirmed the intent. A store that cannot
+ * record the intent never stops the abort — stopping work is the one thing a
+ * broken store must not prevent — but it also never turns into a success
+ * message: a repeated request re-tries the durable write and answers from what
+ * storage now says, never from the in-memory flag alone.
  */
 export function cancelRun(state: HostState, runId: string): OperationOutcome<RunResult> {
   const run = state.runs.get(runId);
   if (run !== undefined) {
     if (run.terminal !== undefined) return operationSucceeded({ run: run.terminal.snapshot });
-    if (run.cancelRequested) return operationSucceeded({ run: runSnapshotOf(run) });
+    if (run.cancelRequested && run.cancelDurable) return operationSucceeded({ run: runSnapshotOf(run) });
 
+    const first = !run.cancelRequested;
     run.cancelRequested = true;
-    let durable = true;
-    try {
-      state.repository.requestCancel(runId, Date.now());
-    } catch {
-      markStorageFault(state);
-      durable = false;
+
+    if (!state.storageFault) {
+      try {
+        const record = state.repository.requestCancel(runId, Date.now());
+        run.cancelDurable = record.cancelRequested;
+        if (record.status !== "accepted" && record.status !== "running") {
+          // The store already holds this run's outcome — it is the durable
+          // terminal that is the answer, and cancelling executes nothing.
+          return operationSucceeded({ run: runSnapshotOfRecord(record, storedError(record.errorCode)) });
+        }
+      } catch (error) {
+        if (error instanceof CommitOutcomeUnknownError) markStorageFault(state);
+      }
     }
 
-    run.controller.abort();
-    try {
-      publishValidatedEvent(state, runUpdatedEvent(run, activeRunSnapshotOf(run)));
-    } catch {
-      run.faulted = true;
+    // The abort is asked for whatever storage said, and it is asked for once:
+    // a repeat merely re-checks the durable intent.
+    if (first) {
+      run.controller.abort();
+      try {
+        publishValidatedEvent(state, runUpdatedEvent(run, activeRunSnapshotOf(run)));
+      } catch {
+        run.faulted = true;
+      }
     }
 
-    return durable
+    return run.cancelDurable
       ? operationSucceeded({ run: runSnapshotOf(run) })
       : operationFailed(storageUnavailableError());
   }
@@ -285,6 +315,11 @@ export function cancelRun(state: HostState, runId: string): OperationOutcome<Run
 /**
  * Reads one run: the live one if this host is running it, otherwise the durable
  * record. Never an execution.
+ *
+ * A durable terminal is only served when it agrees with the history it claims:
+ * the run's recorded range has to be the turn the store's own index holds. A
+ * record that disagrees is not a run this host can describe, and describing it
+ * anyway would hand a reader a terminal pointing at somebody else's turn.
  */
 export function readRun(state: HostState, params: { readonly runId?: string; readonly submissionId?: string }): OperationOutcome<RunResult> {
   if (params.runId !== undefined) {
@@ -292,6 +327,7 @@ export function readRun(state: HostState, params: { readonly runId?: string; rea
     if (live !== undefined) return operationSucceeded({ run: runSnapshotOf(live) });
     const record = state.repository.getRun(params.runId);
     if (record === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
+    if (!servesRun(state, record)) return operationFailed(protocolError("INTERNAL_ERROR"));
     return operationSucceeded({ run: runSnapshotOfRecord(record, storedError(record.errorCode)) });
   }
 
@@ -305,7 +341,18 @@ export function readRun(state: HostState, params: { readonly runId?: string; rea
   if (live !== undefined) return operationSucceeded({ run: runSnapshotOf(live) });
   const record = state.repository.getRun(known.runId);
   if (record === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
+  if (!servesRun(state, record)) return operationFailed(protocolError("INTERNAL_ERROR"));
   return operationSucceeded({ run: runSnapshotOfRecord(record, storedError(record.errorCode)) });
+}
+
+/** Whether a durable run record's committed range is the turn the index holds. */
+export function servesRun(state: HostState, record: RunRecord): boolean {
+  if (record.status === "accepted" || record.status === "running") return true;
+  try {
+    return state.repository.verifyRunHistory(record);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -343,17 +390,18 @@ async function drainRun(state: HostState, run: RunEntry): Promise<void> {
  *
  * Everything the run will do waits on this: a run whose start was never
  * committed may not call a model or a tool, because the record would then
- * disagree with what actually happened. A store that cannot record the start
- * stops the run here, and the accepted record stays behind for the next start
- * to reconcile as `not-started`.
+ * disagree with what actually happened. A marker whose receipt was lost but
+ * whose row is present is committed — the write layer proves it by reading it
+ * back — and the run proceeds; a marker that could not be confirmed stops the
+ * run without executing anything.
  */
 function beginRun(state: HostState, run: RunEntry): boolean {
   try {
     const record = state.repository.markRunStarted(run.runId, state.hostInstanceId, Date.now());
     run.startedAt = record.startedAt ?? Date.now();
     run.stage = "running";
-  } catch {
-    markStorageFault(state);
+  } catch (error) {
+    if (error instanceof CommitOutcomeUnknownError) markStorageFault(state);
     failRun(state, run);
     return false;
   }
@@ -377,11 +425,15 @@ function beginRun(state: HostState, run: RunEntry): boolean {
  *
  * The window is a read of storage, not a restore of the session: a long
  * conversation costs the same here as a short one, and the part that is not
- * loaded is never presented as if it were.
+ * loaded is never presented as if it were. What is loaded is checked before it
+ * becomes a model context — positions, turn closure and tool pairing — because
+ * a window that cannot be proven to be a whole suffix of committed history is
+ * exactly the history a model must never be handed.
  */
 function loadWindow(state: HostState, run: RunEntry): RunEntry["window"] {
   try {
     const read = state.repository.readTurnWindow(run.sessionId, WINDOW_MAX_TURNS, WINDOW_MAX_BYTES);
+    assertStoredRange(read.records, { partialPrefix: false, baseSeq: read.baseSeq });
     const session: Session = restoreSessionWindow(run.sessionId, {
       baseSeq: read.baseSeq,
       nextSeq: read.nextSeq,
@@ -389,6 +441,10 @@ function loadWindow(state: HostState, run: RunEntry): RunEntry["window"] {
     });
     return { session, baseSeq: read.baseSeq, loadedSeq: read.records.length };
   } catch {
+    // Either the store could not be read or what it holds cannot be read as the
+    // fact it claims to be — a corrupt record is refused exactly like a
+    // missing one. The run does not execute against a history it cannot trust,
+    // and the ordinary host-fault path blocks the session.
     return undefined;
   }
 }
@@ -460,15 +516,32 @@ function bindTurnId(state: HostState, run: RunEntry, turnId: string): void {
   publishValidatedEvent(state, runUpdatedEvent(run, activeRunSnapshotOf(run)));
 }
 
-/** Whether the live timeline is still being published, and still within its bounds. */
-function liveHasRoom(run: RunEntry, cost: number): boolean {
+/**
+ * Whether the live timeline is still being published, and still within its
+ * bounds.
+ *
+ * `cost` is the *encoded* cost of what is about to be shown — the JSON the
+ * frame will actually carry, escaping included — because that number, and not
+ * the length of the text behind it, is what a reader pays for. The bound is a
+ * display bound only: reaching it stops the view from growing and says so.
+ */
+function liveHasRoom(state: HostState, run: RunEntry, cost: number): boolean {
   if (run.liveTruncated) return false;
   if (run.live.length >= MAX_LIVE_ITEMS || run.liveBytes + cost > MAX_LIVE_BYTES) {
-    // The run keeps going; only the view stops growing, and it says so.
+    // The run keeps going; only the view stops growing, and it says so — now,
+    // rather than at the next increment, which may never come.
     run.liveTruncated = true;
+    attempt(run, () => {
+      publishValidatedEvent(state, runUpdatedEvent(run, activeRunSnapshotOf(run)));
+    });
     return false;
   }
   return true;
+}
+
+/** One live item's real cost as published: its encoded content plus its envelope. */
+function liveItemCost(item: LiveToolItem | { readonly kind: "text"; readonly itemId: string; readonly text: string }): number {
+  return encodedBytes(item) + LIVE_ITEM_OVERHEAD;
 }
 
 /**
@@ -478,7 +551,8 @@ function liveHasRoom(run: RunEntry, cost: number): boolean {
  * carry never becomes part of the run's published live view.
  */
 function appendLiveText(state: HostState, run: RunEntry, text: string): void {
-  if (!liveHasRoom(run, Buffer.byteLength(text, "utf8"))) return;
+  const escaped = Math.max(0, encodedBytes(text) - 2);
+  if (!liveHasRoom(state, run, escaped)) return;
 
   const index = run.textItemIndex;
   let itemId: string;
@@ -490,7 +564,7 @@ function appendLiveText(state: HostState, run: RunEntry, text: string): void {
     commitLive(state, build, () => {
       run.textItemIndex = run.live.length;
       run.live.push(item);
-      run.liveBytes += Buffer.byteLength(text, "utf8");
+      run.liveBytes += liveItemCost(item);
     });
     return;
   }
@@ -501,9 +575,10 @@ function appendLiveText(state: HostState, run: RunEntry, text: string): void {
   }
   itemId = previous.itemId;
   const build = runOutputDeltaEvent(run, itemId, text);
+  const grown = Object.freeze({ kind: "text" as const, itemId, text: previous.text + text });
   commitLive(state, build, () => {
-    run.live[index] = Object.freeze({ kind: "text" as const, itemId, text: previous.text + text });
-    run.liveBytes += Buffer.byteLength(text, "utf8");
+    run.live[index] = grown;
+    run.liveBytes += liveItemCost(grown) - liveItemCost(previous);
   });
 }
 
@@ -514,6 +589,12 @@ function appendLiveText(state: HostState, run: RunEntry, text: string): void {
  * call id and allows the same one to be used again in the next step, so two
  * calls that look alike are still two calls, each with its own item and its own
  * invocation id.
+ *
+ * The bookkeeping and the presentation are separated on purpose. A call whose
+ * display does not fit the live budget is still a call: it is tracked so its
+ * result can be matched against it, and so the run's canonical outcome never
+ * depends on how much of the timeline a reader happened to be shown. Only the
+ * *showing* is bounded; nothing about execution is.
  */
 function openLiveToolCall(
   state: HostState,
@@ -523,28 +604,38 @@ function openLiveToolCall(
   if (run.posTool !== undefined) {
     throw new ProjectionError("a tool call arrived while another call was still open");
   }
-  if (!liveHasRoom(run, 256)) return;
 
+  // The occurrence is established first, unconditionally: pairing is execution
+  // bookkeeping, and it must hold whether or not the item is ever published.
+  const invocationId = newLiveId(run, "call");
   const item: LiveToolItem = Object.freeze({
     kind: "tool" as const,
     itemId: newLiveId(run, "item"),
-    invocationId: newLiveId(run, "call"),
+    invocationId,
     callId: event.callId,
     name: event.name,
     input: projectDisplayInput(event.input),
     result: null,
   });
+  const slot = {
+    index: undefined as number | undefined,
+    invocationId,
+    itemId: item.itemId,
+    callId: event.callId,
+    name: event.name,
+  };
+
+  if (!liveHasRoom(state, run, liveItemCost(item))) {
+    run.posTool = slot;
+    run.textItemIndex = undefined;
+    return;
+  }
 
   const build = runToolCallEvent(run, item);
   commitLive(state, build, () => {
-    run.posTool = {
-      index: run.live.length,
-      invocationId: item.invocationId,
-      callId: item.callId,
-      name: item.name,
-    };
+    run.posTool = { ...slot, index: run.live.length };
     run.live.push(item);
-    run.liveBytes += 256;
+    run.liveBytes += liveItemCost(item);
     // A tool call ends the current text item: the next chunk starts a new one.
     run.textItemIndex = undefined;
   });
@@ -555,6 +646,9 @@ function openLiveToolCall(
  *
  * `ok: false` is recorded as it is: the Core reports a failed observation and
  * an undispatched call the same way, and the host does not guess which it was.
+ * The occurrence is matched on every path — including the truncated one — and
+ * is always closed by the result that answers it, so a bounded view can never
+ * leave the run's own bookkeeping stuck.
  */
 function closeLiveToolCall(
   state: HostState,
@@ -568,18 +662,37 @@ function closeLiveToolCall(
   if (open.callId !== event.callId || open.name !== event.name) {
     throw new ProjectionError("a tool result did not match the open call");
   }
-  if (run.liveTruncated) return;
+  if (open.index === undefined) {
+    // The call was never shown, so there is nothing to fill in; the result was
+    // still matched, which is what the canonical turn needs.
+    run.posTool = undefined;
+    return;
+  }
+
+  const index = open.index;
+  const previous = run.live[index];
+  if (previous === undefined || previous.kind !== "tool") {
+    throw new ProjectionError("the open tool item lost its place in the timeline");
+  }
+
+  const filled = Object.freeze({
+    ...previous,
+    result: Object.freeze({ ok: event.ok, content: event.content }),
+  });
+  // The result is the largest thing an occurrence ever carries, so it is what
+  // the live budget is really spent on — measured as the item will encode, not
+  // estimated from the call.
+  if (!liveHasRoom(state, run, liveItemCost(filled) - liveItemCost(previous))) {
+    // The view stops here: the call stays visible without its result, and the
+    // run says the timeline was truncated rather than showing half of one.
+    run.posTool = undefined;
+    return;
+  }
 
   const build = runToolResultEvent(run, open.invocationId, event.ok, event.content);
   commitLive(state, build, () => {
-    const previous = run.live[open.index];
-    if (previous === undefined || previous.kind !== "tool") {
-      throw new ProjectionError("the open tool item lost its place in the timeline");
-    }
-    run.live[open.index] = Object.freeze({
-      ...previous,
-      result: Object.freeze({ ok: event.ok, content: event.content }),
-    });
+    run.live[index] = filled;
+    run.liveBytes += liveItemCost(filled) - liveItemCost(previous);
     run.posTool = undefined;
   });
 }
@@ -652,38 +765,57 @@ function coreTerminal(state: HostState, run: RunEntry): TerminalBatch | undefine
   }
 }
 
+/** The terminal batch, as one value: what is committed is what is retried. */
+function terminalInput(run: RunEntry, batch: TerminalBatch): CommitTurnInput {
+  return {
+    runId: run.runId,
+    sessionId: run.sessionId,
+    turnId: batch.turnId,
+    reason: batch.reason,
+    turnStartSeq: batch.turnStartSeq,
+    records: batch.records,
+    endedAt: Date.now(),
+  };
+}
+
 /**
  * The terminal commit: the turn's events, the run's outcome and the session's
  * new summary, in one transaction.
  *
- * Nothing is published before this returns. A commit that fails leaves the
- * durable record exactly as it was — an unfinished run the next start will
- * reconcile — and this host then says what it honestly can, which is not the
- * same as claiming the outcome was recorded.
+ * Nothing is published before this returns, and what it returns is only ever
+ * one of two things: the batch is durably committed (possibly proven so after
+ * a lost receipt, in which case the *verified* records are what is published),
+ * or the store could not be made to say. A definitive failure — a refusal the
+ * store proved, like a record it cannot keep whole — is retried once as the
+ * same storage batch, and never by re-running anything: the Runtime has already
+ * settled, the model is not called again, and no tool is dispatched twice. What
+ * this function never does is publish a completed or failed terminal the store
+ * does not hold.
  */
 function commitTerminal(state: HostState, run: RunEntry, batch: TerminalBatch): boolean {
-  let result: CommitTurnResult;
-  try {
-    result = state.repository.commitTurn({
-      runId: run.runId,
-      sessionId: run.sessionId,
-      turnId: batch.turnId,
-      reason: batch.reason,
-      turnStartSeq: batch.turnStartSeq,
-      records: batch.records,
-      endedAt: Date.now(),
-    });
-  } catch (error) {
-    if (error instanceof RecordTooLargeError) {
-      // A settled turn the store cannot keep whole. Truncating it would make a
-      // different conversation, so the turn is refused and the session is
-      // blocked with the old canonical untouched.
-      markSessionBlocked(state, run.sessionId);
-      return false;
+  let result: CommitTurnResult | undefined;
+
+  for (let attempt = 1; attempt <= 2 && result === undefined; attempt++) {
+    try {
+      result = state.repository.commitTurn(terminalInput(run, batch));
+    } catch (error) {
+      if (error instanceof CommitOutcomeUnknownError) {
+        // The batch may or may not be recorded, and nothing the host could say
+        // would be true. The run stays unfinished for this host's own readers —
+        // exactly the state a restart reconciles to `interrupted` — and every
+        // later write is refused until the store can be trusted again.
+        markStorageFault(state);
+        return false;
+      }
+      if (attempt === 2) {
+        // Two definitive refusals. The store has proven the batch is not
+        // there; the honest record of what happened is a host failure, and
+        // `failRun` writes one — or leaves the run unfinished when it cannot.
+        return false;
+      }
     }
-    markStorageFault(state);
-    return false;
   }
+  if (result === undefined) return false;
 
   const snapshot = terminalSnapshotOfRecord(result.run, null);
   const summary = sessionSummaryOf(result.session);
@@ -696,13 +828,18 @@ function commitTerminal(state: HostState, run: RunEntry, batch: TerminalBatch): 
  *
  * The previously committed canonical is kept exactly as it is and the session
  * is blocked: a turn the host could not validate or could not keep whole is not
- * repaired, not completed, and not turned into history. When the store cannot
- * record even this, the in-memory outcome is published and the durable record
- * deliberately stays unfinished — the next start will reconcile it to
- * `interrupted`, which is what the store actually knows.
+ * repaired, not completed, and not turned into history. The failure is recorded
+ * durably, because a terminal a client sees must be a terminal the store holds.
+ *
+ * When the store cannot record it — or cannot be trusted to say whether it did
+ * — nothing is published at all. A fabricated in-memory `failed` would be a
+ * claim storage is entitled to contradict, and the honest statement is the one
+ * the durable record makes: an unfinished run, which the next start reconciles
+ * to `interrupted`. Refusing to invent that outcome is the whole point of the
+ * rule; the run keeps its unfinished live state and every later write reports
+ * the store as unavailable.
  */
 function failRun(state: HostState, run: RunEntry): void {
-  const at = Date.now();
   const failure = protocolError("INTERNAL_ERROR");
 
   if (!state.storageFault) {
@@ -712,7 +849,7 @@ function failRun(state: HostState, run: RunEntry): void {
         sessionId: run.sessionId,
         blockedReason: "host-fault",
         errorCode: failure.code,
-        endedAt: at,
+        endedAt: Date.now(),
         turnId: run.turnId,
       });
       applyTerminal(state, run, {
@@ -721,73 +858,9 @@ function failRun(state: HostState, run: RunEntry): void {
         revisions: result.revisions,
       });
       return;
-    } catch {
-      markStorageFault(state);
+    } catch (error) {
+      if (error instanceof CommitOutcomeUnknownError) markStorageFault(state);
     }
-  }
-
-  const summary = readSummary(state, run.sessionId);
-  if (summary === null) {
-    // Even the session cannot be read. The run is marked terminal for this
-    // host's own readers and nothing is published, because there is no honest
-    // session summary to publish it with.
-    run.terminal = {
-      snapshot: localFailureSnapshot(run, failure),
-      summary: localBlockedSummary(run.sessionId),
-      revisions: state.repository.revisions,
-    };
-    return;
-  }
-  applyTerminal(state, run, {
-    snapshot: localFailureSnapshot(run, failure),
-    summary: Object.freeze({ ...summary, status: "blocked" as const, blockedReason: "host-fault" as const, activeRunId: null }),
-    revisions: state.repository.revisions,
-  });
-}
-
-function localFailureSnapshot(run: RunEntry, error: ProtocolError): TerminalRunSnapshot {
-  return Object.freeze({
-    runId: run.runId,
-    submissionId: run.submissionId,
-    sessionId: run.sessionId,
-    text: run.text,
-    turnId: run.turnId,
-    cancelRequested: run.cancelRequested,
-    acceptedAt: run.acceptedAt,
-    startedAt: run.startedAt,
-    endedAt: Date.now(),
-    status: "failed" as const,
-    endReason: "host_error" as const,
-    error,
-    executionKnowledge: null,
-    live: null,
-  });
-}
-
-function localBlockedSummary(sessionId: string): SessionSummary {
-  // Only reached when the session row itself cannot be read; the fields are the
-  // minimum a blocked session has to state, and none of them is invented.
-  return Object.freeze({
-    sessionId,
-    generation: 1,
-    title: "会话",
-    createdAt: 0,
-    updatedAt: 0,
-    status: "blocked" as const,
-    blockedReason: "host-fault" as const,
-    metadataRevision: 0,
-    historyRevision: 0,
-    committedSeq: 0,
-    activeRunId: null,
-  });
-}
-
-function readSummary(state: HostState, sessionId: string): SessionSummary | null {
-  try {
-    const record = state.repository.getSession(sessionId);
-    return record === undefined ? null : sessionSummaryOf(record);
-  } catch {
-    return null;
   }
 }
 
@@ -799,6 +872,9 @@ function readSummary(state: HostState, sessionId: string): SessionSummary | null
  * with the one the commit produced, and the single event that carries both is
  * queued. There is no `await` and no call into the channel between these lines,
  * so a read or a snapshot cannot land in the middle of it.
+ *
+ * The last thing it does is release the entry: a durable terminal is the
+ * repository's fact, and from here on the run is answered from there.
  */
 function applyTerminal(state: HostState, run: RunEntry, record: TerminatedRun): void {
   const build = runEndedEvent(run, record.snapshot, record.summary, record.revisions);
@@ -811,11 +887,13 @@ function applyTerminal(state: HostState, run: RunEntry, record: TerminatedRun): 
 
   run.terminal = record;
   publishEvent(state, build);
+  retireRun(state, run);
 }
 
 /** The same commit without an announcement. */
 function applyTerminalLocally(state: HostState, run: RunEntry, record: TerminatedRun): void {
   run.terminal = record;
+  retireRun(state, run);
 }
 
 function newLiveId(run: RunEntry, kind: string): string {
@@ -830,22 +908,4 @@ function storedError(code: string | null): ProtocolError | null {
 /** Marks the host unable to confirm writes, and says so once. */
 export function markStorageFault(state: HostState): void {
   state.storageFault = true;
-}
-
-/** Blocks one session without a run outcome: the store refused a record it could not keep whole. */
-function markSessionBlocked(state: HostState, sessionId: string): void {
-  try {
-    const summary = readSummary(state, sessionId);
-    if (summary === null) return;
-    const blocked = Object.freeze({
-      ...summary,
-      status: "blocked" as const,
-      blockedReason: "host-fault" as const,
-      activeRunId: null,
-    });
-    publishEvent(state, sessionUpdatedEvent(blocked, state.repository.revisions));
-  } catch {
-    // A session that cannot be read cannot be announced; the run's own failure
-    // still reports what happened.
-  }
 }

@@ -43,6 +43,12 @@ import type {
 } from "@every-dagent/protocol";
 import { validateJsonValue } from "@every-dagent/protocol";
 
+/** What one write's own evidence proves about a batch whose receipt was lost. */
+type WriteVerdict<T> =
+  | { readonly kind: "committed"; readonly value: T }
+  | { readonly kind: "absent" }
+  | { readonly kind: "indeterminate" };
+
 /** The schema generation this build writes and reads. */
 export const SCHEMA_VERSION = 1;
 
@@ -121,6 +127,18 @@ export interface SessionPage {
 }
 
 export interface RunPage {
+  readonly records: readonly RunRecord[];
+  readonly hasMore: boolean;
+}
+
+/**
+ * A bounded recent-run window, with the truth about what it left out.
+ *
+ * `hasMore` is answered by the read that produced the window — a row it fetched
+ * and did not return, or a row it refused to fetch because the byte budget was
+ * spent — never inferred from the count it happens to hold.
+ */
+export interface RecentRunPage {
   readonly records: readonly RunRecord[];
   readonly hasMore: boolean;
 }
@@ -235,11 +253,42 @@ export class RecordTooLargeError extends Error {
   }
 }
 
+/**
+ * A stored fact that is not the shape its type promises.
+ *
+ * Corruption is never repaired into a legal value: a payload that does not hold
+ * what a committed record of its type must hold is refused at the point it would
+ * be read, so it can never become a model context or a published item.
+ */
+export class CorruptRecordError extends Error {
+  constructor(detail: string) {
+    super(`the stored fact is not what its type promises: ${detail}`);
+    this.name = "CorruptRecordError";
+  }
+}
+
 /** The storage could not be opened, or its schema is not one this build knows. */
 export class StorageOpenError extends Error {
   constructor(detail: string) {
     super(`the durable store cannot be opened: ${detail}`);
     this.name = "StorageOpenError";
+  }
+}
+
+/**
+ * A write whose COMMIT receipt was lost without the durable outcome being
+ * provable.
+ *
+ * It is deliberately not a failure: a lost receipt is a failure to *know*, and
+ * a caller that treated it as "nothing happened" would publish a state the
+ * store may already disagree with. A write that can prove its batch landed
+ * returns the committed result instead; a write that can prove it did not
+ * rethrows its own error. Only the genuinely undecidable case arrives here.
+ */
+export class CommitOutcomeUnknownError extends Error {
+  constructor(detail: string) {
+    super(`the commit outcome could not be determined: ${detail}`);
+    this.name = "CommitOutcomeUnknownError";
   }
 }
 
@@ -262,10 +311,28 @@ export interface Repository {
   getRun(runId: string): RunRecord | undefined;
   getSubmission(submissionId: string): SubmissionRecord | undefined;
   listRunsBySession(sessionId: string, limit: number, after: RunCursorKey | null): RunPage;
-  listRecentRuns(limit: number, maxTextBytes: number): readonly RunRecord[];
+  listRecentRuns(limit: number, maxBytes: number): RecentRunPage;
   listUnfinishedRuns(): readonly RunRecord[];
   readHistory(sessionId: string, beforeSeq: number, maxEvents: number): HistoryRead;
   readTurnWindow(sessionId: string, maxTurns: number, maxBytes: number): TurnWindowRead;
+  /**
+   * Whether a run's recorded committed range is the turn the index holds.
+   *
+   * A terminal run and the history it claims to have produced are two rows that
+   * became true in one transaction; a reader that finds them disagreeing is
+   * reading a store this build did not write, and refuses the fact rather than
+   * serving a run whose history is somebody else's.
+   */
+  verifyRunHistory(run: RunRecord): boolean;
+  /**
+   * The durable evidence for one terminal batch.
+   *
+   * `committed` means every part of the batch — the events of the range, the
+   * turn index, the run terminal and the session's new high-water — is present
+   * and agrees; `absent` means the store proves the batch never landed; anything
+   * else is `indeterminate`, which is exactly as much as the store knows.
+   */
+  verifyTurnCommit(input: CommitTurnInput): "committed" | "absent" | "indeterminate";
 
   // Writes. Each one is a transaction.
   createSession(input: CreateSessionInput): SessionRecord;
@@ -294,16 +361,26 @@ export interface Repository {
 /**
  * Encodes one event's payload for storage.
  *
- * Every field a settled turn produced is kept; the one field the store cannot
- * keep verbatim is a tool call's input, because a Core tool call may carry a
- * value JSON cannot represent. That value is stored as the display projection
- * the commit already computed — a deep JSON snapshot when there is one, and an
- * explicit `unavailable` otherwise. The alternative, storing `null` for both,
- * would make an unrepresentable input indistinguishable from a real `null`.
+ * Every field a settled turn produced is kept; two fields the store cannot keep
+ * verbatim are rewritten here, and both rewrites are the point:
+ *
+ * - a tool call's input may carry a value JSON cannot represent. That value is
+ *   stored as the display projection the commit already computed — a deep JSON
+ *   snapshot when there is one, and an explicit `unavailable` otherwise, so an
+ *   unrepresentable input is never confused with a real `null`. Managed
+ *   execution does not let such a call settle, so this branch exists for
+ *   records a different profile wrote, and for display.
+ * - a `turn/end` error is Core-visible text that may quote a provider's own
+ *   words — headers, bodies, URLs, an authorization header. A durable record may
+ *   carry a fixed classification but never that text, so the field is kept as a
+ *   presence marker and its content is dropped.
  */
 export function encodeStoredData(event: SessionEvent): string {
   return JSON.stringify(payloadOf(event));
 }
+
+/** The fixed marker a stored error turn carries: the fact, never the words. */
+export const STORED_ERROR_MARKER = "the turn ended in an error";
 
 /** The display projection recorded alongside a tool call's input. */
 function displayOf(input: unknown): DisplayInput {
@@ -342,9 +419,11 @@ function payloadOf(event: SessionEvent): JsonValue {
         content: event.data.content,
       };
     case "turn/end":
+      // The Core's own message never travels into storage; whether the turn
+      // failed is a fact the reason already carries.
       return event.data.error === undefined
         ? { reason: event.data.reason }
-        : { reason: event.data.reason, error: event.data.error };
+        : { reason: event.data.reason, error: STORED_ERROR_MARKER };
   }
 }
 
@@ -397,14 +476,88 @@ export function parsePayload(data: string): Record<string, unknown> | undefined 
   }
 }
 
-/** A Core tool-call input restored from its display projection. */
-export function restoredInput(display: DisplayInput): unknown {
-  return display.kind === "json" ? display.value : null;
+// ---------------------------------------------------------------------------
+// Strict validation of stored facts.
+// ---------------------------------------------------------------------------
+
+/**
+ * One stored record, parsed and proven to be the shape its type promises.
+ *
+ * This is the read-side of the durable contract. A record is either exactly
+ * what a committed fact of its type must be, or it is refused: nothing here
+ * substitutes `""` for a missing text, `[]` for a missing call list or "error"
+ * for an unknown reason, because a repaired record is a *different* fact
+ * presented as the original one. Every field is checked for its exact type, so
+ * a payload that survived storage but not its own schema never becomes history,
+ * a published item or a model context.
+ */
+export function parseStoredRecord(record: StoredRecord): Record<string, unknown> {
+  const parsed = parsePayload(record.data);
+  if (parsed === undefined) throw new CorruptRecordError(`a ${record.type} record does not hold a JSON object`);
+  if (!Number.isSafeInteger(record.seq) || record.seq < 0) throw new CorruptRecordError("a record has no legal sequence");
+  if (typeof record.turnId !== "string" || record.turnId.length === 0) {
+    throw new CorruptRecordError("a record has no turn id");
+  }
+  if (typeof record.time !== "number" || !Number.isFinite(record.time)) {
+    throw new CorruptRecordError("a record has no legal time");
+  }
+
+  switch (record.type) {
+    case "turn/start":
+      return parsed;
+    case "message/user":
+      requireString(parsed, "text");
+      return parsed;
+    case "message/assistant": {
+      requireString(parsed, "text");
+      const calls = parsed["toolCalls"];
+      if (!Array.isArray(calls)) throw new CorruptRecordError("an assistant record has no tool call list");
+      for (const call of calls) {
+        if (typeof call !== "object" || call === null || Array.isArray(call)) {
+          throw new CorruptRecordError("an assistant record declares a call that is not an object");
+        }
+        const entry = call as Record<string, unknown>;
+        if (typeof entry["callId"] !== "string" || typeof entry["name"] !== "string" || !isDisplayInput(entry["input"])) {
+          throw new CorruptRecordError("an assistant record declares a call without its identity or input");
+        }
+      }
+      return parsed;
+    }
+    case "tool/call":
+      requireString(parsed, "callId");
+      requireString(parsed, "name");
+      if (!isDisplayInput(parsed["input"])) throw new CorruptRecordError("a tool call record has no display input");
+      return parsed;
+    case "tool/result":
+      requireString(parsed, "callId");
+      requireString(parsed, "name");
+      if (typeof parsed["ok"] !== "boolean") throw new CorruptRecordError("a tool result record has no outcome");
+      requireString(parsed, "content");
+      return parsed;
+    case "turn/end": {
+      const reason = parsed["reason"];
+      if (reason !== "completed" && reason !== "max_steps" && reason !== "cancelled" && reason !== "error") {
+        throw new CorruptRecordError("a turn end record carries a reason the Core cannot produce");
+      }
+      if (parsed["error"] !== undefined && typeof parsed["error"] !== "string") {
+        throw new CorruptRecordError("a turn end record carries an error that is not text");
+      }
+      return parsed;
+    }
+    default:
+      throw new CorruptRecordError(`a record carries an unknown event type`);
+  }
+}
+
+function requireString(parsed: Record<string, unknown>, key: string): string {
+  const value = parsed[key];
+  if (typeof value !== "string") throw new CorruptRecordError(`a stored field "${key}" is not text`);
+  return value;
 }
 
 /** One stored record, rebuilt as the Core event the window continues from. */
 export function toSessionEvent(record: StoredRecord): SessionEvent {
-  const parsed = parsePayload(record.data) ?? {};
+  const parsed = parseStoredRecord(record);
   const base = { turnId: record.turnId, seq: record.seq, time: record.time };
 
   switch (record.type) {
@@ -414,15 +567,16 @@ export function toSessionEvent(record: StoredRecord): SessionEvent {
       return Object.freeze({
         ...base,
         type: "message/user" as const,
-        data: Object.freeze({ text: String(parsed["text"] ?? "") }),
+        data: Object.freeze({ text: parsed["text"] as string }),
       });
     case "message/assistant": {
-      const calls = storedToolCalls(record.data) ?? [];
+      const calls = storedToolCalls(record.data);
+      if (calls === undefined) throw new CorruptRecordError("an assistant record's calls cannot be read back");
       return Object.freeze({
         ...base,
         type: "message/assistant" as const,
         data: Object.freeze({
-          text: String(parsed["text"] ?? ""),
+          text: parsed["text"] as string,
           toolCalls: Object.freeze(
             calls.map((call) => ({ callId: call.callId, name: call.name, input: restoredInput(call.input) })),
           ),
@@ -430,13 +584,14 @@ export function toSessionEvent(record: StoredRecord): SessionEvent {
       });
     }
     case "tool/call": {
-      const display = storedDisplay(record.data) ?? { kind: "unavailable" as const, reason: "not-json-safe" as const };
+      const display = storedDisplay(record.data);
+      if (display === undefined) throw new CorruptRecordError("a tool call record's input cannot be read back");
       return Object.freeze({
         ...base,
         type: "tool/call" as const,
         data: Object.freeze({
-          callId: String(parsed["callId"] ?? ""),
-          name: String(parsed["name"] ?? ""),
+          callId: parsed["callId"] as string,
+          name: parsed["name"] as string,
           input: restoredInput(display),
         }),
       });
@@ -446,25 +601,162 @@ export function toSessionEvent(record: StoredRecord): SessionEvent {
         ...base,
         type: "tool/result" as const,
         data: Object.freeze({
-          callId: String(parsed["callId"] ?? ""),
-          name: String(parsed["name"] ?? ""),
-          ok: parsed["ok"] === true,
-          content: String(parsed["content"] ?? ""),
+          callId: parsed["callId"] as string,
+          name: parsed["name"] as string,
+          ok: parsed["ok"] as boolean,
+          content: parsed["content"] as string,
         }),
       });
     case "turn/end": {
-      const reason = parsed["reason"];
       const error = parsed["error"];
-      const known = reason === "completed" || reason === "max_steps" || reason === "cancelled" || reason === "error";
       return Object.freeze({
         ...base,
         type: "turn/end" as const,
         data: Object.freeze({
-          reason: known ? reason : "error",
+          reason: parsed["reason"] as "completed" | "max_steps" | "cancelled" | "error",
           ...(typeof error === "string" ? { error } : {}),
         }),
       });
     }
+  }
+}
+
+/** A Core tool-call input restored from its display projection. */
+export function restoredInput(display: DisplayInput): unknown {
+  return display.kind === "json" ? display.value : null;
+}
+
+/**
+ * One contiguous stored range, checked as a sequence rather than a pile.
+ *
+ * The rules are the ones a committed log cannot break: positions run unbroken,
+ * a turn's events all carry that turn's id, turns do not nest or stay open past
+ * the range, and every recorded tool call is the one an assistant record
+ * declared, answered once, in order. `partialPrefix` is how a *page* is allowed
+ * to begin mid-turn — a page is explicitly a fragment — while a window that will
+ * be executed against is required to be whole turns.
+ */
+export function assertStoredRange(
+  records: readonly StoredRecord[],
+  options: { readonly partialPrefix: boolean; readonly baseSeq: number },
+): void {
+  /**
+   * Where the range stands relative to the turns around it.
+   *
+   * `unknown` is a page that began in the middle of a turn: the events before
+   * its first `turn/start` belong to a turn whose start is outside the range,
+   * so their ids and their pairing cannot be checked here — but nothing inside
+   * the range is repaired on their account either. `open` is a turn whose start
+   * *is* in the range, and everything until its end must belong to it. `closed`
+   * is between turns, where only a `turn/start` may appear.
+   */
+  let phase: "unknown" | "open" | "closed" = options.partialPrefix ? "unknown" : "closed";
+  /**
+   * Whether this range has seen enough to hold its tool calls to account.
+   *
+   * A page that begins inside a turn does not know what declared the occurrence
+   * it walked in on, so it cannot judge it. The moment the range holds a
+   * `turn/start` or an assistant record, it does — and from there on every call
+   * must be one the range saw declared, every declaration must be recorded, and
+   * every result must answer the call before it.
+   */
+  let declarable = false;
+  let openTurn: string | undefined;
+  let declared = 0;
+  let awaitingResult = false;
+  let openCall: { readonly callId: string; readonly name: string } | undefined;
+
+  const resolveBeforeTurnEnd = (seq: number): void => {
+    if (awaitingResult) throw new CorruptRecordError(`turn end at seq ${seq} leaves a tool call unanswered`);
+    if (declared > 0) throw new CorruptRecordError(`turn end at seq ${seq} leaves declared tool calls unrecorded`);
+  };
+
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    if (record === undefined) throw new CorruptRecordError("the stored range has a hole");
+    if (record.seq !== options.baseSeq + index) throw new CorruptRecordError("the stored range is not contiguous");
+    // Every record's payload, whatever its type, is checked for exactly what a
+    // committed fact of that type must hold — including the two types that
+    // project to no item at all.
+    parseStoredRecord(record);
+
+    if (record.type === "turn/start") {
+      if (phase === "open") {
+        throw new CorruptRecordError(`turn "${openTurn}" is still open at seq ${record.seq}`);
+      }
+      openTurn = record.turnId;
+      phase = "open";
+      declarable = true;
+      continue;
+    }
+
+    if (record.type === "turn/end") {
+      if (phase === "closed") throw new CorruptRecordError(`turn end at seq ${record.seq} has no open turn`);
+      if (phase === "open" && record.turnId !== openTurn) {
+        throw new CorruptRecordError(`turn end at seq ${record.seq} closes turn "${record.turnId}", not the open turn`);
+      }
+      resolveBeforeTurnEnd(record.seq);
+      openTurn = undefined;
+      phase = "closed";
+      declarable = false;
+      continue;
+    }
+
+    // Everything else is inside a turn, and which turn that is has to be known
+    // whenever the range contains that turn's start.
+    if (phase === "closed") throw new CorruptRecordError(`${record.type} at seq ${record.seq} has no open turn`);
+    if (phase === "open" && record.turnId !== openTurn) {
+      throw new CorruptRecordError(`seq ${record.seq} belongs to turn "${record.turnId}", not the open turn`);
+    }
+
+    switch (record.type) {
+      case "message/assistant": {
+        if (awaitingResult) throw new CorruptRecordError("an assistant record interrupts an unanswered tool call");
+        if (declared > 0) throw new CorruptRecordError("an assistant record interrupts tool calls it never recorded");
+        const calls = storedToolCalls(record.data);
+        if (calls === undefined) throw new CorruptRecordError("an assistant record's calls cannot be read back");
+        declared += calls.length;
+        declarable = true;
+        break;
+      }
+      case "tool/call": {
+        if (awaitingResult) throw new CorruptRecordError("a tool call interrupts an unanswered tool call");
+        const parsed = parseStoredRecord(record);
+        if (declarable) {
+          if (declared <= 0) {
+            throw new CorruptRecordError(`a tool call at seq ${record.seq} was never declared by an assistant record`);
+          }
+          declared -= 1;
+        }
+        openCall = { callId: parsed["callId"] as string, name: parsed["name"] as string };
+        awaitingResult = true;
+        break;
+      }
+      case "tool/result": {
+        if (!awaitingResult || openCall === undefined) {
+          if (declarable || phase !== "unknown") {
+            throw new CorruptRecordError(`a tool result at seq ${record.seq} answers no call`);
+          }
+          break;
+        }
+        const parsed = parseStoredRecord(record);
+        if (parsed["callId"] !== openCall.callId || parsed["name"] !== openCall.name) {
+          throw new CorruptRecordError(`a tool result at seq ${record.seq} answers a different call`);
+        }
+        awaitingResult = false;
+        openCall = undefined;
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  // A range that claims to be whole turns may not end inside one, and may not
+  // end owing anything.
+  if (!options.partialPrefix) {
+    if (phase === "open") throw new CorruptRecordError(`the range ends inside turn "${openTurn}"`);
+    resolveBeforeTurnEnd(options.baseSeq + records.length);
   }
 }
 
@@ -581,8 +873,17 @@ const MIGRATIONS: readonly Migration[] = [
  * and migrate the schema, and only then report a storage identity. A second
  * host pointed at the same file cannot take the lock, so it fails here rather
  * than racing the first one for writes it would silently lose.
+ *
+ * A durable location has to name a database. An empty (or blank) path would be
+ * accepted by the driver as a fresh temporary database that disappears with the
+ * process — a store that reports itself durable and keeps nothing — so it is
+ * refused here, before any file is touched, and `":memory:"` remains the one
+ * explicit way to ask for a store that lives no longer than the running host.
  */
 export function openRepository(options: RepositoryOptions): Repository {
+  if (options.location.trim() === "") {
+    throw new StorageOpenError("a durable store needs a location; an empty path is not a database");
+  }
   const ephemeral = options.location === ":memory:";
   let database: DatabaseSync;
   try {
@@ -664,6 +965,72 @@ export function submissionHash(sessionId: string, text: string): string {
   return createHash("sha256").update(`${sessionId.length}:${sessionId}:${text}`, "utf8").digest("hex");
 }
 
+/** What one durable record's envelope adds on top of its encoded payload. */
+export const RECORD_OVERHEAD_BYTES = 64;
+
+/**
+ * The size a value really occupies once it is written the way storage writes it.
+ *
+ * The one accounting the whole host uses for "will this fit": the value is
+ * JSON-encoded — escaping included, since a control character costs six bytes
+ * where it looked like one — and measured as UTF-8. Character counts and fixed
+ * per-item estimates are not this measurement's approximations; they are a
+ * different, wrong number.
+ */
+export function encodedBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+/** Whether a settled record of these encoded bytes could be stored whole. */
+export function recordFits(data: string, turnId: string, maxRecordBytes: number): boolean {
+  return (
+    Buffer.byteLength(data, "utf8") + Buffer.byteLength(turnId, "utf8") + RECORD_OVERHEAD_BYTES <= maxRecordBytes
+  );
+}
+
+/**
+ * Whether one accepted input's user fact can be stored whole.
+ *
+ * Checked against the record as it will actually be written, not against the
+ * raw text: JSON escaping is what turns 16 KiB of control characters into a
+ * record the store would refuse. A refusal here means the input was never
+ * accepted, never model-bound and never tool-bound.
+ */
+export function userRecordFits(text: string, maxRecordBytes: number): boolean {
+  return recordFits(JSON.stringify({ text }), "", maxRecordBytes);
+}
+
+/**
+ * Whether one model step's assistant declaration and its calls can be stored.
+ *
+ * Both the declaration and each call become their own durable record, so both
+ * are measured. This is deliberately only representability: no truncation, no
+ * dropping a call, no rewriting arguments — a step that cannot be stored whole
+ * is a step that does not run.
+ */
+export function stepRecordsFit(
+  step: { readonly text: string; readonly toolCalls: readonly { readonly callId: string; readonly name: string; readonly input: unknown }[] },
+  maxRecordBytes: number,
+): boolean {
+  const assistant = JSON.stringify({
+    text: step.text,
+    toolCalls: step.toolCalls.map((call) => ({
+      callId: call.callId,
+      name: call.name,
+      input: displayOf(call.input),
+    })),
+  });
+  if (!recordFits(assistant, "", maxRecordBytes)) return false;
+  for (const call of step.toolCalls) {
+    const data = JSON.stringify({ callId: call.callId, name: call.name, input: displayOf(call.input) });
+    if (!recordFits(data, "", maxRecordBytes)) return false;
+  }
+  return true;
+}
+
+/** What one run's accepted input costs the recent-run window, envelope included. */
+export const RUN_WINDOW_OVERHEAD = 256;
+
 interface Counters {
   sessions: number;
   runs: number;
@@ -734,21 +1101,61 @@ class SqliteRepository implements Repository {
   // Transactions.
   // -------------------------------------------------------------------------
 
-  private transaction<T>(act: () => T): T {
+  /**
+   * The verdict one write's own evidence is asked for after a lost receipt.
+   *
+   * `committed` carries the result the caller would have received had the
+   * receipt arrived; `absent` is the store proving the batch never landed;
+   * `indeterminate` is a store that cannot answer, which is neither.
+   */
+  private write<T>(act: () => T, verify: () => WriteVerdict<T>): T {
     this.database.exec("BEGIN IMMEDIATE");
     let value: T;
     try {
       value = act();
     } catch (error) {
-      try {
-        this.database.exec("ROLLBACK");
-      } catch {
-        // The transaction is already over; the original failure is the report.
-      }
-      throw error;
+      if (this.rollback()) throw error;
+      // The rollback itself failed, so the transaction API cannot say what
+      // happened. The batch's own evidence is the only remaining witness.
+      const verdict = this.reach(verify);
+      if (verdict.kind === "committed") return verdict.value;
+      throw new CommitOutcomeUnknownError(describeFailure(error));
     }
-    this.database.exec("COMMIT");
+
+    try {
+      this.database.exec("COMMIT");
+    } catch (error) {
+      // A COMMIT that reported an error may or may not have committed; a
+      // successful one leaves nothing to roll back. Both are settled by asking
+      // the facts, never by assuming the receipt told the truth.
+      this.rollback();
+      const verdict = this.reach(verify);
+      if (verdict.kind === "committed") return verdict.value;
+      if (verdict.kind === "absent") throw error;
+      throw new CommitOutcomeUnknownError(describeFailure(error));
+    }
     return value;
+  }
+
+  /** Ends a transaction that did not commit; `false` means it could not be ended. */
+  private rollback(): boolean {
+    try {
+      this.database.exec("ROLLBACK");
+      return true;
+    } catch {
+      // Either the transaction is already over or the connection is unusable;
+      // both are answered by the evidence query, not by guessing here.
+      return false;
+    }
+  }
+
+  /** Runs an evidence query; a query that fails is the same as no evidence. */
+  private reach<T>(verify: () => WriteVerdict<T>): WriteVerdict<T> {
+    try {
+      return verify();
+    } catch {
+      return { kind: "indeterminate" };
+    }
   }
 
   private bump(...collections: readonly ("sessions" | "runs" | "plugins")[]): void {
@@ -832,24 +1239,29 @@ class SqliteRepository implements Repository {
     return { records, hasMore: rows.length > limit };
   }
 
-  listRecentRuns(limit: number, maxTextBytes: number): readonly RunRecord[] {
+  listRecentRuns(limit: number, maxBytes: number): RecentRunPage {
+    // One row past the bound, so "there is more" is answered by the read that
+    // would have returned it, not guessed from the count that fits.
     const rows = this.database
       .prepare("SELECT * FROM runs ORDER BY accepted_at DESC, run_id DESC LIMIT ?")
-      .all(limit) as Row[];
+      .all(limit + 1) as Row[];
+    const bounded = rows.slice(0, limit);
 
-    // The window is bounded in bytes as well as in count: a run's accepted
-    // input is the largest thing it carries, and a snapshot of many long inputs
-    // would not fit the frame it has to travel in.
+    // The window is bounded in encoded bytes as well as in count: a run's
+    // accepted input is the largest thing it carries, and it is measured the
+    // way it will actually travel — as JSON with its escaping — because a
+    // character count is not what the frame pays for.
     const records: RunRecord[] = [];
     let bytes = 0;
-    for (const row of rows) {
+    for (const row of bounded) {
       const record = runOf(row);
-      const cost = record.text.length + 128;
-      if (records.length > 0 && bytes + cost > maxTextBytes) break;
+      const cost = encodedBytes(record.text) + RUN_WINDOW_OVERHEAD;
+      if (records.length > 0 && bytes + cost > maxBytes) break;
       bytes += cost;
       records.push(record);
     }
-    return Object.freeze(records);
+
+    return { records: Object.freeze(records), hasMore: rows.length > records.length };
   }
 
   listUnfinishedRuns(): readonly RunRecord[] {
@@ -857,6 +1269,66 @@ class SqliteRepository implements Repository {
       .prepare("SELECT * FROM runs WHERE status IN ('accepted', 'running') ORDER BY accepted_at, run_id")
       .all() as Row[];
     return Object.freeze(rows.map(runOf));
+  }
+
+  verifyRunHistory(run: RunRecord): boolean {
+    const range = this.database
+      .prepare("SELECT committed_from_seq, committed_to_seq FROM runs WHERE run_id = ?")
+      .get(run.runId) as
+      | { readonly committed_from_seq?: number | null; readonly committed_to_seq?: number | null }
+      | undefined;
+    if (range === undefined) return false;
+
+    // A run that claims no committed history is consistent when its range is
+    // empty: a failed or interrupted run whose turn never settled may carry a
+    // turn id it never got to commit, and that is not an inconsistency.
+    if (range.committed_from_seq === null && range.committed_to_seq === null) return true;
+    if (run.turnId === null) return false;
+
+    const turn = this.database
+      .prepare("SELECT start_seq, end_seq FROM turns WHERE session_id = ? AND turn_id = ?")
+      .get(run.sessionId, run.turnId) as { readonly start_seq?: number; readonly end_seq?: number } | undefined;
+    if (turn === undefined) return false;
+    // The turn index and the run's recorded range became true in one commit;
+    // agreeing with it is the only proof that this run's history is its own.
+    return range.committed_from_seq === turn.start_seq && range.committed_to_seq === turn.end_seq;
+  }
+
+  verifyTurnCommit(input: CommitTurnInput): "committed" | "absent" | "indeterminate" {
+    try {
+      const endSeq = input.turnStartSeq + input.records.length;
+      const session = this.getSession(input.sessionId);
+      if (session === undefined) return "indeterminate";
+      const run = this.getRun(input.runId);
+      if (run === undefined) return "indeterminate";
+
+      const turn = this.database
+        .prepare("SELECT start_seq, end_seq, reason FROM turns WHERE session_id = ? AND turn_id = ?")
+        .get(input.sessionId, input.turnId) as
+        | { readonly start_seq?: number; readonly end_seq?: number; readonly reason?: string }
+        | undefined;
+      const events = this.database
+        .prepare("SELECT COUNT(*) AS count FROM session_events WHERE session_id = ? AND seq >= ? AND seq < ?")
+        .get(input.sessionId, input.turnStartSeq, endSeq) as { readonly count?: number } | undefined;
+      const terminal = run.status !== "accepted" && run.status !== "running";
+
+      const fullyThere =
+        session.committedSeq === endSeq &&
+        turn !== undefined &&
+        turn.start_seq === input.turnStartSeq &&
+        turn.end_seq === endSeq &&
+        turn.reason === input.reason &&
+        events?.count === input.records.length &&
+        terminal &&
+        run.turnId === input.turnId;
+      if (fullyThere) return "committed";
+
+      const untouched = session.committedSeq === input.turnStartSeq && turn === undefined;
+      if (untouched) return "absent";
+      return "indeterminate";
+    } catch {
+      return "indeterminate";
+    }
   }
 
   readHistory(sessionId: string, beforeSeq: number, maxEvents: number): HistoryRead {
@@ -882,21 +1354,22 @@ class SqliteRepository implements Repository {
       .prepare("SELECT start_seq, end_seq FROM turns WHERE session_id = ? ORDER BY start_seq DESC LIMIT ?")
       .all(sessionId, maxTurns) as { readonly start_seq?: number; readonly end_seq?: number }[];
 
+    // The newest turn is examined first and the first turn that does not fit
+    // ends the window — whether that is an older one or the newest one itself.
+    // Nothing is skipped to reach an older turn, nothing oversized is forced
+    // in, and the running total is the budget that matters: a window is allowed
+    // to be smaller, or to hold no previous turns at all, but it is never
+    // allowed to exceed what it was given.
     let baseSeq = nextSeq;
     let bytes = 0;
     for (const turn of turns) {
       const start = turn.start_seq;
       const end = turn.end_seq;
-      if (typeof start !== "number" || typeof end !== "number") continue;
-      const spanBytes = this.measureRange(sessionId, start, end);
-      if (bytes + spanBytes > maxBytes && baseSeq !== nextSeq) break;
-      if (bytes + spanBytes > maxBytes) {
-        // Even the newest turn alone is over budget. Loading it is the only
-        // honest choice: a window cannot be empty while history exists without
-        // pretending the conversation has no previous turns.
-        baseSeq = start;
-        break;
+      if (typeof start !== "number" || typeof end !== "number") {
+        throw new CorruptRecordError("the turn index holds a range that is not a range");
       }
+      const spanBytes = this.measureRange(sessionId, start, end);
+      if (bytes + spanBytes > maxBytes) break;
       bytes += spanBytes;
       baseSeq = start;
     }
@@ -908,9 +1381,20 @@ class SqliteRepository implements Repository {
     return { records: Object.freeze(rows.map(storedOf)), baseSeq, nextSeq };
   }
 
+  /**
+   * A range's real cost in bytes.
+   *
+   * `LENGTH` counts characters, and a character can be up to three UTF-8 bytes
+   * and up to six escaped bytes; a window measured that way is not bounded in
+   * what it actually loads. The cast to `BLOB` makes SQLite answer in bytes, and
+   * each record's envelope is charged for too, because it travels as well.
+   */
   private measureRange(sessionId: string, fromSeq: number, toSeq: number): number {
     const row = this.database
-      .prepare("SELECT COALESCE(SUM(LENGTH(data)), 0) AS bytes FROM session_events WHERE session_id = ? AND seq >= ? AND seq < ?")
+      .prepare(
+        `SELECT COALESCE(SUM(LENGTH(CAST(data AS BLOB)) + LENGTH(CAST(turn_id AS BLOB)) + 64), 0) AS bytes
+           FROM session_events WHERE session_id = ? AND seq >= ? AND seq < ?`,
+      )
       .get(sessionId, fromSeq, toSeq) as { readonly bytes?: number } | undefined;
     return typeof row?.bytes === "number" ? row.bytes : 0;
   }
@@ -920,273 +1404,408 @@ class SqliteRepository implements Repository {
   // -------------------------------------------------------------------------
 
   createSession(input: CreateSessionInput): SessionRecord {
-    return this.transaction(() => {
-      if (this.getSession(input.sessionId) !== undefined) {
-        throw new StorageOpenError("the session id is already in use");
-      }
-      this.database
-        .prepare(
-          `INSERT INTO sessions (
-             session_id, generation, title, created_at, updated_at,
-             metadata_revision, history_revision, committed_seq, status, blocked_reason, active_run_id
-           ) VALUES (?, 1, ?, ?, ?, 0, 0, 0, 'ready', NULL, NULL)`,
-        )
-        .run(input.sessionId, input.title, input.createdAt, input.createdAt);
-      this.bump("sessions");
-      const created = this.getSession(input.sessionId);
-      if (created === undefined) throw new StorageOpenError("the session could not be recorded");
-      return created;
-    });
+    return this.write<SessionRecord>(
+      () => {
+        if (this.getSession(input.sessionId) !== undefined) {
+          throw new StorageOpenError("the session id is already in use");
+        }
+        this.database
+          .prepare(
+            `INSERT INTO sessions (
+               session_id, generation, title, created_at, updated_at,
+               metadata_revision, history_revision, committed_seq, status, blocked_reason, active_run_id
+             ) VALUES (?, 1, ?, ?, ?, 0, 0, 0, 'ready', NULL, NULL)`,
+          )
+          .run(input.sessionId, input.title, input.createdAt, input.createdAt);
+        this.bump("sessions");
+        const created = this.getSession(input.sessionId);
+        if (created === undefined) throw new StorageOpenError("the session could not be recorded");
+        return created;
+      },
+      () => {
+        const created = this.getSession(input.sessionId);
+        if (created !== undefined && created.title === input.title && created.createdAt === input.createdAt) {
+          return { kind: "committed" as const, value: created };
+        }
+        return { kind: "absent" as const };
+      },
+    );
   }
 
   admitRun(input: AdmitInput): AdmitOutcome {
-    return this.transaction(() => {
-      const submission = this.database
-        .prepare("SELECT session_id, input_hash, run_id, state FROM submissions WHERE submission_id = ?")
-        .get(input.submissionId) as
-        | { readonly session_id?: string; readonly input_hash?: string; readonly run_id?: string; readonly state?: string }
-        | undefined;
+    return this.write<AdmitOutcome>(
+      () => {
+        const submission = this.database
+          .prepare("SELECT session_id, input_hash, run_id, state FROM submissions WHERE submission_id = ?")
+          .get(input.submissionId) as
+          | { readonly session_id?: string; readonly input_hash?: string; readonly run_id?: string; readonly state?: string }
+          | undefined;
 
-      if (submission !== undefined) {
-        if (submission.state === "retired") return { kind: "retired" } as const;
-        const sameIdentity =
-          submission.session_id === input.sessionId && submission.input_hash === input.inputHash;
-        if (!sameIdentity) return { kind: "conflict" } as const;
-        const existing =
-          typeof submission.run_id === "string" ? this.getRun(submission.run_id) : undefined;
-        if (existing !== undefined) return { kind: "existing", run: existing } as const;
-        // A submission row without its run is not a state this store can
-        // produce; treating it as a conflict keeps it from becoming one.
-        return { kind: "conflict" } as const;
-      }
+        if (submission !== undefined) {
+          if (submission.state === "retired") return { kind: "retired" } as const;
+          const sameIdentity =
+            submission.session_id === input.sessionId && submission.input_hash === input.inputHash;
+          if (!sameIdentity) return { kind: "conflict" } as const;
+          const existing =
+            typeof submission.run_id === "string" ? this.getRun(submission.run_id) : undefined;
+          if (existing !== undefined) return { kind: "existing", run: existing } as const;
+          // A submission row without its run is not a state this store can
+          // produce; treating it as a conflict keeps it from becoming one.
+          return { kind: "conflict" } as const;
+        }
 
-      const session = this.getSession(input.sessionId);
-      if (session === undefined) return { kind: "session-not-found" } as const;
-      if (session.status === "blocked") return { kind: "session-blocked" } as const;
-      if (session.activeRunId !== null) return { kind: "session-busy" } as const;
+        const session = this.getSession(input.sessionId);
+        if (session === undefined) return { kind: "session-not-found" } as const;
+        if (session.status === "blocked") return { kind: "session-blocked" } as const;
+        if (session.activeRunId !== null) return { kind: "session-busy" } as const;
 
-      this.database
-        .prepare(
-          `INSERT INTO runs (
-             run_id, submission_id, session_id, text, accepted_at, started_at, ended_at,
-             host_instance_id, status, end_reason, error_code, execution_knowledge, turn_id,
-             cancel_requested, committed_from_seq, committed_to_seq
-           ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, 'accepted', NULL, NULL, NULL, NULL, 0, NULL, NULL)`,
-        )
-        .run(input.runId, input.submissionId, input.sessionId, input.text, input.acceptedAt, input.hostInstanceId);
-      this.database
-        .prepare(
-          "INSERT INTO submissions (submission_id, session_id, input_hash, run_id, state, created_at) VALUES (?, ?, ?, ?, 'active', ?)",
-        )
-        .run(input.submissionId, input.sessionId, input.inputHash, input.runId, input.acceptedAt);
-      this.database
-        .prepare(
-          `UPDATE sessions SET active_run_id = ?, metadata_revision = metadata_revision + 1, updated_at = ?
-           WHERE session_id = ?`,
-        )
-        .run(input.runId, input.acceptedAt, input.sessionId);
-      this.bump("sessions", "runs");
+        this.database
+          .prepare(
+            `INSERT INTO runs (
+               run_id, submission_id, session_id, text, accepted_at, started_at, ended_at,
+               host_instance_id, status, end_reason, error_code, execution_knowledge, turn_id,
+               cancel_requested, committed_from_seq, committed_to_seq
+             ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, 'accepted', NULL, NULL, NULL, NULL, 0, NULL, NULL)`,
+          )
+          .run(input.runId, input.submissionId, input.sessionId, input.text, input.acceptedAt, input.hostInstanceId);
+        this.database
+          .prepare(
+            "INSERT INTO submissions (submission_id, session_id, input_hash, run_id, state, created_at) VALUES (?, ?, ?, ?, 'active', ?)",
+          )
+          .run(input.submissionId, input.sessionId, input.inputHash, input.runId, input.acceptedAt);
+        this.database
+          .prepare(
+            `UPDATE sessions SET active_run_id = ?, metadata_revision = metadata_revision + 1, updated_at = ?
+             WHERE session_id = ?`,
+          )
+          .run(input.runId, input.acceptedAt, input.sessionId);
+        this.bump("sessions", "runs");
 
-      const run = this.getRun(input.runId);
-      const updated = this.getSession(input.sessionId);
-      if (run === undefined || updated === undefined) throw new StorageOpenError("the admission could not be recorded");
-      return { kind: "admitted", run, session: updated } as const;
-    });
+        const run = this.getRun(input.runId);
+        const updated = this.getSession(input.sessionId);
+        if (run === undefined || updated === undefined) throw new StorageOpenError("the admission could not be recorded");
+        return { kind: "admitted", run, session: updated } as const;
+      },
+      () => {
+        // Admission is one row each in three tables plus the session's pointer;
+        // all of them present and pointing at each other is the proof it landed.
+        const run = this.getRun(input.runId);
+        const session = this.getSession(input.sessionId);
+        const submission = this.getSubmission(input.submissionId);
+        if (
+          run !== undefined &&
+          session !== undefined &&
+          submission !== undefined &&
+          submission.runId === input.runId &&
+          run.status === "accepted" &&
+          session.activeRunId === input.runId
+        ) {
+          return { kind: "committed" as const, value: { kind: "admitted", run, session } as const };
+        }
+        if (run === undefined && submission === undefined) return { kind: "absent" as const };
+        return { kind: "indeterminate" as const };
+      },
+    );
   }
 
   markRunStarted(runId: string, hostInstanceId: string, at: number): RunRecord {
-    return this.transaction(() => {
-      const changed = this.database
-        .prepare(
-          `UPDATE runs SET status = 'running', started_at = ?, host_instance_id = ?
-           WHERE run_id = ? AND status = 'accepted'`,
-        )
-        .run(at, hostInstanceId, runId);
-      if (changed.changes !== 1) {
-        throw new StorageOpenError("the run is not in a state that can be started");
-      }
-      this.bump("runs");
-      const run = this.getRun(runId);
-      if (run === undefined) throw new StorageOpenError("the start marker could not be recorded");
-      return run;
-    });
+    return this.write<RunRecord>(
+      () => {
+        const changed = this.database
+          .prepare(
+            `UPDATE runs SET status = 'running', started_at = ?, host_instance_id = ?
+             WHERE run_id = ? AND status = 'accepted'`,
+          )
+          .run(at, hostInstanceId, runId);
+        if (changed.changes !== 1) {
+          throw new StorageOpenError("the run is not in a state that can be started");
+        }
+        this.bump("runs");
+        const run = this.getRun(runId);
+        if (run === undefined) throw new StorageOpenError("the start marker could not be recorded");
+        return run;
+      },
+      () => {
+        const run = this.getRun(runId);
+        if (run !== undefined && run.status === "running" && run.hostInstanceId === hostInstanceId && run.startedAt !== null) {
+          return { kind: "committed" as const, value: run };
+        }
+        if (run !== undefined && run.status === "accepted" && run.startedAt === null) {
+          return { kind: "absent" as const };
+        }
+        return { kind: "indeterminate" as const };
+      },
+    );
   }
 
   commitTurn(input: CommitTurnInput): CommitTurnResult {
-    return this.transaction(() => {
-      const session = this.getSession(input.sessionId);
-      if (session === undefined) throw new StorageOpenError("the session is gone");
-      if (input.turnStartSeq !== session.committedSeq) {
-        // A batch that does not continue the committed log exactly is not a
-        // batch this store can add; refusing is what keeps seqs honest.
-        throw new StorageOpenError("the turn batch does not continue the committed log");
-      }
-
-      let seq = input.turnStartSeq;
-      for (const record of input.records) {
-        if (record.seq !== seq) throw new StorageOpenError("the turn batch is not contiguous");
-        this.assertRecordFits(record);
-        this.database
-          .prepare("INSERT INTO session_events (session_id, seq, turn_id, type, time, data) VALUES (?, ?, ?, ?, ?, ?)")
-          .run(input.sessionId, record.seq, record.turnId, record.type, record.time, record.data);
-        seq += 1;
-      }
-
-      this.database
-        .prepare("INSERT INTO turns (session_id, turn_id, start_seq, end_seq, reason) VALUES (?, ?, ?, ?, ?)")
-        .run(input.sessionId, input.turnId, input.turnStartSeq, seq, input.reason);
-      this.database
-        .prepare(
-          `UPDATE sessions SET
-             committed_seq = ?, history_revision = history_revision + 1,
-             metadata_revision = metadata_revision + 1, updated_at = ?, active_run_id = NULL
-           WHERE session_id = ?`,
-        )
-        .run(seq, input.endedAt, input.sessionId);
-      this.database
-        .prepare(
-          `UPDATE runs SET
-             status = ?, end_reason = ?, ended_at = ?, turn_id = ?,
-             committed_from_seq = ?, committed_to_seq = ?
-           WHERE run_id = ?`,
-        )
-        .run(statusFor(input.reason), input.reason, input.endedAt, input.turnId, input.turnStartSeq, seq, input.runId);
-      this.bump("sessions", "runs");
-
-      return this.committedResult(input.sessionId, input.runId);
-    });
-  }
-
-  failRun(input: HostFaultInput): CommitTurnResult {
-    return this.transaction(() => {
-      const session = this.getSession(input.sessionId);
-      if (session === undefined) throw new StorageOpenError("the session is gone");
-      this.database
-        .prepare(
-          `UPDATE runs SET status = 'failed', end_reason = 'host_error', error_code = ?, ended_at = ?, turn_id = ?
-           WHERE run_id = ?`,
-        )
-        .run(input.errorCode, input.endedAt, input.turnId, input.runId);
-      this.database
-        .prepare(
-          `UPDATE sessions SET
-             status = 'blocked', blocked_reason = ?, metadata_revision = metadata_revision + 1,
-             updated_at = ?, active_run_id = NULL
-           WHERE session_id = ?`,
-        )
-        .run(input.blockedReason, input.endedAt, input.sessionId);
-      this.bump("sessions", "runs");
-      return this.committedResult(input.sessionId, input.runId);
-    });
-  }
-
-  requestCancel(runId: string, at: number): RunRecord {
-    return this.transaction(() => {
-      const run = this.getRun(runId);
-      if (run === undefined) throw new StorageOpenError("the run is gone");
-      if (run.status === "accepted" || run.status === "running") {
-        if (!run.cancelRequested) {
-          this.database.prepare("UPDATE runs SET cancel_requested = 1 WHERE run_id = ?").run(runId);
-          this.bump("runs");
+    return this.write<CommitTurnResult>(
+      () => {
+        const session = this.getSession(input.sessionId);
+        if (session === undefined) throw new StorageOpenError("the session is gone");
+        if (input.turnStartSeq !== session.committedSeq) {
+          // A batch that does not continue the committed log exactly is not a
+          // batch this store can add; refusing is what keeps seqs honest.
+          throw new StorageOpenError("the turn batch does not continue the committed log");
         }
-        void at;
-      }
-      const updated = this.getRun(runId);
-      if (updated === undefined) throw new StorageOpenError("the cancel intent could not be recorded");
-      return updated;
-    });
-  }
 
-  renameSession(input: RenameInput): RenameOutcome {
-    return this.transaction(() => {
-      const session = this.getSession(input.sessionId);
-      if (session === undefined) return { kind: "not-found" } as const;
-      if (session.metadataRevision !== input.expectedRevision) {
-        return { kind: "revision-conflict", session } as const;
-      }
-      this.database
-        .prepare(
-          `UPDATE sessions SET title = ?, metadata_revision = metadata_revision + 1, updated_at = ?
-           WHERE session_id = ? AND metadata_revision = ?`,
-        )
-        .run(input.title, input.at, input.sessionId, input.expectedRevision);
-      this.bump("sessions");
-      const renamed = this.getSession(input.sessionId);
-      if (renamed === undefined) throw new StorageOpenError("the rename could not be recorded");
-      return { kind: "renamed", session: renamed } as const;
-    });
-  }
+        let seq = input.turnStartSeq;
+        for (const record of input.records) {
+          if (record.seq !== seq) throw new StorageOpenError("the turn batch is not contiguous");
+          this.assertRecordFits(record);
+          this.database
+            .prepare("INSERT INTO session_events (session_id, seq, turn_id, type, time, data) VALUES (?, ?, ?, ?, ?, ?)")
+            .run(input.sessionId, record.seq, record.turnId, record.type, record.time, record.data);
+          seq += 1;
+        }
 
-  deleteSession(input: DeleteInput): DeleteOutcome {
-    return this.transaction(() => {
-      const session = this.getSession(input.sessionId);
-      if (session === undefined) return { kind: "not-found" } as const;
-      if (session.metadataRevision !== input.expectedRevision) {
-        return { kind: "revision-conflict", session } as const;
-      }
-      // An unfinished run owns an execution. Deleting around it would destroy
-      // the only record of work that may have had effects.
-      if (session.activeRunId !== null) return { kind: "busy" } as const;
-
-      // The submission identities this session spent are retired, not
-      // released: the smallest record that keeps a deleted conversation's
-      // submission from becoming a fresh one.
-      this.database
-        .prepare("UPDATE submissions SET state = 'retired', run_id = NULL WHERE session_id = ?")
-        .run(input.sessionId);
-      this.database.prepare("DELETE FROM runs WHERE session_id = ?").run(input.sessionId);
-      this.database.prepare("DELETE FROM sessions WHERE session_id = ?").run(input.sessionId);
-      this.database
-        .prepare("INSERT INTO deleted_sessions (session_id, generation, deleted_at) VALUES (?, ?, ?)")
-        .run(input.sessionId, session.generation, input.at);
-      this.bump("sessions", "runs");
-      return { kind: "deleted", generation: session.generation } as const;
-    });
-  }
-
-  bumpPluginRevision(): CollectionRevisions {
-    return this.transaction(() => {
-      this.bump("plugins");
-      return this.revisions;
-    });
-  }
-
-  reconcileInterrupted(hostInstanceId: string, at: number): ReconcileResult {
-    return this.transaction(() => {
-      let interrupted = 0;
-      for (const run of this.listUnfinishedRuns()) {
-        // The evidence class is read from what was actually committed: accepted
-        // with no start marker proves nothing was dispatched; a start marker
-        // proves a start and nothing about what followed it.
-        const knowledge: ExecutionKnowledge = run.startedAt === null ? "not-started" : "unknown";
         this.database
-          .prepare(
-            `UPDATE runs SET status = 'interrupted', end_reason = 'interrupted', execution_knowledge = ?,
-               ended_at = ?, host_instance_id = ?
-             WHERE run_id = ? AND status IN ('accepted', 'running')`,
-          )
-          .run(knowledge, at, hostInstanceId, run.runId);
-
-        const session = this.getSession(run.sessionId);
-        if (session === undefined) continue;
-        // `not-started` clears the pointer and leaves the session usable; a
-        // running marker blocks it, because nothing in the record can say
-        // whether the execution had already produced effects.
-        const blocked = knowledge === "unknown";
+          .prepare("INSERT INTO turns (session_id, turn_id, start_seq, end_seq, reason) VALUES (?, ?, ?, ?, ?)")
+          .run(input.sessionId, input.turnId, input.turnStartSeq, seq, input.reason);
         this.database
           .prepare(
             `UPDATE sessions SET
-               active_run_id = NULL, status = ?, blocked_reason = ?,
-               metadata_revision = metadata_revision + 1, updated_at = ?
+               committed_seq = ?, history_revision = history_revision + 1,
+               metadata_revision = metadata_revision + 1, updated_at = ?, active_run_id = NULL
              WHERE session_id = ?`,
           )
-          .run(blocked ? "blocked" : "ready", blocked ? "unknown-execution" : null, at, run.sessionId);
-        interrupted += 1;
-      }
+          .run(seq, input.endedAt, input.sessionId);
+        this.database
+          .prepare(
+            `UPDATE runs SET
+               status = ?, end_reason = ?, ended_at = ?, turn_id = ?,
+               committed_from_seq = ?, committed_to_seq = ?
+             WHERE run_id = ?`,
+          )
+          .run(statusFor(input.reason), input.reason, input.endedAt, input.turnId, input.turnStartSeq, seq, input.runId);
+        this.bump("sessions", "runs");
 
-      if (interrupted > 0) this.bump("sessions", "runs");
-      return { interrupted, revisions: this.revisions };
-    });
+        return this.committedResult(input.sessionId, input.runId);
+      },
+      () => {
+        const verdict = this.verifyTurnCommit(input);
+        if (verdict === "committed") {
+          return { kind: "committed" as const, value: this.committedResult(input.sessionId, input.runId) };
+        }
+        return verdict === "absent" ? { kind: "absent" as const } : { kind: "indeterminate" as const };
+      },
+    );
+  }
+
+  failRun(input: HostFaultInput): CommitTurnResult {
+    return this.write<CommitTurnResult>(
+      () => {
+        const session = this.getSession(input.sessionId);
+        if (session === undefined) throw new StorageOpenError("the session is gone");
+        this.database
+          .prepare(
+            `UPDATE runs SET status = 'failed', end_reason = 'host_error', error_code = ?, ended_at = ?, turn_id = ?
+             WHERE run_id = ?`,
+          )
+          .run(input.errorCode, input.endedAt, input.turnId, input.runId);
+        this.database
+          .prepare(
+            `UPDATE sessions SET
+               status = 'blocked', blocked_reason = ?, metadata_revision = metadata_revision + 1,
+               updated_at = ?, active_run_id = NULL
+             WHERE session_id = ?`,
+          )
+          .run(input.blockedReason, input.endedAt, input.sessionId);
+        this.bump("sessions", "runs");
+        return this.committedResult(input.sessionId, input.runId);
+      },
+      () => {
+        const run = this.getRun(input.runId);
+        const session = this.getSession(input.sessionId);
+        if (
+          run !== undefined &&
+          run.status === "failed" &&
+          session !== undefined &&
+          session.status === "blocked" &&
+          session.blockedReason === input.blockedReason &&
+          session.activeRunId === null
+        ) {
+          return { kind: "committed" as const, value: this.committedResult(input.sessionId, input.runId) };
+        }
+        if (
+          run !== undefined &&
+          (run.status === "accepted" || run.status === "running") &&
+          session !== undefined &&
+          session.activeRunId === input.runId
+        ) {
+          return { kind: "absent" as const };
+        }
+        return { kind: "indeterminate" as const };
+      },
+    );
+  }
+
+  requestCancel(runId: string, at: number): RunRecord {
+    const current = this.getRun(runId);
+    if (current === undefined) throw new StorageOpenError("the run is gone");
+    // A terminal run has nothing left to record and a recorded intent is never
+    // written twice; both answer with the record itself, so the caller can
+    // still tell a durable intent from one that was never written.
+    if (current.status !== "accepted" && current.status !== "running") return current;
+    if (current.cancelRequested) return current;
+    void at;
+
+    return this.write<RunRecord>(
+      () => {
+        this.database.prepare("UPDATE runs SET cancel_requested = 1 WHERE run_id = ?").run(runId);
+        this.bump("runs");
+        const updated = this.getRun(runId);
+        if (updated === undefined) throw new StorageOpenError("the cancel intent could not be recorded");
+        return updated;
+      },
+      () => {
+        const run = this.getRun(runId);
+        if (run !== undefined && run.cancelRequested) {
+          return { kind: "committed" as const, value: run };
+        }
+        if (run !== undefined && !run.cancelRequested && (run.status === "accepted" || run.status === "running")) {
+          return { kind: "absent" as const };
+        }
+        return { kind: "indeterminate" as const };
+      },
+    );
+  }
+
+  renameSession(input: RenameInput): RenameOutcome {
+    return this.write<RenameOutcome>(
+      () => {
+        const session = this.getSession(input.sessionId);
+        if (session === undefined) return { kind: "not-found" } as const;
+        if (session.metadataRevision !== input.expectedRevision) {
+          return { kind: "revision-conflict", session } as const;
+        }
+        this.database
+          .prepare(
+            `UPDATE sessions SET title = ?, metadata_revision = metadata_revision + 1, updated_at = ?
+             WHERE session_id = ? AND metadata_revision = ?`,
+          )
+          .run(input.title, input.at, input.sessionId, input.expectedRevision);
+        this.bump("sessions");
+        const renamed = this.getSession(input.sessionId);
+        if (renamed === undefined) throw new StorageOpenError("the rename could not be recorded");
+        return { kind: "renamed", session: renamed } as const;
+      },
+      () => {
+        const session = this.getSession(input.sessionId);
+        if (session !== undefined && session.title === input.title && session.metadataRevision === input.expectedRevision + 1) {
+          return { kind: "committed" as const, value: { kind: "renamed", session } as const };
+        }
+        if (session !== undefined && session.metadataRevision === input.expectedRevision) {
+          return { kind: "absent" as const };
+        }
+        return { kind: "indeterminate" as const };
+      },
+    );
+  }
+
+  deleteSession(input: DeleteInput): DeleteOutcome {
+    return this.write<DeleteOutcome>(
+      () => {
+        const session = this.getSession(input.sessionId);
+        if (session === undefined) return { kind: "not-found" } as const;
+        if (session.metadataRevision !== input.expectedRevision) {
+          return { kind: "revision-conflict", session } as const;
+        }
+        // An unfinished run owns an execution. Deleting around it would destroy
+        // the only record of work that may have had effects.
+        if (session.activeRunId !== null) return { kind: "busy" } as const;
+
+        // The submission identities this session spent are retired, not
+        // released: the smallest record that keeps a deleted conversation's
+        // submission from becoming a fresh one.
+        this.database
+          .prepare("UPDATE submissions SET state = 'retired', run_id = NULL WHERE session_id = ?")
+          .run(input.sessionId);
+        this.database.prepare("DELETE FROM runs WHERE session_id = ?").run(input.sessionId);
+        this.database.prepare("DELETE FROM sessions WHERE session_id = ?").run(input.sessionId);
+        this.database
+          .prepare("INSERT INTO deleted_sessions (session_id, generation, deleted_at) VALUES (?, ?, ?)")
+          .run(input.sessionId, session.generation, input.at);
+        this.bump("sessions", "runs");
+        return { kind: "deleted", generation: session.generation } as const;
+      },
+      () => {
+        const still = this.getSession(input.sessionId);
+        const tombstone = this.getDeletedSession(input.sessionId);
+        if (still === undefined && tombstone !== undefined) {
+          return { kind: "committed" as const, value: { kind: "deleted", generation: tombstone } as const };
+        }
+        if (still !== undefined) return { kind: "absent" as const };
+        return { kind: "indeterminate" as const };
+      },
+    );
+  }
+
+  bumpPluginRevision(): CollectionRevisions {
+    const before = this.revisions.plugins;
+    return this.write<CollectionRevisions>(
+      () => {
+        this.bump("plugins");
+        return this.revisions;
+      },
+      () => {
+        const now = this.revisions;
+        if (now.plugins === before + 1) return { kind: "committed" as const, value: now };
+        if (now.plugins === before) return { kind: "absent" as const };
+        return { kind: "indeterminate" as const };
+      },
+    );
+  }
+
+  reconcileInterrupted(hostInstanceId: string, at: number): ReconcileResult {
+    const pending = this.listUnfinishedRuns().length;
+    if (pending === 0) return { interrupted: 0, revisions: this.revisions };
+
+    return this.write<ReconcileResult>(
+      () => {
+        let interrupted = 0;
+        for (const run of this.listUnfinishedRuns()) {
+          // The evidence class is read from what was actually committed: accepted
+          // with no start marker proves nothing was dispatched; a start marker
+          // proves a start and nothing about what followed it.
+          const knowledge: ExecutionKnowledge = run.startedAt === null ? "not-started" : "unknown";
+          this.database
+            .prepare(
+              `UPDATE runs SET status = 'interrupted', end_reason = 'interrupted', execution_knowledge = ?,
+                 ended_at = ?, host_instance_id = ?
+               WHERE run_id = ? AND status IN ('accepted', 'running')`,
+            )
+            .run(knowledge, at, hostInstanceId, run.runId);
+
+          const session = this.getSession(run.sessionId);
+          if (session === undefined) continue;
+          // `not-started` clears the pointer and leaves the session usable; a
+          // running marker blocks it, because nothing in the record can say
+          // whether the execution had already produced effects.
+          const blocked = knowledge === "unknown";
+          this.database
+            .prepare(
+              `UPDATE sessions SET
+                 active_run_id = NULL, status = ?, blocked_reason = ?,
+                 metadata_revision = metadata_revision + 1, updated_at = ?
+               WHERE session_id = ?`,
+            )
+            .run(blocked ? "blocked" : "ready", blocked ? "unknown-execution" : null, at, run.sessionId);
+          interrupted += 1;
+        }
+
+        if (interrupted > 0) this.bump("sessions", "runs");
+        return { interrupted, revisions: this.revisions };
+      },
+      () => {
+        const left = this.listUnfinishedRuns().length;
+        if (left === 0) {
+          return { kind: "committed" as const, value: { interrupted: pending, revisions: this.revisions } };
+        }
+        if (left === pending) return { kind: "absent" as const };
+        return { kind: "indeterminate" as const };
+      },
+    );
   }
 
   private committedResult(sessionId: string, runId: string): CommitTurnResult {
@@ -1199,8 +1818,8 @@ class SqliteRepository implements Repository {
   }
 
   private assertRecordFits(record: StoredRecord): void {
-    const size = Buffer.byteLength(record.data, "utf8") + Buffer.byteLength(record.turnId, "utf8") + 64;
-    if (size > this.limits.maxRecordBytes) {
+    if (!recordFits(record.data, record.turnId, this.limits.maxRecordBytes)) {
+      const size = Buffer.byteLength(record.data, "utf8") + Buffer.byteLength(record.turnId, "utf8") + RECORD_OVERHEAD_BYTES;
       throw new RecordTooLargeError(`a ${record.type} record is ${size} bytes`);
     }
   }

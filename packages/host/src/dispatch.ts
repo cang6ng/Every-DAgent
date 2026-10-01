@@ -292,7 +292,16 @@ function dispatchClientRequest(
     }
 
     case "sessions.history": {
-      const outcome = readHistoryPage(state.repository, request.params.sessionId, request.params.cursor, request.params.limit);
+      let outcome;
+      try {
+        outcome = readHistoryPage(state.repository, request.params.sessionId, request.params.cursor, request.params.limit);
+      } catch {
+        // Durable facts that do not agree with what they claim to be are
+        // refused, not repaired: the page is not served, and the caller is told
+        // the host could not answer rather than shown a rewritten conversation.
+        replyError(state, connection, requestId, protocolError("INTERNAL_ERROR"));
+        return;
+      }
       if (outcome.kind === "session-not-found") {
         replyError(state, connection, requestId, protocolError("SESSION_NOT_FOUND"));
         return;
@@ -357,7 +366,16 @@ function dispatchClientRequest(
         replyError(state, connection, requestId, protocolError("SESSION_NOT_FOUND"));
         return;
       }
-      const page = readRunPage(state.repository, request.params.sessionId, request.params.cursor, request.params.limit);
+      let page;
+      try {
+        page = readRunPage(state.repository, request.params.sessionId, request.params.cursor, request.params.limit);
+      } catch {
+        // A run whose recorded range is not the turn the index holds is a fact
+        // this host did not write; the page that would carry it is refused
+        // rather than served with one rewritten entry.
+        replyError(state, connection, requestId, protocolError("INTERNAL_ERROR"));
+        return;
+      }
       if ("failure" in page) {
         replyError(state, connection, requestId, staleCursorError());
         return;
@@ -437,9 +455,18 @@ function dispatchClientRequest(
       if (previous !== undefined) dropReverseForStream(connection, previous.streamId, "stream-gone");
 
       const streamId = newId();
-      const result: OperationMap["subscriptions.open"]["result"] = {
-        snapshot: captureHostSnapshot(state, streamId),
-      };
+      let snapshot;
+      try {
+        snapshot = captureHostSnapshot(state, streamId);
+      } catch {
+        // The cut could not be composed at all — a directory that cannot be
+        // read, or a state that cannot be published inside one frame after
+        // every honest reduction. The caller is told the host failed rather
+        // than left waiting for a cut that will never arrive.
+        replyError(state, connection, requestId, protocolError("INTERNAL_ERROR"));
+        return;
+      }
+      const result: OperationMap["subscriptions.open"]["result"] = { snapshot };
       const encoded = encodeFrame(
         { kind: "host-response", method: "subscriptions.open" },
         hostResponse(state, requestId, result),

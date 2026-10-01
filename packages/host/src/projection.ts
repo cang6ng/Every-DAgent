@@ -17,8 +17,9 @@ import { pluginFailureSummary } from "./errors.js";
 import {
   encodeStoredData,
   invocationOf,
-  parsePayload,
+  parseStoredRecord,
   storedDisplay,
+  CorruptRecordError,
   type StoredRecord,
 } from "./repository.js";
 
@@ -40,72 +41,88 @@ export function projectionError(detail: string): ProjectionError {
   return new ProjectionError(detail);
 }
 
+/** The tool occurrence a result at this position answers: its call's identity. */
+export interface OpenCall {
+  readonly invocationId: string;
+  readonly callId: string;
+  readonly name: string;
+}
+
 /**
  * One canonical item from one stored record, or `undefined` when the event
  * projects to no item.
  *
  * Both paths that publish conversation items — the terminal commit and a
  * history page — come through here, so a page and the turn it came from can
- * never disagree about an item's identity or its fields. `openInvocation` is
- * the invocation of the tool call this record answers, which the caller tracks
- * because a result's id is derived from its call's position in the log.
+ * never disagree about an item's identity or its fields. The record's payload
+ * is *parsed strictly* first: a stored field that is not what its type promises
+ * is refused here rather than substituted, because a repaired item is a
+ * different fact published as the original one. `openCall` is the occurrence a
+ * result must answer — not merely be adjacent to — and a result that names a
+ * different call is refused for the same reason.
  */
 export function storedItem(
   record: StoredRecord,
   sessionId: string,
-  openInvocation: string | undefined,
+  openCall: OpenCall | undefined,
 ): CanonicalItem | undefined {
-  const parsed = parsePayload(record.data) ?? {};
-
   switch (record.type) {
-    case "message/user":
+    case "message/user": {
+      const parsed = parseStoredRecord(record);
       return Object.freeze({
         id: `${sessionId}:${record.seq}`,
         turnId: record.turnId,
         seq: record.seq,
         kind: "user" as const,
-        text: String(parsed["text"] ?? ""),
+        text: parsed["text"] as string,
       });
-    case "message/assistant":
+    }
+    case "message/assistant": {
+      const parsed = parseStoredRecord(record);
       return Object.freeze({
         id: `${sessionId}:${record.seq}`,
         turnId: record.turnId,
         seq: record.seq,
         kind: "assistant" as const,
-        text: String(parsed["text"] ?? ""),
+        text: parsed["text"] as string,
       });
-    case "tool/call":
+    }
+    case "tool/call": {
+      const parsed = parseStoredRecord(record);
+      const display = storedDisplay(record.data);
+      if (display === undefined) throw new CorruptRecordError("a tool call record's input cannot be read back");
       return Object.freeze({
         id: `${sessionId}:${record.seq}`,
         turnId: record.turnId,
         seq: record.seq,
         kind: "tool-call" as const,
         invocationId: invocationOf(sessionId, record.seq),
-        callId: String(parsed["callId"] ?? ""),
-        name: String(parsed["name"] ?? ""),
-        input: storedDisplay(record.data) ?? unavailableInput(),
+        callId: parsed["callId"] as string,
+        name: parsed["name"] as string,
+        input: display,
       });
+    }
     case "tool/result": {
-      if (openInvocation === undefined) return undefined;
+      if (openCall === undefined) return undefined;
+      const parsed = parseStoredRecord(record);
+      if (parsed["callId"] !== openCall.callId || parsed["name"] !== openCall.name) {
+        throw new CorruptRecordError(`a stored tool result at seq ${record.seq} answers a different call`);
+      }
       return Object.freeze({
         id: `${sessionId}:${record.seq}`,
         turnId: record.turnId,
         seq: record.seq,
         kind: "tool-result" as const,
-        invocationId: openInvocation,
-        callId: String(parsed["callId"] ?? ""),
-        name: String(parsed["name"] ?? ""),
-        ok: parsed["ok"] === true,
-        content: String(parsed["content"] ?? ""),
+        invocationId: openCall.invocationId,
+        callId: parsed["callId"] as string,
+        name: parsed["name"] as string,
+        ok: parsed["ok"] as boolean,
+        content: parsed["content"] as string,
       });
     }
     default:
       return undefined;
   }
-}
-
-function unavailableInput(): DisplayInput {
-  return Object.freeze({ kind: "unavailable" as const, reason: "not-json-safe" as const });
 }
 
 /**
@@ -337,7 +354,7 @@ export function projectSettledTurn(input: SettledTurnInput): SettledTurn {
  */
 function itemsOf(events: readonly SessionEvent[], sessionId: string): readonly CanonicalItem[] {
   const items: CanonicalItem[] = [];
-  let openInvocation: string | undefined;
+  let openCall: OpenCall | undefined;
 
   for (const event of events) {
     const record: StoredRecord = Object.freeze({
@@ -347,8 +364,15 @@ function itemsOf(events: readonly SessionEvent[], sessionId: string): readonly C
       time: event.time,
       data: encodeStoredData(event),
     });
-    if (record.type === "tool/call") openInvocation = invocationOf(sessionId, record.seq);
-    const item = storedItem(record, sessionId, openInvocation);
+    if (record.type === "tool/call") {
+      const parsed = parseStoredRecord(record);
+      openCall = {
+        invocationId: invocationOf(sessionId, record.seq),
+        callId: parsed["callId"] as string,
+        name: parsed["name"] as string,
+      };
+    }
+    const item = storedItem(record, sessionId, openCall);
     if (record.type === "tool/result" && item === undefined) {
       throw new ProjectionError("a recorded tool result has no call to belong to");
     }

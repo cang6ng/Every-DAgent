@@ -30,9 +30,13 @@ import type {
 } from "@every-dagent/protocol";
 import { MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TITLE_CHARS } from "@every-dagent/protocol";
 
-import { projectionError, storedItem } from "./projection.js";
+import { projectionError, storedItem, type OpenCall } from "./projection.js";
 import {
+  assertStoredRange,
+  CorruptRecordError,
+  encodedBytes,
   invocationOf,
+  parseStoredRecord,
   type Repository,
   type RunCursorKey,
   type RunRecord,
@@ -41,7 +45,21 @@ import {
   type StoredRecord,
 } from "./repository.js";
 
-/** How much of one page may be occupied by its items, leaving room for the envelope. */
+/** Whether a listed run's committed range is the turn the store's index holds. */
+function servesRunRecord(repository: Repository, record: RunRecord): boolean {
+  if (record.status === "accepted" || record.status === "running") return true;
+  try {
+    return repository.verifyRunHistory(record);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * How much of one page may be occupied by its items, leaving room for the
+ * envelope. Both page kinds — history and runs — stop at whichever of their
+ * item and byte bounds is reached first.
+ */
 const PAGE_ITEM_BUDGET_BYTES = MAX_PAGE_BYTES - 4096;
 
 /** The default page size when a caller does not ask for one. */
@@ -315,10 +333,38 @@ export function readRunPage(
   }
 
   const result = repository.listRunsBySession(sessionId, limit, after);
+
+  // Every terminal run that would be listed has to agree with the history it
+  // claims: its recorded range is checked against the turn index before any of
+  // it is served. A page holding a run whose history is not its own is refused
+  // as a whole — a listing that silently dropped the entry would be a different
+  // lie than the one it avoided.
+  for (const record of result.records) {
+    if (!servesRunRecord(repository, record)) {
+      throw new CorruptRecordError(`a run in the list claims history that is not its own`);
+    }
+  }
+
+  // A run summary carries the accepted input, which is the largest thing a run
+  // ever holds, so the count bound alone does not bound the page. Items are
+  // measured as they will be encoded and the page ends at whichever bound it
+  // reaches first — and the cursor names the last item actually returned, so the
+  // next page starts exactly where this one stopped.
+  const items: RunSummary[] = [];
+  let bytes = 0;
+  for (const record of result.records) {
+    const summary = runSummaryOf(record);
+    const cost = encodedBytes(summary) + 64;
+    if (items.length > 0 && bytes + cost > PAGE_ITEM_BUDGET_BYTES) break;
+    bytes += cost;
+    items.push(summary);
+  }
+
   const revision = repository.revisions.runs;
-  const last = result.records[result.records.length - 1];
+  const last = items[items.length - 1];
+  const hasMore = result.hasMore || items.length < result.records.length;
   const nextCursor =
-    result.hasMore && last !== undefined
+    hasMore && last !== undefined
       ? encodeCursor({
           v: 1,
           kind: "runs",
@@ -332,10 +378,10 @@ export function readRunPage(
 
   return {
     page: Object.freeze({
-      items: Object.freeze(result.records.map(runSummaryOf)),
+      items: Object.freeze(items),
       collectionRevision: revision,
       nextCursor,
-      hasMore: result.hasMore,
+      hasMore,
     }),
   };
 }
@@ -402,11 +448,25 @@ export function readHistoryPage(
   const read = repository.readHistory(sessionId, beforeSeq, limit + 2);
   const kept = trimToBudget(sessionId, read.records, limit);
 
+  // Everything the page will serve is checked as durable fact first: strict
+  // payloads, unbroken positions, a turn's events all carrying its own id, and
+  // tool occurrences that pair. A fragment is allowed to *begin* mid-turn — a
+  // page is explicitly a window — but nothing inside it is repaired into place.
+  // A page that cannot be served honestly is refused, not served approximately.
+  assertStoredRange(kept.records, { partialPrefix: true, baseSeq: kept.fromSeq });
+
   const items: CanonicalItem[] = [];
-  let openInvocation: string | undefined;
+  let openCall: OpenCall | undefined;
   for (const record of kept.records) {
-    if (record.type === "tool/call") openInvocation = invocationOf(sessionId, record.seq);
-    const item = storedItem(record, sessionId, openInvocation);
+    if (record.type === "tool/call") {
+      const parsed = parseStoredRecord(record);
+      openCall = {
+        invocationId: invocationOf(sessionId, record.seq),
+        callId: parsed["callId"] as string,
+        name: parsed["name"] as string,
+      };
+    }
+    const item = storedItem(record, sessionId, openCall);
     if (record.type === "tool/result" && item === undefined) {
       throw projectionError("a stored tool result has no call to belong to");
     }

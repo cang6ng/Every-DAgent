@@ -36,6 +36,7 @@ import { PROTOCOL_VERSION, validateMessage } from "@every-dagent/protocol";
 
 import { closeConnection, createConnection, observePlugin } from "./connection.js";
 import { handleFrame } from "./dispatch.js";
+import { guardedModelClient } from "./guard.js";
 import { HOST_LIMITS } from "./limits.js";
 import { projectPluginInfo } from "./projection.js";
 import { openRepository } from "./repository.js";
@@ -43,7 +44,8 @@ import type { Repository } from "./repository.js";
 import { createReverseTrigger } from "./reverse.js";
 import type { ReverseProfile, ReverseTrigger } from "./reverse.js";
 import { createRegistryGate } from "./registry-gate.js";
-import { captureHostSnapshot, newId, type ConnectionState, type HostState } from "./state.js";
+import { captureHostSnapshot, newId, pluginSummaryOf, type ConnectionState, type HostState } from "./state.js";
+import { encodeFrame } from "@every-dagent/protocol";
 
 const HOST_NAME = "every-dagent-host";
 const HOST_VERSION = "0.2.0";
@@ -106,6 +108,8 @@ export interface HostInternals {
   readonly onAttach?: (attached: AttachedConnection) => void;
   /** Test-only: observes the repository the host actually opened. */
   readonly onRepository?: (repository: Repository) => void;
+  /** Test-only: observes the host's own live state, so a test can ask what it holds. */
+  readonly onState?: (state: HostState) => void;
 }
 
 /** One attached connection, seen by tests: the channel, the trigger, the disposer. */
@@ -152,7 +156,10 @@ export function composeHost(options: HostOptions, internals: HostInternals): Com
     });
     const contextBuilder = options.contextBuilder ?? createDefaultContextBuilder();
     const loop = createAgentLoop({
-      modelClient: options.modelClient,
+      // The composition's client, with the durable step guard in front of it:
+      // a step whose records could never be stored is refused before it can
+      // declare a tool call, so nothing executes that could not be kept.
+      modelClient: guardedModelClient(options.modelClient, HOST_LIMITS.maxRecordBytes),
       tools: registry,
       contextBuilder,
     });
@@ -196,6 +203,7 @@ export function composeHost(options: HostOptions, internals: HostInternals): Com
   }
 
   internals.onRepository?.(repository);
+  internals.onState?.(state);
 
   const attach = (channel: ProtocolChannel): AttachedConnection => {
     const connection = attachConnection(state, channel, internals.reverseProfiles ?? []);
@@ -223,9 +231,12 @@ export function composeHost(options: HostOptions, internals: HostInternals): Com
 /**
  * Checks at construction that the host can describe the state it starts in.
  *
- * A cheap, honest gate: if the bounded snapshot could not be published as a
- * frame, the host would fail on the first client instead of failing here, where
- * the composition can still see why.
+ * The check is the real thing, not a schema-shaped approximation: the snapshot
+ * a subscriber would receive is composed and encoded with the protocol's own
+ * encoder, so the frame limit that decides whether a client can ever subscribe
+ * is decided *here*, while the composition can still see why. A finite static
+ * configuration — the plugin catalogue among it — that could not travel is
+ * refused at startup instead of producing a host whose every subscribe fails.
  */
 function assertSelfDescription(state: HostState): void {
   const result: OperationMap["subscriptions.open"]["result"] = {
@@ -243,6 +254,38 @@ function assertSelfDescription(state: HostState): void {
   );
   if (!validated.success) {
     throw new Error("the host could not describe the state it was configured with");
+  }
+  const encoded = encodeFrame(
+    { kind: "host-response", method: "subscriptions.open" },
+    {
+      kind: "host-response",
+      protocolVersion: PROTOCOL_VERSION,
+      hostInstanceId: state.hostInstanceId,
+      requestId: "prepare",
+      result,
+    },
+  );
+  if (!encoded.success) {
+    throw new Error("the state this host was configured with cannot be published inside one frame");
+  }
+
+  // The catalogue is static configuration and travels on its own response, so
+  // it is checked the same way, with the same encoder.
+  const catalogue: OperationMap["plugins.list"]["result"] = {
+    plugins: state.pluginOrder.map((pluginId) => pluginSummaryOf(state, pluginId)),
+  };
+  const catalogueFrame = encodeFrame(
+    { kind: "host-response", method: "plugins.list" },
+    {
+      kind: "host-response",
+      protocolVersion: PROTOCOL_VERSION,
+      hostInstanceId: state.hostInstanceId,
+      requestId: "prepare",
+      result: catalogue,
+    },
+  );
+  if (!catalogueFrame.success) {
+    throw new Error("the plugin catalogue this host was configured with cannot be published inside one frame");
   }
 }
 
