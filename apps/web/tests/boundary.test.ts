@@ -5,7 +5,11 @@
  * frames stay exactly these seven, they import only their own modules, the
  * protocol and node builtins, the browser half stays free of node builtins and
  * of the server half, and the browser entry's own import graph is walked
- * rather than trusted. The shell that now lives beside them has its own,
+ * rather than trusted. An import edge is judged by the file it *resolves to*,
+ * and that resolution is done for every relative import of all seven transport
+ * files — not only for the file a walk starts from — so `./main.js` written
+ * inside the server half is an edge out of the transport set even though no
+ * substring of it says so. The shell that now lives beside them has its own,
  * separate boundary file — `shell-boundary.test.ts` — so that adding a page
  * could not quietly loosen anything that was already checked here.
  */
@@ -65,13 +69,16 @@ const browserHalf = srcRelative.filter(
   (file) => file.startsWith("client/") || file.startsWith("transport/"),
 );
 
+// Four spellings, because each one is a real edge: `import … from`, the
+// side-effect `import "…"` (a specifier the from-form does not cover),
+// dynamic `import(…)`, and `require(…)`.
 const IMPORT_PATTERN =
-  /(?:import|export)[^;'"]*from\s+['"]([^'"]+)['"]|import\s*\(\s*['"]([^'"]+)['"]\s*\)|require\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  /(?:import|export)[^;'"]*from\s+['"]([^'"]+)['"]|import\s*['"]([^'"]+)['"]|import\s*\(\s*['"]([^'"]+)['"]\s*\)|require\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
 
 function importSpecifiers(source: string): string[] {
   const specifiers: string[] = [];
   for (const match of source.matchAll(IMPORT_PATTERN)) {
-    specifiers.push(match[1] ?? match[2] ?? match[3] ?? "");
+    specifiers.push(match[1] ?? match[2] ?? match[3] ?? match[4] ?? "");
   }
   return specifiers;
 }
@@ -87,6 +94,52 @@ function resolveRelative(from: string, specifier: string): string {
     if (existsSync(join(srcRoot, base + extension))) return base + extension;
   }
   return `${base}.ts`;
+}
+
+/** The real tree, as a reader the checks below can be pointed at. */
+function readSource(file: string): string | undefined {
+  try {
+    return readFileSync(join(srcRoot, file), "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Every relative import of *every* transport file, resolved to the file it
+ * names and required to stay inside the seven.
+ *
+ * The rule is about the target, not the spelling. `server/http-binding.ts`
+ * importing `./main.js` names `server/main.ts` — a real file, not one of the
+ * seven, and a specifier in which no substring says "server" — and that is the
+ * kind of edge this check exists for. Only checking the file a walk happens to
+ * start from would miss it: a file nothing reaches is still a file that has to
+ * keep the boundary.
+ */
+function transportEdges(read: (file: string) => string | undefined): {
+  readonly edges: number;
+  readonly offenders: string[];
+} {
+  const offenders: string[] = [];
+  let edges = 0;
+  for (const file of TRANSPORT_FILES) {
+    const source = read(file);
+    if (source === undefined) {
+      offenders.push(`${file}: could not be read`);
+      continue;
+    }
+    for (const specifier of importSpecifiers(source)) {
+      if (specifier === "@every-dagent/protocol" || specifier.startsWith("node:")) continue;
+      if (!specifier.startsWith(".")) {
+        offenders.push(`${file}: ${specifier}`);
+        continue;
+      }
+      edges += 1;
+      const target = resolveRelative(file, specifier);
+      if (!TRANSPORT_FILES.includes(target)) offenders.push(`${file}: ${specifier} → ${target}`);
+    }
+  }
+  return { edges, offenders };
 }
 
 /**
@@ -168,18 +221,55 @@ describe("dependency boundary", () => {
     }
   });
 
+  it("resolves every relative import of all seven transport files to a transport file", () => {
+    const asked = new Set<string>();
+    const { edges, offenders } = transportEdges((file) => {
+      asked.add(file);
+      return readSource(file);
+    });
+
+    expect(offenders).toEqual([]);
+    // All seven were really checked, and relative edges really were resolved:
+    // a loop that read nothing would otherwise pass vacuously.
+    expect([...asked].sort()).toEqual([...TRANSPORT_FILES].sort());
+    expect(edges).toBeGreaterThan(0);
+  });
+
+  it("refuses a transport file that reaches anything but a transport file", () => {
+    // The counterexample this check exists for: `./main.js` inside the server
+    // half names `server/main.ts` — a real file, not one of the seven, reached
+    // by a specifier no substring check would flag. The rest of the matrix is
+    // the same rule through other spellings, plus the legal edge that must keep
+    // working.
+    const cases: readonly { readonly file: string; readonly specifier: string; readonly allowed: boolean }[] = [
+      { file: "server/http-binding.ts", specifier: "./main.js", allowed: false },
+      { file: "server/http-binding.ts", specifier: "./static-server.js", allowed: false },
+      { file: "server/http-binding.ts", specifier: "../server/main.js", allowed: false },
+      { file: "server/http-binding.ts", specifier: "./../server/main.js", allowed: false },
+      { file: "server/http-binding.ts", specifier: "..\\server\\main.js", allowed: false },
+      // A real file, reached by an escape: not a transport file, so refused.
+      { file: "client/http-channel.ts", specifier: "../browser/main.js", allowed: false },
+      // A path that names nothing at all is not an allowed edge either.
+      { file: "server/http-binding.ts", specifier: "./not-a-file.js", allowed: false },
+      // Legal transport→transport imports keep working.
+      { file: "client/http-channel.ts", specifier: "../transport/queue.js", allowed: true },
+      { file: "transport/queue.ts", specifier: "./framing.js", allowed: true },
+    ];
+
+    for (const { file, specifier, allowed } of cases) {
+      const { offenders } = transportEdges((candidate) =>
+        candidate === file ? `import { x } from ${JSON.stringify(specifier)};` : "",
+      );
+      expect(offenders.length > 0, `${file} → ${specifier} must be ${allowed ? "allowed" : "refused"}`).toBe(!allowed);
+    }
+  });
+
   it("keeps everything the browser channel can reach inside the transport files", () => {
     // The channel is a real consuming path, so the check follows its imports by
     // resolving each relative specifier to the file it names — the transport
     // may reach its own files and the protocol contract, and nothing else: no
     // node builtin, no server implementation, no host.
-    const { visited, offenders } = walkBrowserChannel((file) => {
-      try {
-        return readFileSync(join(srcRoot, file), "utf8");
-      } catch {
-        return undefined;
-      }
-    });
+    const { visited, offenders } = walkBrowserChannel(readSource);
 
     expect(offenders).toEqual([]);
     // The graph really was walked: the transport primitives are in it.

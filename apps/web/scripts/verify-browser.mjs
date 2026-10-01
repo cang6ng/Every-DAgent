@@ -53,6 +53,7 @@ const REQUIRED = [
       "marks a failed run as failed and keeps its partial text out of history",
       "shows a plugin activation failure as a safe summary without a retry",
       "renders a non-JSON tool input as unavailable and keeps tool text inert",
+      "renders a dangerous tool result as inert text without executing it",
     ],
   },
   {

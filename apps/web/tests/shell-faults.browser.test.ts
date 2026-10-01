@@ -252,4 +252,63 @@ describe("the shell when things go wrong, in a real browser", () => {
     },
     90000,
   );
+
+  it.skipIf(browser === undefined)(
+    "renders a dangerous tool result as inert text without executing it",
+    async () => {
+      const { acceptance, session } = await openShell();
+
+      // A real tool really returns markup-shaped text: the guarantee under test
+      // is about the generic card, not about anything the test typed.
+      await enablePlugin(session, "text-stats");
+      await createSession(session);
+      await sendText(session, "危险结果");
+
+      const resultText = textOf('[data-testid="tool-result-content"]');
+      // The wait is on this round's *tool result*: the payload exists nowhere
+      // else, so no earlier assistant message can satisfy it.
+      await session.waitFor(resultText, (value) => value.includes("__tool_pwned"), 20000, "this round's tool result text");
+      expect(acceptance.textStats.executions).toEqual([{ text: "危险结果" }]);
+
+      const seen = async (): Promise<{
+        readonly resultText: string;
+        readonly echoedByAssistant: boolean;
+        readonly payloadRan: boolean;
+        readonly resultNodes: number;
+        readonly pageImages: number;
+      }> => ({
+        resultText: await session.evaluate<string>(resultText),
+        echoedByAssistant: (await session.evaluate<string>(textOf('[data-testid="msg-assistant"]'))).includes("__tool_pwned"),
+        payloadRan: await session.evaluate<boolean>('String(window.__tool_pwned) !== "undefined"'),
+        resultNodes: Number(
+          await session.evaluate<string>(
+            countOf('[data-testid="tool-result-content"] script, [data-testid="tool-result-content"] img'),
+          ),
+        ),
+        pageImages: Number(await session.evaluate<string>(countOf("img"))),
+      });
+
+      // Live card: shown verbatim, nothing executed, nothing created.
+      const live = await seen();
+      expect(live.resultText).toContain('<script>window.__tool_pwned = 1</script>');
+      expect(live.resultText).toContain("onerror=");
+      expect(live.payloadRan).toBe(false);
+      expect(live.resultNodes).toBe(0);
+      expect(live.pageImages).toBe(0);
+      // The payload is only in the tool result — the round's assistant message
+      // never carries it, so these assertions cannot be reading a message.
+      expect(live.echoedByAssistant).toBe(false);
+
+      // And it stays inert once the run settles and the card moves to history.
+      await session.waitFor(runStatus, (value) => value.includes("已完成"), 20000, "the run to finish");
+      const settled = await seen();
+      expect(settled.resultText).toContain("__tool_pwned");
+      expect(settled.payloadRan).toBe(false);
+      expect(settled.resultNodes).toBe(0);
+      expect(settled.pageImages).toBe(0);
+
+      expect(session.uncaughtExceptions()).toEqual([]);
+    },
+    90000,
+  );
 });

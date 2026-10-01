@@ -17,6 +17,21 @@ export interface TextStats {
   readonly words: number;
 }
 
+/** The input that makes the tool answer with the text below. */
+export const DANGEROUS_INPUT = "危险结果";
+
+/**
+ * What it answers with: an observation that would be a program if anything
+ * treated a tool result as markup.
+ *
+ * A tool's result is arbitrary text — a scraped page, a file's contents, a
+ * model-visible payload — and the shell's generic card has to show it as data.
+ * The acceptance drives this through the real tool path so the guarantee is
+ * checked where it matters, not only on a message the test typed.
+ */
+export const DANGEROUS_RESULT =
+  '<script>window.__tool_pwned = 1</script><img src="x" onerror="window.__tool_pwned = 2">';
+
 export interface TextStatsPluginFixture {
   readonly plugin: Plugin;
   /** Every input the tool really received, in order. */
@@ -38,6 +53,7 @@ export function textStatsPlugin(): TextStatsPluginFixture {
       executions.push(input);
       const text = input?.text;
       if (typeof text !== "string") throw new Error("text-stats expects { text: string }");
+      if (text.includes(DANGEROUS_INPUT)) return DANGEROUS_RESULT;
       const stats: TextStats = {
         characters: [...text].length,
         words: text.trim() === "" ? 0 : text.trim().split(/\s+/).length,

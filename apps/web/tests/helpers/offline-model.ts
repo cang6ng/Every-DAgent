@@ -16,11 +16,15 @@
 
 import type { ModelClient, ModelEvent, ModelRequest, RuntimeContext } from "@every-dagent/agent-core";
 
+import { DANGEROUS_INPUT } from "../../../../tests/fixtures/text-stats-plugin.js";
+
 export const MARKER = {
   /** Ask for the calculator tool (a*b), then answer. */
   calculator: "算一下",
   /** Ask for the text-stats tool, then answer. */
   stats: "统计一下",
+  /** Ask for the text-stats tool with input whose *result* is dangerous text. */
+  dangerousResult: DANGEROUS_INPUT,
   /** Ask for a tool that keeps asking: the step budget runs out. */
   manySteps: "一直做",
   /** Stream a partial answer, then fail. */
@@ -116,6 +120,15 @@ export function offlineModel(): OfflineModel {
 
     if (text.includes(MARKER.stats) && !sawToolResult(request, "text-stats")) {
       yield { type: "tool-call", call: { callId: nextCallId(), name: "text-stats", input: { text: "hello world" } } };
+      yield { type: "done" };
+      return;
+    }
+
+    if (text.includes(MARKER.dangerousResult) && !sawToolResult(request, "text-stats")) {
+      // The tool really runs and really answers with its dangerous text; the
+      // answer after it stays free of that text, so a page that showed the
+      // payload could only have got it from the tool result.
+      yield { type: "tool-call", call: { callId: nextCallId(), name: "text-stats", input: { text: DANGEROUS_INPUT } } };
       yield { type: "done" };
       return;
     }
