@@ -121,6 +121,56 @@ function writeTurn(
   return runId;
 }
 
+/**
+ * One finished turn that really called a tool: user, a declared call, the call,
+ * its result, and the closing assistant record.
+ *
+ * It is the shape a window has to carry whole — an occurrence is a call *and*
+ * its result — so it is also the shape a byte boundary has to be tested with.
+ */
+function writeToolTurn(repository: Repository, sessionId: string, index: number): string {
+  const runId = `seed-run-${index}`;
+  const accepted = repository.admitRun({
+    runId,
+    submissionId: `seed-sub-${index}`,
+    sessionId,
+    text: `q${index}`,
+    inputHash: `seed-hash-${index}`,
+    hostInstanceId: "seed-host",
+    acceptedAt: 1_700_000_000_000 + index * 10,
+  });
+  if (accepted.kind !== "admitted") throw new Error(`seed admission refused: ${accepted.kind}`);
+  repository.markRunStarted(runId, "seed-host", 1_700_000_000_001 + index * 10);
+  const startSeq = repository.getSession(sessionId)?.committedSeq ?? 0;
+  const events = [
+    { type: "turn/start" as const, data: {} },
+    { type: "message/user" as const, data: { text: `q${index}` } },
+    { type: "message/assistant" as const, data: { text: "", toolCalls: [{ callId: "c1", name: "t", input: { n: 1 } }] } },
+    { type: "tool/call" as const, data: { callId: "c1", name: "t", input: { n: 1 } } },
+    { type: "tool/result" as const, data: { callId: "c1", name: "t", ok: true, content: "ok" } },
+    { type: "message/assistant" as const, data: { text: "a", toolCalls: [] } },
+    { type: "turn/end" as const, data: { reason: "completed" as const } },
+  ];
+  repository.commitTurn({
+    runId,
+    sessionId,
+    turnId: `turn-${index}`,
+    reason: "completed",
+    turnStartSeq: startSeq,
+    records: events.map((event, offset) =>
+      Object.freeze({
+        seq: startSeq + offset,
+        turnId: `turn-${index}`,
+        type: event.type,
+        time: 1_700_000_000_000 + startSeq + offset,
+        data: encodeStoredData({ type: event.type, turnId: `turn-${index}`, seq: startSeq + offset, time: 0, data: event.data } as never),
+      }),
+    ),
+    endedAt: 1_700_000_000_002 + index * 10,
+  });
+  return runId;
+}
+
 /** The real encoded size of one frame, as UTF-8. */
 function frameBytes(frame: string): number {
   return Buffer.byteLength(frame, "utf8");
@@ -699,50 +749,6 @@ describe("R05 canonical corruption", () => {
     return { sessionId: "s-1", runId };
   }
 
-  /** One finished turn that really called a tool, for pairing corruptions. */
-  function writeToolTurn(repository: Repository, sessionId: string, index: number): string {
-    const runId = `seed-run-${index}`;
-    const accepted = repository.admitRun({
-      runId,
-      submissionId: `seed-sub-${index}`,
-      sessionId,
-      text: `q${index}`,
-      inputHash: `seed-hash-${index}`,
-      hostInstanceId: "seed-host",
-      acceptedAt: 1_700_000_000_000 + index * 10,
-    });
-    if (accepted.kind !== "admitted") throw new Error(`seed admission refused: ${accepted.kind}`);
-    repository.markRunStarted(runId, "seed-host", 1_700_000_000_001 + index * 10);
-    const startSeq = repository.getSession(sessionId)?.committedSeq ?? 0;
-    const events = [
-      { type: "turn/start" as const, data: {} },
-      { type: "message/user" as const, data: { text: `q${index}` } },
-      { type: "message/assistant" as const, data: { text: "", toolCalls: [{ callId: "c1", name: "t", input: { n: 1 } }] } },
-      { type: "tool/call" as const, data: { callId: "c1", name: "t", input: { n: 1 } } },
-      { type: "tool/result" as const, data: { callId: "c1", name: "t", ok: true, content: "ok" } },
-      { type: "message/assistant" as const, data: { text: "a", toolCalls: [] } },
-      { type: "turn/end" as const, data: { reason: "completed" as const } },
-    ];
-    repository.commitTurn({
-      runId,
-      sessionId,
-      turnId: `turn-${index}`,
-      reason: "completed",
-      turnStartSeq: startSeq,
-      records: events.map((event, offset) =>
-        Object.freeze({
-          seq: startSeq + offset,
-          turnId: `turn-${index}`,
-          type: event.type,
-          time: 1_700_000_000_000 + startSeq + offset,
-          data: encodeStoredData({ type: event.type, turnId: `turn-${index}`, seq: startSeq + offset, time: 0, data: event.data } as never),
-        }),
-      ),
-      endedAt: 1_700_000_000_002 + index * 10,
-    });
-    return runId;
-  }
-
   /**
    * Every damage below is a durable record that disagrees with itself, and each
    * one is checked the same way: the page is refused, the session stops taking
@@ -934,6 +940,53 @@ describe("R10 window representation", () => {
     // One byte more: unchanged, because the turn already fits.
     const over = composed.repository.readTurnWindow("s-1", 16, exact + 1);
     expect(over.records).toHaveLength(whole.length);
+
+    await composed.host.shutdown();
+  });
+
+  it("bounds a window that carries tool calls and results, one byte either side", async () => {
+    const composed = composeTestHost({ modelClient: MODEL().client });
+    composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
+    writeTurn(composed.repository, "s-1", 1, "old", "old answer");
+    writeToolTurn(composed.repository, "s-1", 2);
+
+    const both = composed.repository.readHistory("s-1", 100, 50).records;
+    const newest = both.slice(4);
+    expect(newest.some((record) => record.type === "tool/call")).toBe(true);
+    expect(newest.some((record) => record.type === "tool/result")).toBe(true);
+
+    // Budget - 1: the newest turn — the one carrying the call and its result —
+    // does not fit, so the honest window is empty rather than over budget.
+    const underNewest = composed.repository.readTurnWindow("s-1", 16, representationBytes(newest) - 1);
+    expect(underNewest.records).toEqual([]);
+    expect(underNewest.baseSeq).toBe(underNewest.nextSeq);
+
+    // Budget: exactly that turn, occurrences whole.
+    const atNewest = composed.repository.readTurnWindow("s-1", 16, representationBytes(newest));
+    expect(atNewest.records).toHaveLength(newest.length);
+    expect(atNewest.baseSeq).toBe(4);
+    expect(atNewest.records.some((record) => record.type === "tool/call")).toBe(true);
+    expect(atNewest.records.some((record) => record.type === "tool/result")).toBe(true);
+
+    // Budget + 1: unchanged, because the older turn still does not fit beside it.
+    const overNewest = composed.repository.readTurnWindow("s-1", 16, representationBytes(newest) + 1);
+    expect(overNewest.records).toHaveLength(newest.length);
+    expect(overNewest.baseSeq).toBe(4);
+
+    // Budget - 1 for both turns: the older one ends the window, and it is not
+    // skipped over for an even older turn that might fit.
+    const underBoth = composed.repository.readTurnWindow("s-1", 16, representationBytes(both) - 1);
+    expect(underBoth.records).toHaveLength(newest.length);
+    expect(underBoth.baseSeq).toBe(4);
+
+    // Budget and budget + 1: the whole log fits.
+    const atBoth = composed.repository.readTurnWindow("s-1", 16, representationBytes(both));
+    expect(atBoth.records).toHaveLength(both.length);
+    expect(atBoth.baseSeq).toBe(0);
+    const overBoth = composed.repository.readTurnWindow("s-1", 16, representationBytes(both) + 1);
+    expect(overBoth.records).toHaveLength(both.length);
+    expect(overBoth.baseSeq).toBe(0);
+    expect(representationBytes(overBoth.records)).toBeLessThanOrEqual(representationBytes(both) + 1);
 
     await composed.host.shutdown();
   });
