@@ -8,32 +8,49 @@
  * callers construct that shape structurally without needing the name.
  */
 
-export { PROTOCOL_VERSION } from "./contracts.js";
+export {
+  MAX_FRAME_BYTES,
+  MAX_PAGE_BYTES,
+  MAX_PAGE_ITEMS,
+  MAX_TITLE_CHARS,
+  PROTOCOL_VERSION,
+} from "./contracts.js";
 export type {
   ActiveRunSnapshot,
+  BlockedReason,
   CanonicalItem,
   ClientCapabilities,
+  CollectionRevisions,
   ConversationPresentationSnapshot,
   DisplayInput,
   EndReason,
   EventScope,
+  ExecutionKnowledge,
+  HistoryCoverage,
+  HistoryPage,
   HostCapabilities,
   HostDescription,
+  HostLimits,
   HostSnapshot,
   Id,
   JsonValue,
   LiveItem,
   LiveToolItem,
+  LogPosition,
   PluginFailureSummary,
   PluginSummary,
   ProtocolError,
   ProtocolErrorCode,
   ProtocolVersion,
+  Revision,
   RunSnapshot,
   RunStatus,
+  RunSummary,
+  RunSummaryPage,
   Sequence,
-  SessionSnapshot,
   SessionSummary,
+  SessionSummaryPage,
+  StorageIdentity,
   TerminalRunSnapshot,
   Watermark,
 } from "./contracts.js";
@@ -42,10 +59,13 @@ export type {
   ClientRequest,
   ClientRequestFor,
   ClientResponse,
+  DescribeParams,
+  EmptyParams,
   HostRequest,
   HostResponse,
   OperationMap,
   OperationName,
+  PageParams,
 } from "./operations.js";
 
 export type { HostEvent } from "./events.js";

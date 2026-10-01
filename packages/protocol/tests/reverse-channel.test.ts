@@ -50,9 +50,10 @@ describe("reverse request envelope", () => {
     });
     expect(both).toMatchObject({ success: false });
 
+    // Neither half present: a v2 envelope that carries no outcome at all.
     const neither = validateMessage({ kind: "client-response" }, {
       kind: "client-response",
-      protocolVersion: "1",
+      protocolVersion: "2",
       hostInstanceId: INSTANCE,
       streamId: STREAM,
       requestId: "h-1",
@@ -85,7 +86,7 @@ describe("reverse request envelope", () => {
       { kind: "host-event" },
       {
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: INSTANCE,
         streamId: STREAM,
         sequence: 4,

@@ -4,7 +4,7 @@
  * Every call follows the same fixed order (SPEC §5 / Master Plan):
  *
  *   raw value → strict JSON guard → isolated snapshot
- *     → version gate → exact v1 schema → cross-field checks
+ *     → version gate → exact v2 schema → cross-field checks
  *
  * Failures carry a fixed local reason — never library issues, never raw
  * input, never exception text — plus, for request-shaped messages, the
@@ -48,7 +48,8 @@ export type ValidationFailureReason =
   | "UNKNOWN_METHOD"
   | "UNKNOWN_EVENT"
   | "INVALID_MESSAGE"
-  | "INVALID_TARGET";
+  | "INVALID_TARGET"
+  | "FRAME_TOO_LARGE";
 
 /**
  * Request-direction correlation extracted only after the JSON guard and
@@ -93,7 +94,7 @@ const failure = (reason: ValidationFailureReason): ValidationResult<never> => ({
 const GENERATION_PATTERN = /^[1-9][0-9]*$/;
 
 /**
- * The v1 host-request envelope. The method stays a plain string and params a
+ * The v2 host-request envelope. The method stays a plain string and params a
  * full `JsonValue`: an unknown reverse method is a valid envelope that the
  * Client answers with METHOD_NOT_FOUND — the production reverse business
  * registry is empty, and it is the Client's dispatch (P3.3), not validation,
@@ -101,7 +102,7 @@ const GENERATION_PATTERN = /^[1-9][0-9]*$/;
  */
 const hostRequestSchema = v.object({
   kind: v.literal("host-request"),
-  protocolVersion: v.literal("1"),
+  protocolVersion: v.literal("2"),
   requestId: idSchema,
   method: v.string(),
   params: JsonValueSchema,
@@ -110,11 +111,11 @@ const hostRequestSchema = v.object({
   timeoutMs: positiveSafeIntegerSchema,
 });
 
-/** The v1 client-response envelope: correlation ids, plus the result/error XOR. */
+/** The v2 client-response envelope: correlation ids, plus the result/error XOR. */
 const clientResponseSchema = v.pipe(
   v.object({
     kind: v.literal("client-response"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     hostInstanceId: idSchema,
     streamId: idSchema,
     requestId: idSchema,
@@ -150,7 +151,7 @@ function correlationOf(snapshot: JsonValue): RequestCorrelation | undefined {
 }
 
 /**
- * v1 generation gate. `"1"` proceeds; another well-formed generation stops
+ * v2 generation gate. The current generation proceeds; another well-formed one stops
  * with UNSUPPORTED_PROTOCOL (so the upper layer can answer it); a malformed
  * version string is just an invalid message.
  */
@@ -256,7 +257,7 @@ export function validateJsonValue(input: unknown): ValidationResult<JsonValue> {
 }
 
 /**
- * Validates one message against the frozen v1 contract. Overloads keep the
+ * Validates one message against the frozen v2 contract. Overloads keep the
  * target and the validated type tied together; an unknown method selector on
  * a `host-response` target is a compile-time and runtime error, not a silent
  * downgrade.

@@ -6,30 +6,54 @@ import {
   hostEvent,
   liveToolItem,
   pluginSummary,
-  sessionSnapshot,
+  collectionRevisions,
+  sessionSummary,
   terminalRun,
   activeRun,
 } from "./helpers/fixtures.js";
 
 const EVENT_TYPES = [
   "session.created",
+  "session.updated",
+  "session.deleted",
   "run.updated",
   "run.output.delta",
   "run.tool.call",
   "run.tool.result",
   "run.ended",
   "plugin.updated",
+  "collection.invalidated",
   "host.request.cancelled",
 ] as const;
 
 type EventType = (typeof EVENT_TYPES)[number];
 
 const RUN_SCOPE = { kind: "run", sessionId: "s-1", runId: "r-1" };
+const SESSION_SCOPE = { kind: "session", sessionId: "s-1" };
 
 function validEvent(type: EventType, sequence = 1): Record<string, unknown> {
   switch (type) {
     case "session.created":
-      return hostEvent(type, { kind: "session", sessionId: "s-1" }, { session: sessionSnapshot() }, sequence);
+      return hostEvent(
+        type,
+        SESSION_SCOPE,
+        { session: sessionSummary(), collections: collectionRevisions() },
+        sequence,
+      );
+    case "session.updated":
+      return hostEvent(
+        type,
+        SESSION_SCOPE,
+        { session: sessionSummary(), collections: collectionRevisions() },
+        sequence,
+      );
+    case "session.deleted":
+      return hostEvent(
+        type,
+        SESSION_SCOPE,
+        { sessionId: "s-1", generation: 1, collections: collectionRevisions() },
+        sequence,
+      );
     case "run.updated":
       return hostEvent(type, RUN_SCOPE, { run: activeRun("running") }, sequence);
     case "run.output.delta":
@@ -39,9 +63,16 @@ function validEvent(type: EventType, sequence = 1): Record<string, unknown> {
     case "run.tool.result":
       return hostEvent(type, RUN_SCOPE, { invocationId: "inv-1", ok: true, content: "42" }, sequence);
     case "run.ended":
-      return hostEvent(type, RUN_SCOPE, { run: terminalRun("completed"), session: sessionSnapshot() }, sequence);
+      return hostEvent(
+        type,
+        RUN_SCOPE,
+        { run: terminalRun("completed"), session: sessionSummary(), collections: collectionRevisions() },
+        sequence,
+      );
     case "plugin.updated":
       return hostEvent(type, { kind: "plugin", pluginId: "calculator" }, { plugin: pluginSummary("enabled") }, sequence);
+    case "collection.invalidated":
+      return hostEvent(type, { kind: "host" }, { collections: collectionRevisions() }, sequence);
     case "host.request.cancelled":
       return hostEvent(type, { kind: "host" }, { requestId: "h-1", reason: "timeout" }, sequence);
   }
@@ -88,7 +119,7 @@ describe("host events", () => {
   it("rejects scope/payload id mismatches per event", () => {
     const wrongSession = validateMessage(
       { kind: "host-event" },
-      hostEvent("session.created", { kind: "session", sessionId: "s-other" }, { session: sessionSnapshot() }),
+      hostEvent("session.created", { kind: "session", sessionId: "s-other" }, { session: sessionSummary() }),
     );
     expect(wrongSession).toMatchObject({ success: false });
 
@@ -124,7 +155,7 @@ describe("host events", () => {
   });
 
   it("rejects a run.ended whose session still names the run as active", () => {
-    const session = sessionSnapshot();
+    const session = sessionSummary();
     (session as { activeRunId: string | null }).activeRunId = "r-1";
     const result = validateMessage(
       { kind: "host-event" },
@@ -134,10 +165,16 @@ describe("host events", () => {
   });
 
   it("rejects a session.created that is not a fresh empty session", () => {
-    const dirty = sessionSnapshot([{ kind: "user", id: "i-1", turnId: "t-1", text: "x" }]);
+    // A create announces a session with no history; one that already has a
+    // committed position is something else wearing the event's name.
+    const dirty = { ...sessionSummary(), committedSeq: 3 };
     const result = validateMessage(
       { kind: "host-event" },
-      hostEvent("session.created", { kind: "session", sessionId: "s-1" }, { session: dirty }),
+      hostEvent(
+        "session.created",
+        { kind: "session", sessionId: "s-1" },
+        { session: dirty, collections: collectionRevisions() },
+      ),
     );
     expect(result).toMatchObject({ success: false });
   });
@@ -193,8 +230,8 @@ describe("host events", () => {
   });
 
   it("never exports semantics the Core does not produce", () => {
-    // Sanity pin on the frozen literal set itself.
-    expect(EVENT_TYPES).toHaveLength(8);
+    // Sanity pin on the frozen v2 literal set itself.
+    expect(EVENT_TYPES).toHaveLength(11);
     expect(EVENT_TYPES).not.toContain("message.start");
     expect(EVENT_TYPES).not.toContain("tool.args.delta");
     expect(EVENT_TYPES).not.toContain("state.delta");

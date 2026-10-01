@@ -24,6 +24,10 @@ type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y 
 type Expect<T extends true> = T;
 
 const RUNTIME_EXPORTS = [
+  "MAX_FRAME_BYTES",
+  "MAX_PAGE_BYTES",
+  "MAX_PAGE_ITEMS",
+  "MAX_TITLE_CHARS",
   "PROTOCOL_VERSION",
   "decodeFrame",
   "encodeFrame",
@@ -37,11 +41,11 @@ describe("public API surface", () => {
     expect(Object.keys(ns).sort()).toEqual(RUNTIME_EXPORTS);
   });
 
-  it("declares generation 1", () => {
-    expect(PROTOCOL_VERSION).toBe("1");
+  it("declares generation 2", () => {
+    expect(PROTOCOL_VERSION).toBe("2");
   });
 
-  it("pins the twelve operation names at the type level", () => {
+  it("pins the sixteen operation names at the type level", () => {
     const pinned: Expect<
       Equal<
         OperationName,
@@ -49,8 +53,12 @@ describe("public API surface", () => {
         | "sessions.list"
         | "sessions.create"
         | "sessions.get"
+        | "sessions.history"
+        | "sessions.rename"
+        | "sessions.delete"
         | "runs.start"
         | "runs.get"
+        | "runs.list"
         | "runs.cancel"
         | "plugins.list"
         | "plugins.enable"
@@ -62,17 +70,20 @@ describe("public API surface", () => {
     expect(pinned).toBe(true);
   });
 
-  it("pins the eight event type literals at the type level", () => {
+  it("pins the eleven event type literals at the type level", () => {
     const pinned: Expect<
       Equal<
         HostEvent["type"],
         | "session.created"
+        | "session.updated"
+        | "session.deleted"
         | "run.updated"
         | "run.output.delta"
         | "run.tool.call"
         | "run.tool.result"
         | "run.ended"
         | "plugin.updated"
+        | "collection.invalidated"
         | "host.request.cancelled"
       >
     > = true;
@@ -82,11 +93,11 @@ describe("public API surface", () => {
   it("keeps a describe request free of hostInstanceId in the type", () => {
     const request = {
       kind: "client-request",
-      protocolVersion: "1",
+      protocolVersion: "2",
       requestId: "c-1",
       method: "host.describe",
       params: {
-        supportedProtocolVersions: ["1"],
+        supportedProtocolVersions: ["2"],
         client: { name: "c", version: "1" },
         capabilities: { reverseRequests: true },
       },
@@ -98,7 +109,7 @@ describe("public API surface", () => {
   it("rejects a success response on the methodless error-only target at the type level", () => {
     const successResponse = {
       kind: "host-response",
-      protocolVersion: "1",
+      protocolVersion: "2",
       hostInstanceId: "host-1",
       requestId: "c-1",
       result: { ok: true },
@@ -122,6 +133,10 @@ describe("public API surface", () => {
       plugins: true,
       subscriptions: true,
       reverseRequests: true,
+      historyPages: true,
+      sessionMutations: true,
+      settings: false,
+      approvals: false,
     };
     expect(client.reverseRequests).toBe(true);
     expect(host.sessions).toBe(true);
@@ -131,10 +146,10 @@ describe("public API surface", () => {
 describe("encodeFrame target/message correlation", () => {
   const listResponse: HostResponse<"sessions.list"> = {
     kind: "host-response",
-    protocolVersion: "1",
+    protocolVersion: "2",
     hostInstanceId: "host-1",
     requestId: "c-1",
-    result: { sessions: [] },
+    result: { sessions: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false } },
   };
 
   it("encodes a correctly correlated host-response pair", () => {

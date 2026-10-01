@@ -1,17 +1,22 @@
 import { describe, expect, it } from "vitest";
 
-import { validateMessage, type OperationName } from "@every-dagent/protocol";
+import { validateMessage, type CanonicalItem, type OperationName } from "@every-dagent/protocol";
 
 import {
+  collectionRevisions,
   describeParams,
   describeRequest,
+  historyPage,
   hostDescription,
   hostResponseError,
   hostResponseSuccess,
   INSTANCE,
   pluginSummary,
   protocolError,
-  sessionSnapshot,
+  runPage,
+  sessionPage,
+  sessionSummary,
+  storageIdentity,
   terminalRun,
   activeRun,
   businessRequest,
@@ -62,11 +67,11 @@ function validResultFor(method: OperationName): unknown {
     case "host.describe":
       return hostDescription();
     case "sessions.list":
-      return { sessions: [sessionSnapshot()] };
+      return { sessions: sessionPage([sessionSummary()]) };
     case "sessions.create":
-      return { session: sessionSnapshot() };
+      return { session: sessionSummary() };
     case "sessions.get":
-      return { session: sessionSnapshot([ ]) };
+      return { session: sessionSummary() };
     case "runs.start":
     case "runs.get":
     case "runs.cancel":
@@ -87,8 +92,10 @@ function hostSnapshotForOpen(): Record<string, unknown> {
   return {
     hostInstanceId: INSTANCE,
     watermark: { streamId: "stream-1", sequence: 0 },
-    sessions: [sessionSnapshot()],
-    runs: [],
+    storage: storageIdentity(),
+    collections: collectionRevisions(),
+    sessions: sessionPage([sessionSummary()]),
+    runs: runPage(),
     plugins: [pluginSummary()],
   };
 }
@@ -142,7 +149,7 @@ describe("operation requests", () => {
 
     const withoutInstance = validateMessage({ kind: "client-request" }, {
       kind: "client-request",
-      protocolVersion: "1",
+      protocolVersion: "2",
       requestId: "c-9",
       method: "sessions.list",
       params: {},
@@ -207,12 +214,16 @@ describe("operation requests", () => {
   });
 
   it("gates generations: unknown legal generation is UNSUPPORTED_PROTOCOL, garbage is INVALID_MESSAGE", () => {
-    const future = validateMessage({ kind: "client-request" }, {
-      ...describeRequest(),
-      protocolVersion: "2",
-    });
-    expect(future).toMatchObject({ success: false });
-    if (!future.success) expect(future.failure.reason).toBe("UNSUPPORTED_PROTOCOL");
+    // "1" is a legal generation this host does not serve, and "3" is one that
+    // does not exist yet: both are refused at the gate, not as malformed JSON.
+    for (const protocolVersion of ["1", "3"]) {
+      const unsupported = validateMessage({ kind: "client-request" }, {
+        ...describeRequest(),
+        protocolVersion,
+      });
+      expect(unsupported).toMatchObject({ success: false });
+      if (!unsupported.success) expect(unsupported.failure.reason).toBe("UNSUPPORTED_PROTOCOL");
+    }
 
     const malformed = validateMessage({ kind: "client-request" }, {
       ...describeRequest(),
@@ -256,7 +267,7 @@ describe("operation responses", () => {
 
     const neither = validateMessage(
       { kind: "host-response", method: "sessions.list" },
-      { kind: "host-response", protocolVersion: "1", hostInstanceId: INSTANCE, requestId: "c-1" },
+      { kind: "host-response", protocolVersion: "2", hostInstanceId: INSTANCE, requestId: "c-1" },
     );
     expect(neither).toMatchObject({ success: false });
   });
@@ -272,15 +283,17 @@ describe("operation responses", () => {
   });
 
   it("validates a sessions.create result as a fresh empty session", () => {
+    // The rejection case: a session that already has committed history cannot
+    // be the result of creating one.
     const reused = validateMessage(
       { kind: "host-response", method: "sessions.create" },
-      hostResponseSuccess({ session: sessionSnapshot([ { kind: "user", id: "i-1", turnId: "t-1", text: "x" } ]) }),
+      hostResponseSuccess({ session: { ...sessionSummary(), committedSeq: 4, historyRevision: 1 } }),
     );
     expect(reused).toMatchObject({ success: false });
 
     const fresh = validateMessage(
       { kind: "host-response", method: "sessions.create" },
-      hostResponseSuccess({ session: sessionSnapshot() }),
+      hostResponseSuccess({ session: sessionSummary() }),
     );
     expect(fresh.success).toBe(true);
   });
@@ -388,8 +401,20 @@ describe("prototype-chain selectors must not resolve (own-key checks)", () => {
 });
 
 describe("canonical occurrence validation (array-level)", () => {
-  function canonicalSession(items: unknown[]): Record<string, unknown> {
-    return { sessionId: "s-1", createdAt: 1000, status: "ready", activeRunId: null, canonical: items };
+  /**
+   * One history page carrying exactly the given items.
+   *
+   * v2 has no `session.canonical`: committed items are read through
+   * `sessions.history`, and the page's schema checks the log order and coverage
+   * it claims. `seq` is assigned here in array order, exactly as a host numbers
+   * its committed log.
+   */
+  function historyPageOf(items: readonly Record<string, unknown>[]): Record<string, unknown> {
+    return {
+      page: historyPage(
+        items.map((item, index) => ({ ...item, seq: index + 1 })) as unknown as CanonicalItem[],
+      ),
+    };
   }
 
   const call = (invocationId: string, callId: string) => ({
@@ -403,7 +428,7 @@ describe("canonical occurrence validation (array-level)", () => {
 
   it("keeps two distinct invocations that share one empty or repeated callId", () => {
     for (const callId of ["", "call-1"]) {
-      const session = canonicalSession([
+      const page = historyPageOf([
         { kind: "user", id: "u-1", turnId: "turn-1", text: "go" },
         call("inv-1", callId),
         result("inv-1", callId),
@@ -411,19 +436,19 @@ describe("canonical occurrence validation (array-level)", () => {
         result("inv-2", callId),
       ]);
       const response = validateMessage(
-        { kind: "host-response", method: "sessions.get" },
-        hostResponseSuccess({ session }),
+        { kind: "host-response", method: "sessions.history" },
+        hostResponseSuccess(page),
       );
       expect(response.success).toBe(true);
       if (response.success) {
         // Mutation guard: a callId-deduplicating implementation would drop
         // the second occurrence; both invocations must survive as their own
         // call + result pair.
-        const canonical = (response.output as unknown as {
-          result: { session: { canonical: { kind: string; invocationId?: string }[] } };
-        }).result.session.canonical;
+        const items = (response.output as unknown as {
+          result: { page: { items: { kind: string; invocationId?: string }[] } };
+        }).result.page.items;
         expect(
-          canonical.filter((item) => item.kind.startsWith("tool")).map((item) => item.invocationId),
+          items.filter((item) => item.kind.startsWith("tool")).map((item) => item.invocationId),
         ).toEqual(["inv-1", "inv-1", "inv-2", "inv-2"]);
       }
     }
@@ -431,55 +456,55 @@ describe("canonical occurrence validation (array-level)", () => {
 
   it("rejects a tool-result with no preceding matching tool-call", () => {
     const orphan = validateMessage(
-      { kind: "host-response", method: "sessions.get" },
-      hostResponseSuccess({ session: canonicalSession([result("inv-1", "call-1")]) }),
+      { kind: "host-response", method: "sessions.history" },
+      hostResponseSuccess(historyPageOf([result("inv-1", "call-1")])),
     );
     expect(orphan).toMatchObject({ success: false });
   });
 
   it("rejects a pair whose turnId, callId or name disagrees", () => {
-    const mismatchedCallId = canonicalSession([call("inv-1", "call-1"), result("inv-1", "other")]);
-    const mismatchedName = canonicalSession([
+    const mismatchedCallId = historyPageOf([call("inv-1", "call-1"), result("inv-1", "other")]);
+    const mismatchedName = historyPageOf([
       call("inv-1", "call-1"),
       { ...result("inv-1", "call-1"), name: "other-tool" },
     ]);
-    const mismatchedTurn = canonicalSession([
+    const mismatchedTurn = historyPageOf([
       call("inv-1", "call-1"),
       { ...result("inv-1", "call-1"), turnId: "turn-2" },
     ]);
-    for (const session of [mismatchedCallId, mismatchedName, mismatchedTurn]) {
+    for (const page of [mismatchedCallId, mismatchedName, mismatchedTurn]) {
       const response = validateMessage(
-        { kind: "host-response", method: "sessions.get" },
-        hostResponseSuccess({ session }),
+        { kind: "host-response", method: "sessions.history" },
+        hostResponseSuccess(page),
       );
       expect(response).toMatchObject({ success: false });
     }
   });
 
   it("rejects duplicate item ids and reused invocation identities", () => {
-    const duplicateItemId = canonicalSession([
+    const duplicateItemId = historyPageOf([
       { kind: "user", id: "u-1", turnId: "turn-1", text: "a" },
       { kind: "user", id: "u-1", turnId: "turn-1", text: "b" },
     ]);
-    const doubleConsume = canonicalSession([call("inv-1", "call-1"), result("inv-1", "call-1"), result("inv-1", "call-1")]);
-    const reusedInvocation = canonicalSession([call("inv-1", "call-1"), result("inv-1", "call-1"), call("inv-1", "call-2")]);
-    for (const session of [duplicateItemId, doubleConsume, reusedInvocation]) {
+    const doubleConsume = historyPageOf([call("inv-1", "call-1"), result("inv-1", "call-1"), result("inv-1", "call-1")]);
+    const reusedInvocation = historyPageOf([call("inv-1", "call-1"), result("inv-1", "call-1"), call("inv-1", "call-2")]);
+    for (const page of [duplicateItemId, doubleConsume, reusedInvocation]) {
       const response = validateMessage(
-        { kind: "host-response", method: "sessions.get" },
-        hostResponseSuccess({ session }),
+        { kind: "host-response", method: "sessions.history" },
+        hostResponseSuccess(page),
       );
       expect(response).toMatchObject({ success: false });
     }
   });
 
   it("accepts an empty-string tool name and an empty-string description", () => {
-    const named = canonicalSession([
+    const named = historyPageOf([
       { kind: "tool-call", id: "i-1", turnId: "t-1", invocationId: "inv-1", callId: "", name: "", input: { kind: "unavailable", reason: "not-json-safe" } },
       { kind: "tool-result", id: "i-2", turnId: "t-1", invocationId: "inv-1", callId: "", name: "", ok: false, content: "" },
     ]);
     const response = validateMessage(
-      { kind: "host-response", method: "sessions.get" },
-      hostResponseSuccess({ session: named }),
+      { kind: "host-response", method: "sessions.history" },
+      hostResponseSuccess(named),
     );
     expect(response.success).toBe(true);
 
@@ -493,22 +518,26 @@ describe("canonical occurrence validation (array-level)", () => {
 });
 
 describe("host snapshot consistency (single-snapshot cross-field)", () => {
-  function snapshotWith(runs: unknown[], sessions: unknown[]): Record<string, unknown> {
+  function snapshotWith(
+    runs: readonly unknown[],
+    sessions: readonly unknown[],
+  ): Record<string, unknown> {
     return {
       hostInstanceId: INSTANCE,
       watermark: { streamId: "stream-1", sequence: 0 },
-      sessions,
-      runs,
+      storage: storageIdentity(),
+      collections: collectionRevisions(),
+      sessions: sessionPage(sessions as never),
+      runs: runPage(runs as never),
       plugins: [],
     };
   }
 
-  const readySession = (activeRunId: string | null) => ({
-    sessionId: "s-1", createdAt: 1000, status: "ready", activeRunId, canonical: [],
+  const readySession = (activeRunId: string | null, sessionId = "s-1") => ({
+    ...sessionSummary(), sessionId, activeRunId,
   });
   const activeRunOf = (runId: string, sessionId: string, submissionId = "sub-1") => ({
-    runId, submissionId, sessionId, text: "hello", turnId: null, cancelRequested: false,
-    status: "running", endReason: null, error: null, live: [],
+    ...activeRun("running"), runId, sessionId, submissionId,
   });
 
   it("accepts each session pointing at its own active run", () => {
@@ -516,13 +545,13 @@ describe("host snapshot consistency (single-snapshot cross-field)", () => {
       { kind: "host-response", method: "subscriptions.open" },
       hostResponseSuccess({ snapshot: snapshotWith(
         [activeRunOf("r-1", "s-1", "sub-1"), activeRunOf("r-2", "s-2", "sub-2")],
-        [readySession("r-1"), { ...readySession("r-2"), sessionId: "s-2" }],
+        [readySession("r-1"), readySession("r-2", "s-2")],
       ) }),
     );
     expect(response.success).toBe(true);
   });
 
-  it("rejects an active run that no session points at, or that a terminal run leaves dangling", () => {
+  it("rejects an active run that no session in the window points at", () => {
     const unpointed = validateMessage(
       { kind: "host-response", method: "subscriptions.open" },
       hostResponseSuccess({ snapshot: snapshotWith([activeRunOf("r-1", "s-1")], [readySession(null)]) }),
@@ -533,7 +562,7 @@ describe("host snapshot consistency (single-snapshot cross-field)", () => {
   it("rejects two sessions pointing at the same run, and a pointer across sessions", () => {
     const sharedPointer = validateMessage(
       { kind: "host-response", method: "subscriptions.open" },
-      hostResponseSuccess({ snapshot: snapshotWith([activeRunOf("r-1", "s-1")], [readySession("r-1"), { ...readySession("r-1"), sessionId: "s-2" }]) }),
+      hostResponseSuccess({ snapshot: snapshotWith([activeRunOf("r-1", "s-1")], [readySession("r-1"), readySession("r-1", "s-2")]) }),
     );
     expect(sharedPointer).toMatchObject({ success: false });
 
@@ -549,7 +578,7 @@ describe("host snapshot consistency (single-snapshot cross-field)", () => {
       { kind: "host-response", method: "subscriptions.open" },
       hostResponseSuccess({ snapshot: snapshotWith(
         [activeRunOf("r-1", "s-1", "sub-1"), activeRunOf("r-2", "s-2", "sub-1")],
-        [readySession("r-1"), { ...readySession("r-2"), sessionId: "s-2" }],
+        [readySession("r-1"), readySession("r-2", "s-2")],
       ) }),
     );
     expect(duplicateSubmission).toMatchObject({ success: false });
@@ -558,22 +587,31 @@ describe("host snapshot consistency (single-snapshot cross-field)", () => {
       { kind: "host-response", method: "subscriptions.open" },
       hostResponseSuccess({ snapshot: snapshotWith(
         [activeRunOf("r-1", "s-1"), { ...activeRunOf("r-1", "s-2"), submissionId: "sub-2" }],
-        [readySession("r-1"), { ...readySession("r-1"), sessionId: "s-2" }],
+        [readySession("r-1"), readySession("r-1", "s-2")],
       ) }),
     );
     expect(duplicateRunId).toMatchObject({ success: false });
   });
 
-  it("anchors every terminal run to an existing session — settled runs are never orphans", () => {
+  it("keeps a settled run whose session is outside the window, but never an unfinished one", () => {
+    // v2: the session directory and the runs window are separate bounded pages,
+    // so a settled run may legitimately outlive the page its session fell off.
+    // An unfinished run may not: the window carries it, and a session in the
+    // window has to point at it.
     for (const status of ["completed", "limited", "cancelled", "failed"] as const) {
-      const run = { ...terminalRun(status), sessionId: "s-orphan", submissionId: `sub-${status}` };
-      const response = validateMessage(
+      const settled = { ...terminalRun(status), sessionId: "s-orphan", submissionId: `sub-${status}` };
+      const accepted = validateMessage(
         { kind: "host-response", method: "subscriptions.open" },
-        hostResponseSuccess({ snapshot: snapshotWith([run], [readySession(null)]) }),
+        hostResponseSuccess({ snapshot: snapshotWith([settled], [readySession(null)]) }),
       );
-      expect(response).toMatchObject({ success: false });
-      if (!response.success) expect(response.failure.reason).toBe("INVALID_MESSAGE");
+      expect(accepted.success).toBe(true);
     }
+
+    const activeOrphan = validateMessage(
+      { kind: "host-response", method: "subscriptions.open" },
+      hostResponseSuccess({ snapshot: snapshotWith([activeRunOf("r-1", "s-orphan")], [readySession(null)]) }),
+    );
+    expect(activeOrphan).toMatchObject({ success: false });
   });
 
   it("accepts a settled terminal run whose session exists in the snapshot", () => {

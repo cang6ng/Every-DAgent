@@ -1,7 +1,15 @@
 /**
- * The operation set v1: exactly the twelve methods frozen by SPEC §8.1 — no
- * settings, no credentials, no `tools.execute`, no plugin install, no
- * arbitrary RPC.
+ * The operation set v2: the durable-state and pagination surface frozen by
+ * SPEC §14.3, minus the profiles that belong to later milestones.
+ *
+ * What is here is exactly what this host implements: sessions (list, create,
+ * get, history, rename, delete), runs (start, get, list, cancel), plugins
+ * (list, enable, disable) and subscriptions. There is no `tools.execute`, no
+ * `runs.resume`, no `approvals.*`, no credential operation, no plugin install
+ * and no arbitrary RPC. `settings.*` and the approval profiles are declared in
+ * the frozen v2 inventory but are not implemented by this milestone, so they
+ * are absent rather than stubbed — an unimplemented method answers
+ * METHOD_NOT_FOUND, which is the truth.
  *
  * `OperationMap` is the single source of truth for both the public TypeScript
  * contract and the runtime schemas: the schemas in this module are keyed by
@@ -12,20 +20,25 @@
 import * as v from "valibot";
 
 import type {
+  HistoryPage,
   HostDescription,
   HostSnapshot,
   Id,
   JsonValue,
   PluginSummary,
   ProtocolError,
+  Revision,
   RunSnapshot,
-  SessionSnapshot,
+  RunSummaryPage,
   SessionSummary,
+  SessionSummaryPage,
 } from "./contracts.js";
+import { MAX_PAGE_ITEMS } from "./contracts.js";
 import {
   clientCapabilitiesSchema,
   generationStringSchema,
   hasNonWhitespaceSchema,
+  historyPageSchema,
   hostDescriptionSchema,
   hostSnapshotSchema,
   idSchema,
@@ -34,9 +47,12 @@ import {
   pluginIdSchema,
   pluginSummarySchema,
   protocolErrorSchema,
+  revisionSchema,
+  runPageSchema,
   runSnapshotSchema,
-  sessionSnapshotSchema,
+  sessionPageSchema,
   sessionSummarySchema,
+  titleSchema,
 } from "./schemas.js";
 
 // ---------------------------------------------------------------------------
@@ -55,13 +71,54 @@ export type EmptyParams = {
   readonly [key: string]: never;
 };
 
+/** One bounded read of a collection: how far, and from where. */
+export interface PageParams {
+  /** An opaque continuation from the previous page. Absent means "the first page". */
+  readonly cursor?: Id;
+  /** How many items the caller wants; never more than one page may carry. */
+  readonly limit?: number;
+}
+
+export interface SessionsListResult {
+  readonly sessions: SessionSummaryPage;
+}
+export interface SessionResult {
+  readonly session: SessionSummary;
+}
+export interface SessionsHistoryResult {
+  readonly page: HistoryPage;
+}
+export interface SessionsDeleteResult {
+  readonly sessionId: Id;
+  readonly generation: number;
+  readonly deleted: true;
+}
+export interface RunResult {
+  readonly run: RunSnapshot;
+}
+export interface RunsListResult {
+  readonly runs: RunSummaryPage;
+}
+export interface PluginsListResult {
+  readonly plugins: readonly PluginSummary[];
+}
+export interface PluginResult {
+  readonly plugin: PluginSummary;
+}
+export interface SubscriptionsOpenResult {
+  readonly snapshot: HostSnapshot;
+}
+export interface SubscriptionsCloseResult {
+  readonly closed: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Envelope bases (internal). The wire never repeats the method on a response.
 // ---------------------------------------------------------------------------
 
 interface RequestBase<M extends string, P> {
   readonly kind: "client-request";
-  readonly protocolVersion: "1";
+  readonly protocolVersion: "2";
   readonly requestId: Id;
   readonly method: M;
   readonly params: P;
@@ -69,14 +126,14 @@ interface RequestBase<M extends string, P> {
 
 interface HostResponseBase {
   readonly kind: "host-response";
-  readonly protocolVersion: "1";
+  readonly protocolVersion: "2";
   readonly hostInstanceId: Id;
   readonly requestId: Id;
 }
 
 interface ClientResponseBase {
   readonly kind: "client-response";
-  readonly protocolVersion: "1";
+  readonly protocolVersion: "2";
   readonly hostInstanceId: Id;
   readonly streamId: Id;
   readonly requestId: Id;
@@ -99,40 +156,26 @@ type ResponseXor<T> = SuccessBody<T> | FailureBody;
 export type HostErrorResponse = HostResponseBase & FailureBody;
 
 // ---------------------------------------------------------------------------
-// Per-method result payloads.
-// ---------------------------------------------------------------------------
-
-export interface SessionsListResult {
-  readonly sessions: readonly SessionSummary[];
-}
-export interface SessionResult {
-  readonly session: SessionSnapshot;
-}
-export interface RunResult {
-  readonly run: RunSnapshot;
-}
-export interface PluginsListResult {
-  readonly plugins: readonly PluginSummary[];
-}
-export interface PluginResult {
-  readonly plugin: PluginSummary;
-}
-export interface SubscriptionsOpenResult {
-  readonly snapshot: HostSnapshot;
-}
-export interface SubscriptionsCloseResult {
-  readonly closed: boolean;
-}
-
-// ---------------------------------------------------------------------------
 // The frozen operation map.
 // ---------------------------------------------------------------------------
 
 export interface OperationMap {
   "host.describe": { params: DescribeParams; result: HostDescription };
-  "sessions.list": { params: EmptyParams; result: SessionsListResult };
+  "sessions.list": { params: PageParams; result: SessionsListResult };
   "sessions.create": { params: EmptyParams; result: SessionResult };
   "sessions.get": { params: { readonly sessionId: Id }; result: SessionResult };
+  "sessions.history": {
+    params: { readonly sessionId: Id; readonly cursor?: Id; readonly limit?: number };
+    result: SessionsHistoryResult;
+  };
+  "sessions.rename": {
+    params: { readonly sessionId: Id; readonly expectedRevision: Revision; readonly title: string };
+    result: SessionResult;
+  };
+  "sessions.delete": {
+    params: { readonly sessionId: Id; readonly expectedRevision: Revision };
+    result: SessionsDeleteResult;
+  };
   "runs.start": {
     params: { readonly sessionId: Id; readonly submissionId: Id; readonly text: string };
     result: RunResult;
@@ -142,6 +185,10 @@ export interface OperationMap {
       | { readonly runId: Id; readonly submissionId?: never }
       | { readonly submissionId: Id; readonly runId?: never };
     result: RunResult;
+  };
+  "runs.list": {
+    params: { readonly sessionId: Id; readonly cursor?: Id; readonly limit?: number };
+    result: RunsListResult;
   };
   "runs.cancel": { params: { readonly runId: Id }; result: RunResult };
   "plugins.list": { params: EmptyParams; result: PluginsListResult };
@@ -172,7 +219,7 @@ export type HostResponse<M extends OperationName> = HostResponseBase &
 
 export type HostRequest = {
   readonly kind: "host-request";
-  readonly protocolVersion: "1";
+  readonly protocolVersion: "2";
   readonly requestId: Id;
   /** Any string: an unknown reverse method is answered METHOD_NOT_FOUND, never ignored. */
   readonly method: string;
@@ -193,6 +240,23 @@ const emptyParamsSchema = v.pipe(
   // array and launder it into a fresh empty object.
   plainJsonObjectSchema,
   v.object({}),
+);
+
+/**
+ * A bounded page request: an optional continuation and an optional size.
+ *
+ * The size is capped here rather than clamped, because a page larger than
+ * `MAX_PAGE_ITEMS` is not something this protocol can express — and silently
+ * shrinking it would answer a different question than the one asked.
+ */
+const pageParamsEntries = {
+  cursor: v.optional(idSchema),
+  limit: v.optional(v.pipe(v.number(), v.safeInteger(), v.minValue(1), v.maxValue(MAX_PAGE_ITEMS))),
+} as const;
+
+const pageParamsSchema = v.pipe(
+  plainJsonObjectSchema,
+  v.object(pageParamsEntries),
 );
 
 const runsGetParamsSchema = v.pipe(
@@ -225,15 +289,25 @@ const describeParamsSchema = v.pipe(
 
 const paramsSchemas = {
   "host.describe": describeParamsSchema,
-  "sessions.list": emptyParamsSchema,
+  "sessions.list": pageParamsSchema,
   "sessions.create": emptyParamsSchema,
   "sessions.get": v.object({ sessionId: idSchema }),
+  "sessions.history": v.pipe(
+    v.object({ sessionId: idSchema, ...pageParamsEntries }),
+  ),
+  "sessions.rename": v.object({
+    sessionId: idSchema,
+    expectedRevision: revisionSchema,
+    title: titleSchema,
+  }),
+  "sessions.delete": v.object({ sessionId: idSchema, expectedRevision: revisionSchema }),
   "runs.start": v.object({
     sessionId: idSchema,
     submissionId: idSchema,
     text: hasNonWhitespaceSchema,
   }),
   "runs.get": runsGetParamsSchema,
+  "runs.list": v.object({ sessionId: idSchema, ...pageParamsEntries }),
   "runs.cancel": v.object({ runId: idSchema }),
   "plugins.list": emptyParamsSchema,
   "plugins.enable": v.object({ pluginId: pluginIdSchema }),
@@ -244,20 +318,33 @@ const paramsSchemas = {
 
 const resultSchemas = {
   "host.describe": hostDescriptionSchema,
-  "sessions.list": v.object({ sessions: v.array(sessionSummarySchema) }),
+  "sessions.list": v.object({ sessions: sessionPageSchema }),
   "sessions.create": v.pipe(
-    v.object({ session: sessionSnapshotSchema }),
-    // A create result is a brand-new session by definition.
+    v.object({ session: sessionSummarySchema }),
+    // A create result is a brand-new session by definition: no history, no run,
+    // and nothing blocking it.
     v.check(
       (value) =>
         value.session.status === "ready" &&
         value.session.activeRunId === null &&
-        value.session.canonical.length === 0,
+        value.session.committedSeq === 0 &&
+        value.session.historyRevision === 0 &&
+        value.session.generation === 1,
     ),
   ),
-  "sessions.get": v.object({ session: sessionSnapshotSchema }),
+  "sessions.get": v.object({ session: sessionSummarySchema }),
+  "sessions.history": v.object({ page: historyPageSchema }),
+  "sessions.rename": v.object({ session: sessionSummarySchema }),
+  "sessions.delete": v.pipe(
+    v.object({
+      sessionId: idSchema,
+      generation: v.pipe(v.number(), v.safeInteger(), v.minValue(1)),
+      deleted: v.literal(true),
+    }),
+  ),
   "runs.start": v.object({ run: runSnapshotSchema }),
   "runs.get": v.object({ run: runSnapshotSchema }),
+  "runs.list": v.object({ runs: runPageSchema }),
   "runs.cancel": v.object({ run: runSnapshotSchema }),
   "plugins.list": v.object({ plugins: v.array(pluginSummarySchema) }),
   "plugins.enable": v.object({ plugin: pluginSummarySchema }),
@@ -271,7 +358,7 @@ const resultSchemas = {
 } as const;
 
 /**
- * The full v1 response schema for one known method: base envelope plus the
+ * The full v2 response schema for one known method: base envelope plus the
  * result/error XOR. Both fields are known entries, so the `check` sees the
  * pre-strip snapshot and a both-present conflict can never hide.
  */
@@ -279,7 +366,7 @@ function responseSchemaFor<const M extends OperationName>(method: M) {
   return v.pipe(
     v.object({
       kind: v.literal("host-response"),
-      protocolVersion: v.literal("1"),
+      protocolVersion: v.literal("2"),
       hostInstanceId: idSchema,
       requestId: idSchema,
       result: v.optional(resultSchemas[method]),
@@ -292,7 +379,7 @@ function responseSchemaFor<const M extends OperationName>(method: M) {
 /** The error-only response for unknown methods and bootstrap failures. */
 const hostErrorResponseSchema = v.object({
   kind: v.literal("host-response"),
-  protocolVersion: v.literal("1"),
+  protocolVersion: v.literal("2"),
   hostInstanceId: idSchema,
   requestId: idSchema,
   error: protocolErrorSchema,
@@ -303,7 +390,7 @@ const hostErrorResponseSchema = v.object({
 const requestSchemas = {
   "host.describe": v.object({
     kind: v.literal("client-request"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     requestId: idSchema,
     method: v.literal("host.describe"),
     params: paramsSchemas["host.describe"],
@@ -311,7 +398,7 @@ const requestSchemas = {
   }),
   "sessions.list": v.object({
     kind: v.literal("client-request"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     requestId: idSchema,
     method: v.literal("sessions.list"),
     params: paramsSchemas["sessions.list"],
@@ -319,7 +406,7 @@ const requestSchemas = {
   }),
   "sessions.create": v.object({
     kind: v.literal("client-request"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     requestId: idSchema,
     method: v.literal("sessions.create"),
     params: paramsSchemas["sessions.create"],
@@ -327,15 +414,39 @@ const requestSchemas = {
   }),
   "sessions.get": v.object({
     kind: v.literal("client-request"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     requestId: idSchema,
     method: v.literal("sessions.get"),
     params: paramsSchemas["sessions.get"],
     hostInstanceId: idSchema,
   }),
+  "sessions.history": v.object({
+    kind: v.literal("client-request"),
+    protocolVersion: v.literal("2"),
+    requestId: idSchema,
+    method: v.literal("sessions.history"),
+    params: paramsSchemas["sessions.history"],
+    hostInstanceId: idSchema,
+  }),
+  "sessions.rename": v.object({
+    kind: v.literal("client-request"),
+    protocolVersion: v.literal("2"),
+    requestId: idSchema,
+    method: v.literal("sessions.rename"),
+    params: paramsSchemas["sessions.rename"],
+    hostInstanceId: idSchema,
+  }),
+  "sessions.delete": v.object({
+    kind: v.literal("client-request"),
+    protocolVersion: v.literal("2"),
+    requestId: idSchema,
+    method: v.literal("sessions.delete"),
+    params: paramsSchemas["sessions.delete"],
+    hostInstanceId: idSchema,
+  }),
   "runs.start": v.object({
     kind: v.literal("client-request"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     requestId: idSchema,
     method: v.literal("runs.start"),
     params: paramsSchemas["runs.start"],
@@ -343,15 +454,23 @@ const requestSchemas = {
   }),
   "runs.get": v.object({
     kind: v.literal("client-request"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     requestId: idSchema,
     method: v.literal("runs.get"),
     params: paramsSchemas["runs.get"],
     hostInstanceId: idSchema,
   }),
+  "runs.list": v.object({
+    kind: v.literal("client-request"),
+    protocolVersion: v.literal("2"),
+    requestId: idSchema,
+    method: v.literal("runs.list"),
+    params: paramsSchemas["runs.list"],
+    hostInstanceId: idSchema,
+  }),
   "runs.cancel": v.object({
     kind: v.literal("client-request"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     requestId: idSchema,
     method: v.literal("runs.cancel"),
     params: paramsSchemas["runs.cancel"],
@@ -359,7 +478,7 @@ const requestSchemas = {
   }),
   "plugins.list": v.object({
     kind: v.literal("client-request"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     requestId: idSchema,
     method: v.literal("plugins.list"),
     params: paramsSchemas["plugins.list"],
@@ -367,7 +486,7 @@ const requestSchemas = {
   }),
   "plugins.enable": v.object({
     kind: v.literal("client-request"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     requestId: idSchema,
     method: v.literal("plugins.enable"),
     params: paramsSchemas["plugins.enable"],
@@ -375,7 +494,7 @@ const requestSchemas = {
   }),
   "plugins.disable": v.object({
     kind: v.literal("client-request"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     requestId: idSchema,
     method: v.literal("plugins.disable"),
     params: paramsSchemas["plugins.disable"],
@@ -383,7 +502,7 @@ const requestSchemas = {
   }),
   "subscriptions.open": v.object({
     kind: v.literal("client-request"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     requestId: idSchema,
     method: v.literal("subscriptions.open"),
     params: paramsSchemas["subscriptions.open"],
@@ -391,7 +510,7 @@ const requestSchemas = {
   }),
   "subscriptions.close": v.object({
     kind: v.literal("client-request"),
-    protocolVersion: v.literal("1"),
+    protocolVersion: v.literal("2"),
     requestId: idSchema,
     method: v.literal("subscriptions.close"),
     params: paramsSchemas["subscriptions.close"],

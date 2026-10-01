@@ -5,7 +5,7 @@
  * JSON check, generic envelope and the result/error XOR. It must be able to
  * recognize an unknown method or an unsupported generation as a well-formed
  * envelope, because the upper layer has to answer those with a proper error
- * instead of dropping the frame. Full v1 semantics live in
+ * instead of dropping the frame. Full v2 semantics live in
  * `validateMessage`; only a `validateMessage` output is a contract message.
  *
  * `encodeFrame` re-runs the full validation before serializing: a TypeScript
@@ -14,7 +14,7 @@
 
 import * as v from "valibot";
 
-import type { Id, JsonValue } from "./contracts.js";
+import { MAX_FRAME_BYTES, type Id, type JsonValue } from "./contracts.js";
 import { guardJsonSnapshot, isStrictJsonValue } from "./json-value.js";
 import { idSchema } from "./schemas.js";
 import {
@@ -33,7 +33,7 @@ import type {
 } from "./operations.js";
 import type { HostEvent } from "./events.js";
 
-/** A decoded error is only loosely shaped: full `ProtocolError` checks happen in v1 validation. */
+/** A decoded error is only loosely shaped: full `ProtocolError` checks happen in v2 validation. */
 interface DecodedError {
   readonly code: string;
   readonly message: string;
@@ -45,7 +45,7 @@ type DecodedResponseXor =
 
 /**
  * What `decodeFrame` hands back: the base envelope of one message, stripped
- * of nothing, aware of nothing beyond its shape. Not a v1 contract message.
+ * of nothing, aware of nothing beyond its shape. Not a v2 contract message.
  */
 export type DecodedEnvelope =
   | {
@@ -92,9 +92,41 @@ export type DecodedEnvelope =
 
 const failure = (reason: ValidationFailureReason) => ({ success: false as const, failure: { reason } });
 
+/**
+ * The UTF-8 byte length of a string, counted rather than allocated.
+ *
+ * Encoded size is the only size the wire has: a frame measured in code units
+ * can be four times larger once its non-ASCII characters are encoded, and an
+ * escaped control character in JSON costs six. Lone surrogates count as the
+ * three bytes their replacement character takes, which is what every encoder
+ * on the path will actually write.
+ */
+function utf8Length(text: string): number {
+  let bytes = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = index + 1 < text.length ? text.charCodeAt(index + 1) : 0;
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
 // Base envelope schemas. `protocolVersion` must be a well-formed generation
 // string so an unknown-but-legal generation survives to the version gate;
-// events keep their sequence unclamped (0 is rejected in v1 validation).
+// events keep their sequence unclamped (0 is rejected in v2 validation).
 const generationStringSchema = v.pipe(v.string(), v.regex(/^[1-9][0-9]*$/));
 const baseEntries = { protocolVersion: generationStringSchema } as const;
 
@@ -169,6 +201,10 @@ type DecodedKind = (typeof KINDS)[number];
  */
 export function decodeFrame(frame: string): { success: true; output: DecodedEnvelope } | { success: false; failure: { reason: ValidationFailureReason; correlation?: { kind: "client-request" | "host-request"; requestId: Id } } } {
   if (typeof frame !== "string") return failure("INVALID_JSON");
+  // The bound is checked on the encoded bytes before anything is parsed: a
+  // frame this protocol would never send is not one it will read either, and
+  // parsing it first would spend the memory the bound exists to protect.
+  if (utf8Length(frame) > MAX_FRAME_BYTES) return failure("FRAME_TOO_LARGE");
 
   let parsed: unknown;
   try {
@@ -233,7 +269,7 @@ type EncodeFrameResult = {
 };
 
 /**
- * Validates a message against the frozen v1 contract and serializes the
+ * Validates a message against the frozen v2 contract and serializes the
  * validated output.
  *
  * The `host-response` overloads are enumerated per method on purpose: the
@@ -244,6 +280,10 @@ type EncodeFrameResult = {
  * runtime. A union-typed target matches none of the overloads and must be
  * narrowed first. The methodless overload still takes only the error-only
  * response (the unknown-method / bootstrap path).
+ *
+ * The encoded frame is measured in UTF-8 bytes and refused when it exceeds
+ * `MAX_FRAME_BYTES`: a host that cannot express a result has to say so through
+ * an error, never by sending a frame the carrier will cut in half.
  */
 export function encodeFrame(target: { readonly kind: "client-request" }, message: ClientRequest): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-request" }, message: HostRequest): EncodeFrameResult;
@@ -253,8 +293,12 @@ export function encodeFrame(target: { readonly kind: "host-response"; readonly m
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "sessions.list" }, message: HostResponse<"sessions.list">): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "sessions.create" }, message: HostResponse<"sessions.create">): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "sessions.get" }, message: HostResponse<"sessions.get">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "sessions.history" }, message: HostResponse<"sessions.history">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "sessions.rename" }, message: HostResponse<"sessions.rename">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "sessions.delete" }, message: HostResponse<"sessions.delete">): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "runs.start" }, message: HostResponse<"runs.start">): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "runs.get" }, message: HostResponse<"runs.get">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "runs.list" }, message: HostResponse<"runs.list">): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "runs.cancel" }, message: HostResponse<"runs.cancel">): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "plugins.list" }, message: HostResponse<"plugins.list">): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "plugins.enable" }, message: HostResponse<"plugins.enable">): EncodeFrameResult;
@@ -265,10 +309,15 @@ export function encodeFrame(target: { readonly kind: "host-response"; readonly m
 export function encodeFrame(target: ValidationTarget, message: unknown): EncodeFrameResult {
   const validated = validateMessageCore(target, message);
   if (!validated.success) return validated;
+  let output: string;
   try {
-    return { success: true, output: JSON.stringify(validated.output) };
+    output = JSON.stringify(validated.output);
   } catch {
     // Unreachable for guarded snapshots; kept as the honest terminal state.
     return failure("INVALID_MESSAGE");
   }
+  // Checked last, on the bytes that would actually travel: the bound is about
+  // what the wire carries, and no earlier check can see the escaping.
+  if (utf8Length(output) > MAX_FRAME_BYTES) return failure("FRAME_TOO_LARGE");
+  return { success: true, output };
 }

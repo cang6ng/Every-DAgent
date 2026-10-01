@@ -1,31 +1,39 @@
 /**
- * HostEvent v1: exactly the eight event types frozen by SPEC §9 — and
- * nothing the Core never produced. No message-start/end, no model-step, no
- * tool-argument delta, no artifact, no reasoning, no usage.
+ * HostEvent v2: the events frozen by SPEC §14.4, and nothing the Core never
+ * produced. No message-start/end, no model-step, no tool-argument delta, no
+ * artifact, no reasoning, no usage.
  *
  * Scope ids must agree with the payload's own ids; the cross-field checks
  * here run on the pre-strip snapshot, so a mismatched scope can never be
  * laundered into a valid event by field stripping.
+ *
+ * Two properties are contract, not decoration. A collection revision travelling
+ * with an event is the version the event's own change produced, so a client can
+ * tell that a page it holds belongs to an older catalogue. And no event carries
+ * a whole session's history: `run.ended` announces a terminal run and the new
+ * summary, never the turns it settled — those are read through a history page.
  */
 
 import * as v from "valibot";
 
 import type {
   ActiveRunSnapshot,
+  CollectionRevisions,
   EventScope,
   Id,
   LiveToolItem,
   PluginSummary,
-  SessionSnapshot,
+  SessionSummary,
   TerminalRunSnapshot,
 } from "./contracts.js";
 import {
   activeRunSchema,
+  collectionRevisionsSchema,
   idSchema,
   liveToolItemSchema,
   plainStringSchema,
   pluginSummarySchema,
-  sessionSnapshotSchema,
+  sessionSummarySchema,
   terminalRunSchema,
 } from "./schemas.js";
 
@@ -35,7 +43,7 @@ import {
 
 interface HostEventBase {
   readonly kind: "host-event";
-  readonly protocolVersion: "1";
+  readonly protocolVersion: "2";
   readonly hostInstanceId: Id;
   readonly streamId: Id;
   readonly sequence: number;
@@ -45,7 +53,21 @@ export type HostEvent =
   | (HostEventBase & {
       readonly scope: EventScope & { readonly kind: "session"; readonly sessionId: Id };
       readonly type: "session.created";
-      readonly payload: { readonly session: SessionSnapshot };
+      readonly payload: { readonly session: SessionSummary; readonly collections: CollectionRevisions };
+    })
+  | (HostEventBase & {
+      readonly scope: EventScope & { readonly kind: "session"; readonly sessionId: Id };
+      readonly type: "session.updated";
+      readonly payload: { readonly session: SessionSummary; readonly collections: CollectionRevisions };
+    })
+  | (HostEventBase & {
+      readonly scope: EventScope & { readonly kind: "session"; readonly sessionId: Id };
+      readonly type: "session.deleted";
+      readonly payload: {
+        readonly sessionId: Id;
+        readonly generation: number;
+        readonly collections: CollectionRevisions;
+      };
     })
   | (HostEventBase & {
       readonly scope: EventScope & { readonly kind: "run"; readonly sessionId: Id; readonly runId: Id };
@@ -70,12 +92,21 @@ export type HostEvent =
   | (HostEventBase & {
       readonly scope: EventScope & { readonly kind: "run"; readonly sessionId: Id; readonly runId: Id };
       readonly type: "run.ended";
-      readonly payload: { readonly run: TerminalRunSnapshot; readonly session: SessionSnapshot };
+      readonly payload: {
+        readonly run: TerminalRunSnapshot;
+        readonly session: SessionSummary;
+        readonly collections: CollectionRevisions;
+      };
     })
   | (HostEventBase & {
       readonly scope: EventScope & { readonly kind: "plugin"; readonly pluginId: Id };
       readonly type: "plugin.updated";
       readonly payload: { readonly plugin: PluginSummary };
+    })
+  | (HostEventBase & {
+      readonly scope: EventScope & { readonly kind: "host" };
+      readonly type: "collection.invalidated";
+      readonly payload: { readonly collections: CollectionRevisions };
     })
   | (HostEventBase & {
       readonly scope: EventScope & { readonly kind: "host" };
@@ -87,7 +118,7 @@ export type HostEvent =
 export type HostEventType = HostEvent["type"];
 
 // ---------------------------------------------------------------------------
-// Runtime schemas (internal), keyed by exactly the eight event literals.
+// Runtime schemas (internal), keyed by exactly the event literals.
 // ---------------------------------------------------------------------------
 
 /** Events start at sequence 1; zero belongs to snapshot watermarks. */
@@ -95,7 +126,7 @@ const eventSequenceSchema = v.pipe(v.number(), v.safeInteger(), v.minValue(1));
 
 const eventBaseEntries = {
   kind: v.literal("host-event"),
-  protocolVersion: v.literal("1"),
+  protocolVersion: v.literal("2"),
   hostInstanceId: idSchema,
   streamId: idSchema,
   sequence: eventSequenceSchema,
@@ -107,23 +138,57 @@ const runScopeSchema = v.object({
   runId: idSchema,
 });
 
-const eventSchemas = {
-  "session.created": v.pipe(
+const sessionScopeSchema = v.object({
+  kind: v.literal("session"),
+  sessionId: idSchema,
+});
+
+/** An announcement about a session's summary, checked against the scope that carries it. */
+const sessionSummaryEventSchema = (type: "session.created" | "session.updated") =>
+  v.pipe(
     v.object({
       ...eventBaseEntries,
-      type: v.literal("session.created"),
-      scope: v.object({ kind: v.literal("session"), sessionId: idSchema }),
-      payload: v.object({ session: sessionSnapshotSchema }),
+      type: v.literal(type),
+      scope: sessionScopeSchema,
+      payload: v.object({
+        session: sessionSummarySchema,
+        collections: collectionRevisionsSchema,
+      }),
     }),
     v.check((event) => {
       const session = event.payload.session;
+      if (event.scope.sessionId !== session.sessionId) return false;
+      // A create announces a session that has no history and no run yet. An
+      // update announces a change to one that exists; the schema cannot see
+      // which came first, so it only pins what "created" claims.
+      if (type !== "session.created") return true;
       return (
-        event.scope.sessionId === session.sessionId &&
         session.status === "ready" &&
         session.activeRunId === null &&
-        session.canonical.length === 0
+        session.committedSeq === 0 &&
+        session.historyRevision === 0 &&
+        session.generation === 1
       );
     }),
+  );
+
+const eventSchemas = {
+  "session.created": sessionSummaryEventSchema("session.created"),
+  "session.updated": sessionSummaryEventSchema("session.updated"),
+  "session.deleted": v.pipe(
+    v.object({
+      ...eventBaseEntries,
+      type: v.literal("session.deleted"),
+      scope: sessionScopeSchema,
+      payload: v.object({
+        sessionId: idSchema,
+        generation: v.pipe(v.number(), v.safeInteger(), v.minValue(1)),
+        collections: collectionRevisionsSchema,
+      }),
+    }),
+    // The scope names the session the payload retires, so a client cannot be
+    // told about a deletion of something other than what it holds.
+    v.check((event) => event.scope.sessionId === event.payload.sessionId),
   ),
   "run.updated": v.pipe(
     v.object({
@@ -170,7 +235,11 @@ const eventSchemas = {
       ...eventBaseEntries,
       type: v.literal("run.ended"),
       scope: runScopeSchema,
-      payload: v.object({ run: terminalRunSchema, session: sessionSnapshotSchema }),
+      payload: v.object({
+        run: terminalRunSchema,
+        session: sessionSummarySchema,
+        collections: collectionRevisionsSchema,
+      }),
     }),
     v.check((event) => {
       const run = event.payload.run;
@@ -179,7 +248,8 @@ const eventSchemas = {
         event.scope.runId === run.runId &&
         event.scope.sessionId === run.sessionId &&
         event.scope.sessionId === session.sessionId &&
-        // The terminal correction always clears the session's active run.
+        // The terminal correction always clears the session's active run and
+        // lands exactly at the run's own session boundary.
         session.activeRunId === null
       );
     }),
@@ -193,6 +263,15 @@ const eventSchemas = {
     }),
     v.check((event) => event.scope.pluginId === event.payload.plugin.id),
   ),
+  // A catalogue's revision moved without a summary to carry. The revisions are
+  // the whole message: a client holding an older page learns its page is no
+  // longer the current catalogue and re-reads, rather than stitching versions.
+  "collection.invalidated": v.object({
+    ...eventBaseEntries,
+    type: v.literal("collection.invalidated"),
+    scope: v.object({ kind: v.literal("host") }),
+    payload: v.object({ collections: collectionRevisionsSchema }),
+  }),
   "host.request.cancelled": v.object({
     ...eventBaseEntries,
     type: v.literal("host.request.cancelled"),

@@ -26,6 +26,20 @@ function importSpecifiers(source: string): string[] {
   return specifiers;
 }
 
+/**
+ * Source with its comments removed, for the patterns that are English words.
+ *
+ * `window` is this package's own noun for a bounded page ("a window, never the
+ * whole directory"), and v2 names a real capability `approvals`. Neither word
+ * in a comment can reach a global or register a reverse method, so the two
+ * rules that name them are checked against code; every other pattern still
+ * scans the raw source, because a directive such as `@ts-ignore` only ever
+ * lives in a comment.
+ */
+function codeOnly(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/gm, "$1");
+}
+
 describe("dependency boundary", () => {
   it("keeps the source tree to the planned modules", () => {
     expect([...srcRelative].sort()).toEqual(
@@ -62,18 +76,22 @@ describe("dependency boundary", () => {
       /\bprocess\s*\./,
       /\bBuffer\b/,
       /\bglobalThis\s*\./,
-      /\bdocument\b/,
-      /\bwindow\b/,
       /\bReact\b/,
       /\breact\b/,
       /@every-dagent\/(agent-core|model-pi-ai|plugin-system|plugin-calculator|host|client)/,
       /\bpi-ai\b/,
       /\bvitest\b/,
     ];
+    // The DOM globals are matched on code: this package's docs legitimately say
+    // "a window, never the whole directory", and prose cannot reach a browser.
+    const forbiddenInCode = [/\bdocument\b/, /\bwindow\b/];
     for (const file of srcFiles) {
       const source = readFileSync(file, "utf8");
       for (const pattern of forbidden) {
         expect(source, `${file} must not match ${pattern}`).not.toMatch(pattern);
+      }
+      for (const pattern of forbiddenInCode) {
+        expect(codeOnly(source), `${file} must not match ${pattern} in code`).not.toMatch(pattern);
       }
     }
   });
@@ -110,7 +128,9 @@ describe("dependency boundary", () => {
 
   it("keeps the reverse business registry empty in production code", () => {
     for (const file of srcFiles) {
-      const source = readFileSync(file, "utf8");
+      // Code, not prose: v2 declares an `approvals` capability and says so in
+      // its comments, but no product reverse method is registered anywhere.
+      const source = codeOnly(readFileSync(file, "utf8"));
       expect(source, `${file} must not register reverse methods`).not.toMatch(/test\.ping|test\.echo/);
       expect(source, `${file} must not name product reverse methods`).not.toMatch(
         /\bapproval\b|\bfile\.picker\b|\boauth\b/i,

@@ -10,8 +10,9 @@ import {
   hostRequest,
   hostResponseError,
   hostResponseSuccess,
+  collectionRevisions,
   INSTANCE,
-  sessionSnapshot,
+  sessionSummary,
 } from "./helpers/fixtures.js";
 
 describe("decodeFrame", () => {
@@ -64,17 +65,22 @@ describe("decodeFrame", () => {
   });
 
   it("keeps unknown-but-legal generations decodable for the version gate", () => {
-    const decoded = decodeFrame(JSON.stringify({ ...describeRequest(), protocolVersion: "2" }));
+    // "99" is a well-formed generation that is not the one this package speaks:
+    // the base decode has to recognize the envelope anyway, so that the *gate* —
+    // not the parser — is what refuses it.
+    const unknownGeneration = { ...describeRequest(), protocolVersion: "99" };
+    const decoded = decodeFrame(JSON.stringify(unknownGeneration));
     expect(decoded.success).toBe(true);
 
-    const validated = validateMessage({ kind: "client-request" }, { ...describeRequest(), protocolVersion: "2" });
+    const validated = validateMessage({ kind: "client-request" }, unknownGeneration);
     expect(validated).toMatchObject({ success: false });
+    if (!validated.success) expect(validated.failure.reason).toBe("UNSUPPORTED_PROTOCOL");
   });
 
   it("survives a missing params with a safe correlation, and never salvages one from broken JSON", () => {
     const missingParams = decodeFrame(JSON.stringify({
       kind: "client-request",
-      protocolVersion: "1",
+      protocolVersion: "2",
       requestId: "c-7",
       method: "sessions.list",
     }));
@@ -157,7 +163,7 @@ describe("encodeFrame", () => {
   it("serializes the methodless error-only response for unknown methods", () => {
     const errorResponse = {
       kind: "host-response",
-      protocolVersion: "1",
+      protocolVersion: "2",
       hostInstanceId: INSTANCE,
       requestId: "c-99",
       error: { code: "METHOD_NOT_FOUND", message: "unknown method" },
@@ -173,7 +179,11 @@ describe("encodeFrame", () => {
 
   it("encodes every valid event kind", () => {
     const events = [
-      hostEvent("session.created", { kind: "session", sessionId: "s-1" }, { session: sessionSnapshot() }),
+      hostEvent(
+        "session.created",
+        { kind: "session", sessionId: "s-1" },
+        { session: sessionSummary(), collections: collectionRevisions() },
+      ),
       hostEvent("run.output.delta", { kind: "run", sessionId: "s-1", runId: "r-1" }, { itemId: "i", text: "t" }),
     ];
     for (const event of events) {
