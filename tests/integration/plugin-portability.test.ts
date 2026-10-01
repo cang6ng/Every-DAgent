@@ -17,7 +17,7 @@ import { createCalculatorPlugin } from "@every-dagent/plugin-calculator";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { textStatsPlugin } from "../fixtures/text-stats-plugin.js";
-import { createHostPlatform, waitFor } from "../helpers/platform.js";
+import { createHostPlatform, runSettled, waitFor } from "../helpers/platform.js";
 import { scriptedModel, textReply, toolReply, type ModelReply } from "../helpers/demo-fixtures.js";
 
 const open: { close(): Promise<void> }[] = [];
@@ -71,13 +71,10 @@ describe.each(["memory", "web"] as const)("a second plugin over the %s carrier",
     );
 
     // The model asks for its tool; the real tool runs and is recorded.
-    await client.runs.start({ sessionId: session.sessionId, submissionId: "sub-1", text: "统计一下" });
-    await waitFor(
-      () => client.getSnapshot().presentation?.sessions[0]?.canonical.some((item) => item.kind === "tool-result") === true,
-      { what: "the tool result" },
-    );
+    const first = await client.runs.start({ sessionId: session.sessionId, submissionId: "sub-1", text: "统计一下" });
+    await waitFor(() => runSettled(client.getSnapshot(), first.run.runId), { what: "the tool run to settle" });
 
-    const canonical = client.getSnapshot().presentation?.sessions[0]?.canonical ?? [];
+    const canonical = (await client.sessions.history({ sessionId: session.sessionId })).page.items;
     const call = canonical.find((item) => item.kind === "tool-call");
     const result = canonical.find((item) => item.kind === "tool-result");
     expect(call).toMatchObject({ kind: "tool-call", name: "text-stats", input: { kind: "json", value: { text: "hello world" } } });
@@ -94,17 +91,13 @@ describe.each(["memory", "web"] as const)("a second plugin over the %s carrier",
       { what: "the plugin to be disabled" },
     );
 
-    await client.runs.start({ sessionId: session.sessionId, submissionId: "sub-2", text: "再统计一次" });
+    const second = await client.runs.start({ sessionId: session.sessionId, submissionId: "sub-2", text: "再统计一次" });
     await waitFor(() => model.requests.length >= 4, { what: "the second run's requests" });
     // The request that would decide to call the tool no longer offers it.
     expect(model.requests[2]?.tools.map((tool) => tool.name)).not.toContain("text-stats");
 
-    await waitFor(
-      () =>
-        (client.getSnapshot().presentation?.sessions[0]?.canonical.filter((item) => item.kind === "tool-result").length ?? 0) === 2,
-      { what: "the second tool result" },
-    );
-    const results = (client.getSnapshot().presentation?.sessions[0]?.canonical ?? []).filter(
+    await waitFor(() => runSettled(client.getSnapshot(), second.run.runId), { what: "the second run to settle" });
+    const results = (await client.sessions.history({ sessionId: session.sessionId })).page.items.filter(
       (item) => item.kind === "tool-result",
     );
     // The call failed as an unknown tool, and the fixture never ran again.

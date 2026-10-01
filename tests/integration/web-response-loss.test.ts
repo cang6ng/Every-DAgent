@@ -14,7 +14,7 @@ import { connectHttpChannel, startHttpBinding, type HttpBinding } from "@every-d
 
 import { createClient } from "@every-dagent/client";
 
-import { createHostPlatform, waitFor } from "../helpers/platform.js";
+import { createHostPlatform, runSettled, waitFor } from "../helpers/platform.js";
 import { demoPlugin, scriptedModel, textReply, toolReply } from "../helpers/demo-fixtures.js";
 
 const PLUGIN_ID = "web-loss-plugin";
@@ -146,13 +146,9 @@ describe("a lost runs.start answer over the web binding", () => {
     await client.reconnect();
 
     const recovered = await client.runs.get({ submissionId: SUBMISSION });
-    await waitFor(
-      () =>
-        client
-          .getSnapshot()
-          .presentation?.runs.some((run) => run.runId === recovered.run.runId && run.live === null) === true,
-      { what: "the recovered run to settle" },
-    );
+    await waitFor(() => runSettled(client.getSnapshot(), recovered.run.runId), {
+      what: "the recovered run to settle",
+    });
 
     // Exactly one start left this client, and it was not sent again for the
     // answer it never heard.
@@ -161,7 +157,7 @@ describe("a lost runs.start answer over the web binding", () => {
     const outcome = await lost;
     expect(outcome).toMatchObject({ code: "CONNECTION_LOST", outcome: "unknown" });
     expect(fixture.demo.executions).toHaveLength(1);
-    expect(client.getSnapshot().presentation?.runs).toHaveLength(1);
+    expect(client.getSnapshot().presentation?.runs.items).toHaveLength(1);
 
     const again = await client.runs.start({
       sessionId: session.sessionId,
@@ -191,7 +187,7 @@ describe("a lost runs.start answer over the web binding", () => {
       text: "keep going without me",
     });
     await waitFor(
-      () => client.getSnapshot().presentation?.runs.some((run) => run.runId === started.run.runId) === true,
+      () => client.getSnapshot().presentation?.runs.items.some((run) => run.runId === started.run.runId) === true,
       { what: "the run to be announced" },
     );
 
@@ -201,16 +197,12 @@ describe("a lost runs.start answer over the web binding", () => {
     });
 
     await client.reconnect();
-    await waitFor(
-      () =>
-        client
-          .getSnapshot()
-          .presentation?.runs.some((run) => run.runId === started.run.runId && run.live === null) === true,
-      { what: "the finished run to appear after reconnecting" },
-    );
+    await waitFor(() => runSettled(client.getSnapshot(), started.run.runId), {
+      what: "the finished run to appear after reconnecting",
+    });
 
     expect(
-      client.getSnapshot().presentation?.runs.find((run) => run.runId === started.run.runId)?.status,
+      client.getSnapshot().presentation?.runs.items.find((run) => run.runId === started.run.runId)?.status,
     ).toBe("completed");
     await platform.shutdown();
   });
@@ -224,7 +216,7 @@ describe("a lost runs.start answer over the web binding", () => {
       submissionId: "sub-web-old",
       text: "the first host's work",
     });
-    await waitFor(() => first.client.getSnapshot().presentation?.runs.length === 1, { what: "the run" });
+    await waitFor(() => first.client.getSnapshot().presentation?.runs.items.length === 1, { what: "the run" });
 
     const second = await webPlatform();
     await second.client.connect();
@@ -235,7 +227,7 @@ describe("a lost runs.start answer over the web binding", () => {
     await expect(second.client.runs.get({ submissionId: "sub-web-old" })).rejects.toMatchObject({
       code: "RUN_NOT_FOUND",
     });
-    expect(second.client.getSnapshot().presentation?.runs).toHaveLength(0);
+    expect(second.client.getSnapshot().presentation?.runs.items).toHaveLength(0);
 
     await first.platform.shutdown();
     await second.platform.shutdown();

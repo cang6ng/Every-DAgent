@@ -21,6 +21,7 @@ export type {
   ProtocolViolationReason,
 } from "./errors.js";
 
-export type { ClientSnapshot, ConnectionStatus, PresentationHost } from "./store.js";
+export type { ClientSnapshot, ConnectionStatus, LiveMap, PresentationHost } from "./store.js";
+export type { HistoryCoverage, HistoryMap } from "./fold.js";
 
 export type { ProtocolChannel } from "@every-dagent/protocol";

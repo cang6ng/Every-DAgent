@@ -15,7 +15,7 @@ import { createClient } from "../src/index.js";
 
 import { createFakeHost } from "./helpers/fake-host.js";
 import { createScenario, flush } from "./helpers/scenario.js";
-import { sessionSnapshot } from "./helpers/values.js";
+import { activeRun, sessionPage, sessionSummary } from "./helpers/values.js";
 
 describe("correlating answers", () => {
   it("resolves out-of-order answers to their own requests", async () => {
@@ -29,11 +29,11 @@ describe("correlating answers", () => {
     const createId = host.requestIdOf("sessions.create") ?? "";
 
     // Answered in the opposite order to the one they were sent in.
-    host.respond(createId, "sessions.create", { session: sessionSnapshot({ sessionId: "s-1" }) });
-    host.respond(listId, "sessions.list", { sessions: [] });
+    host.respond(createId, "sessions.create", { session: sessionSummary({ sessionId: "s-1" }) });
+    host.respond(listId, "sessions.list", { sessions: sessionPage([]) });
 
     await expect(create).resolves.toMatchObject({ session: { sessionId: "s-1" } });
-    await expect(list).resolves.toEqual({ sessions: [] });
+    await expect(list).resolves.toEqual({ sessions: sessionPage([]) });
   });
 
   it("drops a duplicate answer without resolving anything twice", async () => {
@@ -43,11 +43,11 @@ describe("correlating answers", () => {
 
     const list = scenario.client.sessions.list();
     const requestId = host.requestIdOf("sessions.list") ?? "";
-    host.respond(requestId, "sessions.list", { sessions: [] });
-    await expect(list).resolves.toEqual({ sessions: [] });
+    host.respond(requestId, "sessions.list", { sessions: sessionPage([]) });
+    await expect(list).resolves.toEqual({ sessions: sessionPage([]) });
 
     const before = host.delivered.length;
-    host.respond(requestId, "sessions.list", { sessions: [] });
+    host.respond(requestId, "sessions.list", { sessions: sessionPage([]) });
     await flush();
 
     expect(host.delivered.length).toBe(before + 1);
@@ -59,7 +59,7 @@ describe("correlating answers", () => {
     const scenario = createScenario();
     await scenario.ready();
 
-    scenario.host.respond("never-asked", "sessions.list", { sessions: [] });
+    scenario.host.respond("never-asked", "sessions.list", { sessions: sessionPage([]) });
     await flush();
 
     expect(scenario.client.getSnapshot().status).toBe("ready");
@@ -89,10 +89,10 @@ describe("answers that contradict the connection", () => {
     scenario.host.sendRaw(
       JSON.stringify({
         kind: "host-response",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: "somewhere-else",
         requestId: "never-asked",
-        result: { sessions: [] },
+        result: { sessions: sessionPage([]) },
       }),
     );
     await flush();
@@ -108,16 +108,16 @@ describe("answers that contradict the connection", () => {
 
     const list = scenario.client.sessions.list();
     const requestId = host.requestIdOf("sessions.list") ?? "";
-    host.respond(requestId, "sessions.list", { sessions: [] });
+    host.respond(requestId, "sessions.list", { sessions: sessionPage([]) });
     await list;
 
     host.sendRaw(
       JSON.stringify({
         kind: "host-response",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: "somewhere-else",
         requestId,
-        result: { sessions: [] },
+        result: { sessions: sessionPage([]) },
       }),
     );
     await flush();
@@ -135,10 +135,10 @@ describe("answers that contradict the connection", () => {
     scenario.host.sendRaw(
       JSON.stringify({
         kind: "host-response",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: scenario.host.hostInstanceId,
         requestId: scenario.host.requestIdOf("runs.get") ?? "",
-        result: { sessions: [] },
+        result: { sessions: sessionPage([]) },
       }),
     );
 
@@ -152,7 +152,7 @@ describe("answers that contradict the connection", () => {
 
     const get = scenario.client.sessions.get({ sessionId: "s-1" });
     scenario.host.respond(scenario.host.requestIdOf("sessions.get") ?? "", "sessions.get", {
-      session: sessionSnapshot({ sessionId: "s-OTHER" }),
+      session: sessionSummary({ sessionId: "s-OTHER" }),
     });
 
     await expect(get).rejects.toMatchObject({ kind: "protocol", reason: "result-identity" });
@@ -165,18 +165,12 @@ describe("answers that contradict the connection", () => {
 
     const start = scenario.client.runs.start({ sessionId: "s-1", submissionId: "sub-1", text: "hello" });
     scenario.host.respond(scenario.host.requestIdOf("runs.start") ?? "", "runs.start", {
-      run: {
+      run: activeRun({
         runId: "r-1",
-        submissionId: "sub-OTHER",
         sessionId: "s-1",
+        submissionId: "sub-OTHER",
         text: "hello",
-        turnId: null,
-        cancelRequested: false,
-        status: "accepted",
-        endReason: null,
-        error: null,
-        live: [],
-      },
+      }),
     });
 
     await expect(start).rejects.toMatchObject({ kind: "protocol", reason: "result-identity" });
@@ -258,7 +252,7 @@ describe("the request the client remembers is the request it sent", () => {
     const response = scenario.client.sessions.get(params);
     params.sessionId = "changed-after-send";
     scenario.host.respond(scenario.host.requestIdOf("sessions.get") ?? "", "sessions.get", {
-      session: sessionSnapshot({ sessionId: "original" }),
+      session: sessionSummary({ sessionId: "original" }),
     });
 
     await expect(response).resolves.toMatchObject({ session: { sessionId: "original" } });
@@ -273,7 +267,7 @@ describe("the request the client remembers is the request it sent", () => {
     scenario.host.sendRaw(
       JSON.stringify({
         kind: "host-response",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: scenario.host.hostInstanceId,
         requestId: scenario.host.requestIdOf("sessions.create") ?? "",
         result: { wrong: "schema" },

@@ -192,8 +192,8 @@ describe("the shell server", () => {
     expect(client.getSnapshot().status).toBe("ready");
 
     const { session } = await client.sessions.create();
-    await waitFor(() => client.getSnapshot().presentation?.sessions.length === 1, "the session event");
-    expect(client.getSnapshot().presentation?.sessions[0]?.sessionId).toBe(session.sessionId);
+    await waitFor(() => client.getSnapshot().presentation?.sessions.items.length === 1, "the session event");
+    expect(client.getSnapshot().presentation?.sessions.items[0]?.sessionId).toBe(session.sessionId);
 
     client.disconnect();
   });

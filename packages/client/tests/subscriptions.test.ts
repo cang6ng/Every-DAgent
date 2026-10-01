@@ -10,20 +10,23 @@
 import { describe, expect, it } from "vitest";
 
 import { createScenario, flush, openWith } from "./helpers/scenario.js";
-import { sessionSnapshot } from "./helpers/values.js";
+import { sessionPage, sessionSummary } from "./helpers/values.js";
 
-const SESSION = sessionSnapshot({ sessionId: "s-1" });
+const SESSION = sessionSummary({ sessionId: "s-1" });
+
+/** The catalogue versions an event carries: what the fake host would announce. */
+const COLLECTIONS = { sessions: 1, runs: 1, plugins: 1 } as const;
 
 function badEvent(host: { readonly hostInstanceId: string; readonly currentStreamId: string | undefined }, sequence: number, sessionId: string): string {
   return JSON.stringify({
     kind: "host-event",
-    protocolVersion: "1",
+    protocolVersion: "2",
     hostInstanceId: host.hostInstanceId,
     streamId: host.currentStreamId,
     sequence,
     type: "session.created",
     scope: { kind: "session", sessionId },
-    payload: { session: sessionSnapshot({ sessionId }) },
+    payload: { session: sessionSummary({ sessionId }), collections: COLLECTIONS },
   });
 }
 
@@ -34,7 +37,7 @@ describe("sequence", () => {
 
     scenario.host.emit({ type: "session.created", session: SESSION });
 
-    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(1);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items).toHaveLength(1);
     expect(scenario.client.getSnapshot().status).toBe("ready");
   });
 
@@ -50,13 +53,13 @@ describe("sequence", () => {
     host.sendRaw(frame);
 
     expect(scenario.client.getSnapshot().presentation).toBe(afterFirst);
-    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(1);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items).toHaveLength(1);
     expect(scenario.client.getSnapshot().status).toBe("ready");
   });
 
   it("does not apply a gap, and re-cuts the subscription instead", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
 
     // Sequence 1 never arrives; 2 does — and is not applied.
@@ -67,17 +70,17 @@ describe("sequence", () => {
 
     // The re-cut installs a fresh, complete snapshot: the skipped event is gone
     // with the stream that carried it.
-    host.serveOpen({ sessions: [SESSION] });
+    host.serveOpen({ sessions: sessionPage([SESSION]) });
     await flush();
 
     expect(scenario.client.getSnapshot().status).toBe("ready");
-    expect(scenario.client.getSnapshot().presentation?.sessions.map((session) => session.sessionId)).toEqual(["s-1"]);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items.map((session) => session.sessionId)).toEqual(["s-1"]);
     expect(host.streamIds).toHaveLength(2);
   });
 
   it("keeps one re-cut in flight when the gap repeats", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
     const streamId = host.currentStreamId;
 
@@ -85,13 +88,13 @@ describe("sequence", () => {
     host.sendRaw(
       JSON.stringify({
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: host.hostInstanceId,
         streamId,
         sequence: 6,
         type: "session.created",
         scope: { kind: "session", sessionId: "s-b" },
-        payload: { session: sessionSnapshot({ sessionId: "s-b" }) },
+        payload: { session: sessionSummary({ sessionId: "s-b" }), collections: COLLECTIONS },
       }),
     );
     await flush();
@@ -102,13 +105,13 @@ describe("sequence", () => {
 
   it("refuses a stream id that was already retired", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
     const firstStream = host.currentStreamId;
 
     const resyncing = scenario.client.resync();
     await flush();
-    host.serveOpen({ sessions: [SESSION] });
+    host.serveOpen({ sessions: sessionPage([SESSION]) });
     await resyncing;
 
     // A third cut that hands back the very stream that was retired: streams are
@@ -118,12 +121,12 @@ describe("sequence", () => {
     host.sendRaw(
       JSON.stringify({
         kind: "host-response",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: host.hostInstanceId,
         requestId: host.requestIdOf("subscriptions.open", 2) ?? "",
         result: {
           snapshot: {
-            ...host.snapshot({ sessions: [SESSION] }),
+            ...host.snapshot({ sessions: sessionPage([SESSION]) }),
             watermark: { streamId: firstStream, sequence: 0 },
           },
         },
@@ -139,19 +142,19 @@ describe("sequence", () => {
 describe("resync", () => {
   it("replaces the presentation whole and starts the new stream at one", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
 
     const resyncing = scenario.client.resync();
     await flush();
-    host.serveOpen({ sessions: [sessionSnapshot({ sessionId: "s-2" })] });
+    host.serveOpen({ sessions: sessionPage([sessionSummary({ sessionId: "s-2" })]) });
     await resyncing;
 
     expect(scenario.client.getSnapshot().status).toBe("ready");
-    expect(scenario.client.getSnapshot().presentation?.sessions.map((session) => session.sessionId)).toEqual(["s-2"]);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items.map((session) => session.sessionId)).toEqual(["s-2"]);
 
-    host.emit({ type: "session.created", session: sessionSnapshot({ sessionId: "s-3" }) });
-    expect(scenario.client.getSnapshot().presentation?.sessions.map((session) => session.sessionId)).toEqual(["s-2", "s-3"]);
+    host.emit({ type: "session.created", session: sessionSummary({ sessionId: "s-3" }) });
+    expect(scenario.client.getSnapshot().presentation?.sessions.items.map((session) => session.sessionId)).toEqual(["s-3", "s-2"]);
   });
 
   it("refuses to resync without a live connection", async () => {
@@ -162,7 +165,7 @@ describe("resync", () => {
 
   it("merges an explicit resync with one already in flight", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
 
     const first = scenario.client.resync();
@@ -170,7 +173,7 @@ describe("resync", () => {
     await flush();
 
     expect(host.requests.filter((request) => request.method === "subscriptions.open")).toHaveLength(2);
-    host.serveOpen({ sessions: [SESSION] });
+    host.serveOpen({ sessions: sessionPage([SESSION]) });
     await expect(first).resolves.toBeUndefined();
     await expect(second).resolves.toBeUndefined();
   });
@@ -179,7 +182,7 @@ describe("resync", () => {
 describe("closing a subscription", () => {
   it("invalidates the stream locally before the host is even told", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
     const streamId = host.currentStreamId;
 
@@ -189,7 +192,7 @@ describe("closing a subscription", () => {
     // client is no longer ready — the answer has not even arrived.
     expect(scenario.client.getSnapshot().status).toBe("connected");
     expect(scenario.client.getSnapshot().stale).toBe(true);
-    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(1);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items).toHaveLength(1);
 
     host.respond(host.requestIdOf("subscriptions.close") ?? "", "subscriptions.close", { closed: true });
     await closing;
@@ -198,7 +201,7 @@ describe("closing a subscription", () => {
 
   it("ignores the frames of the stream it just ended", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
     const streamId = host.currentStreamId;
     const frame = badEvent(host, 1, "s-late");
@@ -208,14 +211,14 @@ describe("closing a subscription", () => {
     host.respond(host.requestIdOf("subscriptions.close") ?? "", "subscriptions.close", { closed: true });
     await closing;
 
-    expect(scenario.client.getSnapshot().presentation?.sessions.map((session) => session.sessionId)).toEqual(["s-1"]);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items.map((session) => session.sessionId)).toEqual(["s-1"]);
     expect(scenario.client.getSnapshot().status).toBe("connected");
     expect(streamId).toBeDefined();
   });
 
   it("keeps the local state when the host reports the stream was already gone", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
 
     const closing = scenario.client.closeSubscription();
@@ -228,7 +231,7 @@ describe("closing a subscription", () => {
 
   it("does not let a late close answer touch a stream opened afterwards", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
 
     const closing = scenario.client.closeSubscription();
@@ -237,19 +240,19 @@ describe("closing a subscription", () => {
     // A new subscription is opened before the host ever answers the close.
     const resyncing = scenario.client.resync();
     await flush();
-    host.serveOpen({ sessions: [sessionSnapshot({ sessionId: "s-2" })] });
+    host.serveOpen({ sessions: sessionPage([sessionSummary({ sessionId: "s-2" })]) });
     await resyncing;
 
     host.respond(closeId, "subscriptions.close", { closed: true });
     await closing;
 
     expect(scenario.client.getSnapshot().status).toBe("ready");
-    expect(scenario.client.getSnapshot().presentation?.sessions.map((session) => session.sessionId)).toEqual(["s-2"]);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items.map((session) => session.sessionId)).toEqual(["s-2"]);
   });
 
   it("refuses to close while an open is in flight", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
 
     const resyncing = scenario.client.resync();
@@ -257,7 +260,7 @@ describe("closing a subscription", () => {
     const closing = scenario.client.closeSubscription();
 
     await expect(closing).rejects.toMatchObject({ kind: "client", reason: "sync-in-flight" });
-    host.serveOpen({ sessions: [SESSION] });
+    host.serveOpen({ sessions: sessionPage([SESSION]) });
     await resyncing;
   });
 
@@ -277,7 +280,7 @@ describe("closing a subscription", () => {
 describe("control transactions are taken before anything observable", () => {
   it("a listener that sees `syncing` cannot start a second simultaneous cut", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
 
     let reentered = false;
@@ -291,7 +294,7 @@ describe("control transactions are taken before anything observable", () => {
     const first = scenario.client.resync();
     const opens = host.requests.filter((request) => request.method === "subscriptions.open").length;
 
-    host.serveOpen({ sessions: [SESSION] });
+    host.serveOpen({ sessions: sessionPage([SESSION]) });
     await first;
     await second;
 
@@ -332,13 +335,13 @@ describe("control transactions are taken before anything observable", () => {
     host.sendRaw(
       JSON.stringify({
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: host.hostInstanceId,
         streamId: host.currentStreamId,
         sequence: 2,
         type: "session.created",
         scope: { kind: "session", sessionId: "skipped" },
-        payload: { session: sessionSnapshot({ sessionId: "skipped" }) },
+        payload: { session: sessionSummary({ sessionId: "skipped" }), collections: COLLECTIONS },
       }),
     );
     await connecting;
@@ -373,7 +376,7 @@ describe("control transactions are taken before anything observable", () => {
 
   it("a listener that reacts to a gap-driven cut joins that cut", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
 
     let reentered = false;
@@ -386,7 +389,7 @@ describe("control transactions are taken before anything observable", () => {
 
     host.sendRaw(badEvent(host, 4, "s-skipped"));
     await flush();
-    host.serveOpen({ sessions: [SESSION] });
+    host.serveOpen({ sessions: sessionPage([SESSION]) });
     await nested;
     await flush();
 
@@ -399,7 +402,7 @@ describe("control transactions are taken before anything observable", () => {
 describe("losing the stream marks the presentation stale", () => {
   it("a cut never publishes a status its own stream could not back", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
     const observed: { readonly status: string; readonly stale: boolean }[] = [];
     scenario.client.subscribe(() => {
@@ -409,7 +412,7 @@ describe("losing the stream marks the presentation stale", () => {
 
     const resyncing = scenario.client.resync();
     await flush();
-    host.serveOpen({ sessions: [SESSION] });
+    host.serveOpen({ sessions: sessionPage([SESSION]) });
     await resyncing;
 
     // The stream is gone and the presentation is stale in the same publication:
@@ -422,16 +425,16 @@ describe("losing the stream marks the presentation stale", () => {
 
   it("a caller's resync marks what is retained as stale", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
 
     const resyncing = scenario.client.resync();
     await flush();
 
     expect(scenario.client.getSnapshot().stale).toBe(true);
-    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(1);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items).toHaveLength(1);
 
-    host.serveOpen({ sessions: [SESSION] });
+    host.serveOpen({ sessions: sessionPage([SESSION]) });
     await resyncing;
 
     expect(scenario.client.getSnapshot().stale).toBe(false);
@@ -439,29 +442,29 @@ describe("losing the stream marks the presentation stale", () => {
 
   it("a gap marks what is retained as stale", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
 
     host.sendRaw(
       JSON.stringify({
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: host.hostInstanceId,
         streamId: host.currentStreamId,
         sequence: 5,
         type: "session.created",
         scope: { kind: "session", sessionId: "skipped" },
-        payload: { session: sessionSnapshot({ sessionId: "skipped" }) },
+        payload: { session: sessionSummary({ sessionId: "skipped" }), collections: COLLECTIONS },
       }),
     );
 
     expect(scenario.client.getSnapshot().stale).toBe(true);
-    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(1);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items).toHaveLength(1);
   });
 
   it("an open that fails leaves the retained presentation stale", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
 
     const resyncing = scenario.client.resync().catch((error: unknown) => error);
@@ -478,20 +481,20 @@ describe("which non-current streams are noise and which are a fence", () => {
   function eventFrame(host: { readonly hostInstanceId: string }, streamId: string): string {
     return JSON.stringify({
       kind: "host-event",
-      protocolVersion: "1",
+      protocolVersion: "2",
       hostInstanceId: host.hostInstanceId,
       streamId,
       sequence: 1,
       type: "session.created",
       scope: { kind: "session", sessionId: "late" },
-      payload: { session: sessionSnapshot({ sessionId: "late" }) },
+      payload: { session: sessionSummary({ sessionId: "late" }), collections: COLLECTIONS },
     });
   }
 
   function requestFrame(host: { readonly hostInstanceId: string }, streamId: string): string {
     return JSON.stringify({
       kind: "host-request",
-      protocolVersion: "1",
+      protocolVersion: "2",
       hostInstanceId: host.hostInstanceId,
       streamId,
       requestId: "late-request",
@@ -522,7 +525,7 @@ describe("which non-current streams are noise and which are a fence", () => {
 
     it(`still discards a retired ${kind} long after that stream was ended`, async () => {
       const scenario = createScenario({ host: { auto: false } });
-      await openWith(scenario, { sessions: [SESSION] });
+      await openWith(scenario, { sessions: sessionPage([SESSION]) });
       const host = scenario.host;
       const firstStream = host.currentStreamId ?? "";
 
@@ -530,7 +533,7 @@ describe("which non-current streams are noise and which are a fence", () => {
       for (let index = 0; index < 10; index += 1) {
         const resyncing = scenario.client.resync();
         await flush();
-        host.serveOpen({ sessions: [SESSION] });
+        host.serveOpen({ sessions: sessionPage([SESSION]) });
         await resyncing;
       }
 
@@ -541,7 +544,7 @@ describe("which non-current streams are noise and which are a fence", () => {
 
       expect(scenario.client.getSnapshot()).toBe(before);
       expect(scenario.client.getSnapshot().status).toBe("syncing");
-      host.serveOpen({ sessions: [SESSION] });
+      host.serveOpen({ sessions: sessionPage([SESSION]) });
       await resyncing;
     });
   }
@@ -574,13 +577,13 @@ describe("which non-current streams are noise and which are a fence", () => {
     scenario.host.sendRaw(
       JSON.stringify({
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: scenario.host.hostInstanceId,
         streamId: lastStream,
         sequence: 1,
         type: "session.created",
         scope: { kind: "session", sessionId: "late" },
-        payload: { session: sessionSnapshot({ sessionId: "late" }) },
+        payload: { session: sessionSummary({ sessionId: "late" }), collections: COLLECTIONS },
       }),
     );
 
@@ -592,26 +595,26 @@ describe("which non-current streams are noise and which are a fence", () => {
 describe("a gap never reaches the presentation, not even for a moment", () => {
   it("keeps the skipped payload out of every observation", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
     const observed: string[] = [];
     const watermarks: number[] = [];
     scenario.client.subscribe(() => {
       const snapshot = scenario.client.getSnapshot();
-      observed.push(JSON.stringify(snapshot.presentation?.sessions.map((session) => session.sessionId) ?? []));
+      observed.push(JSON.stringify(snapshot.presentation?.sessions.items.map((session) => session.sessionId) ?? []));
       watermarks.push(snapshot.presentation?.watermark.sequence ?? -1);
     });
 
     host.sendRaw(
       JSON.stringify({
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: host.hostInstanceId,
         streamId: host.currentStreamId,
         sequence: 4,
         type: "session.created",
         scope: { kind: "session", sessionId: "gap-payload" },
-        payload: { session: sessionSnapshot({ sessionId: "gap-payload" }) },
+        payload: { session: sessionSummary({ sessionId: "gap-payload" }), collections: COLLECTIONS },
       }),
     );
 

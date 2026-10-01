@@ -2,11 +2,14 @@
  * The shell, assembled.
  *
  * Everything a panel shows is derived here, from the two stores, in one place:
- * the snapshot is read once, the derived facts (selected session, active run,
- * latest run, whether writes are allowed) are computed once, and the panels
- * below take them as props. No panel holds a second copy of a host fact; what
- * the controller keeps is only what the user did.
+ * the snapshot is read once, the derived facts (selected session, its loaded
+ * history coverage, the live run, the latest run, whether writes are allowed)
+ * are computed once, and the panels below take them as props. No panel holds a
+ * second copy of a host fact; what the controller keeps is only what the user
+ * did.
  */
+
+import { useEffect } from "react";
 
 import type { ShellController } from "./controller.js";
 import { Composer } from "./Composer.js";
@@ -19,7 +22,7 @@ import { PluginsPanel } from "./PluginsPanel.js";
 import { RunStrip } from "./RunStrip.js";
 import { SessionsPanel } from "./SessionsPanel.js";
 import { useClientSnapshot, useShellState } from "./use-shell.js";
-import { activeRunCount, activeRunOf, latestRunOf, selectedSession, writesAllowed } from "./presentation.js";
+import { activeRunCount, activeRunOf, historyOf, latestRunOf, selectedSession, writesAllowed } from "./presentation.js";
 
 export interface AppProps {
   readonly controller: ShellController;
@@ -31,13 +34,31 @@ export function App(props: AppProps) {
   const ui = useShellState(controller);
 
   const session = selectedSession(snapshot, ui.selection);
+  const sessionId = session === null ? null : session.sessionId;
+  const coverage = sessionId === null ? null : historyOf(snapshot, sessionId);
   const activeRun = session === null ? null : activeRunOf(snapshot, session);
   const latestRun = session === null ? null : latestRunOf(snapshot, session.sessionId);
   const canWrite = writesAllowed(snapshot);
   const running = activeRunCount(snapshot);
   const maxActiveRuns = snapshot.description?.limits.maxActiveRuns ?? 1;
   const atRunLimit = running >= maxActiveRuns;
-  const strip = activeRun ?? (latestRun !== null && latestRun.status !== "accepted" && latestRun.status !== "running" ? latestRun : null);
+  const durable = snapshot.description?.storage.retention === "durable";
+  const strip =
+    activeRun ?? (latestRun !== null && latestRun.status !== "accepted" && latestRun.status !== "running" ? latestRun : null);
+
+  const behind = coverage?.behind ?? false;
+  const loadingHistory = ui.historyLoading;
+
+  // Loading history is a read, and reads are safe: a session the user is looking
+  // at should show what is on the host without them having to ask. The effect
+  // re-runs when the selection changes or when the loaded coverage falls behind
+  // the committed high-water.
+  useEffect(() => {
+    if (sessionId === null) return;
+    if (snapshot.status !== "ready") return;
+    if (session === null || session.status === "blocked") return;
+    void controller.ensureHistory(sessionId);
+  }, [controller, sessionId, snapshot.status, behind]);
 
   return (
     <div className="shell">
@@ -89,6 +110,7 @@ export function App(props: AppProps) {
             ui={ui}
             selected={session}
             canWrite={canWrite}
+            durable={durable}
             onCreate={() => {
               void controller.createSession();
             }}
@@ -107,7 +129,18 @@ export function App(props: AppProps) {
             </p>
           ) : (
             <>
-              <Conversation session={session} activeRun={activeRun} />
+              <Conversation
+                session={session}
+                coverage={coverage}
+                activeRun={activeRun}
+                loading={loadingHistory}
+                onLoadOlder={() => {
+                  void controller.loadOlderHistory(session.sessionId);
+                }}
+                onLoadNewer={() => {
+                  void controller.reloadHistory(session.sessionId);
+                }}
+              />
               {strip !== null && (
                 <RunStrip
                   run={strip}

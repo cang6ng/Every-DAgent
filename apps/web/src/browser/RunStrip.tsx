@@ -8,12 +8,12 @@
  * run stopped is the host publishing a terminal state.
  */
 
-import type { RunSnapshot } from "@every-dagent/protocol";
+import type { RunSummary } from "@every-dagent/protocol";
 
 import { runView } from "./presentation.js";
 
 export interface RunStripProps {
-  readonly run: RunSnapshot;
+  readonly run: RunSummary;
   readonly cancelling: boolean;
   readonly canWrite: boolean;
   onCancel(runId: string): void;

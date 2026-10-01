@@ -9,13 +9,15 @@
  * derived separately and never folded into one another here.
  */
 
-import type { ClientSnapshot, PresentationHost } from "@every-dagent/client";
+import type { ClientSnapshot, HistoryCoverage, PresentationHost } from "@every-dagent/client";
 import type {
+  ActiveRunSnapshot,
   DisplayInput,
   PluginFailureSummary,
   ProtocolError,
-  RunSnapshot,
-  SessionSnapshot,
+  RunStatus,
+  RunSummary,
+  SessionSummary,
 } from "@every-dagent/protocol";
 
 import type { SessionSelection } from "./selection.js";
@@ -38,41 +40,56 @@ export function describedHostInstance(snapshot: ClientSnapshot): string | null {
 export function selectedSession(
   snapshot: ClientSnapshot,
   selection: SessionSelection | null,
-): SessionSnapshot | null {
+): SessionSummary | null {
   if (selection === null) return null;
   const presentation = snapshot.presentation;
   if (presentation === null || presentation.hostInstanceId !== selection.hostInstanceId) return null;
-  return presentation.sessions.find((session) => session.sessionId === selection.sessionId) ?? null;
+  return presentation.sessions.items.find((session) => session.sessionId === selection.sessionId) ?? null;
 }
 
 /**
- * The session's active run, looked up by `activeRunId` — never guessed from the
- * order of the run directory. If the directory and the session disagree, this
- * returns nothing rather than inventing a run.
+ * What the client has loaded of one session's committed history.
+ *
+ * Its absence is a fact worth showing: nothing has been read yet, which is not
+ * the same as the conversation being empty.
  */
-export function activeRunOf(snapshot: ClientSnapshot, session: SessionSnapshot): RunSnapshot | null {
+export function historyOf(snapshot: ClientSnapshot, sessionId: string): HistoryCoverage | null {
+  return Object.hasOwn(snapshot.history, sessionId) ? snapshot.history[sessionId] ?? null : null;
+}
+
+/**
+ * The live timeline of a session's active run, if this client is holding one.
+ *
+ * The timeline is not part of the directory and not part of history: a cut can
+ * only say that a run exists, and the draft is fetched or streamed separately.
+ * A session that points at a run whose draft has not arrived resolves to null —
+ * the strip then shows the run's durable summary instead of an invented
+ * timeline.
+ */
+export function activeRunOf(snapshot: ClientSnapshot, session: SessionSummary): ActiveRunSnapshot | null {
   if (session.activeRunId === null) return null;
-  const run = snapshot.presentation?.runs.find((candidate) => candidate.runId === session.activeRunId);
+  const run = Object.hasOwn(snapshot.live, session.activeRunId) ? snapshot.live[session.activeRunId] : undefined;
   if (run === undefined || run.sessionId !== session.sessionId) return null;
   return run.status === "accepted" || run.status === "running" ? run : null;
 }
 
 /** The most recently accepted run of a session, terminal or not. */
-export function latestRunOf(snapshot: ClientSnapshot, sessionId: string): RunSnapshot | null {
-  const runs = snapshot.presentation?.runs ?? [];
-  let latest: RunSnapshot | null = null;
+export function latestRunOf(snapshot: ClientSnapshot, sessionId: string): RunSummary | null {
+  const runs = snapshot.presentation?.runs.items ?? [];
+  let latest: RunSummary | null = null;
   for (const run of runs) {
-    if (run.sessionId === sessionId) latest = run;
+    if (run.sessionId !== sessionId) continue;
+    if (latest === null || run.acceptedAt >= latest.acceptedAt) latest = run;
   }
   return latest;
 }
 
 /** How many runs the host is currently executing, across all sessions. */
 export function activeRunCount(snapshot: ClientSnapshot): number {
-  const runs = snapshot.presentation?.runs ?? [];
+  const sessions = snapshot.presentation?.sessions.items ?? [];
   let count = 0;
-  for (const run of runs) {
-    if (run.status === "accepted" || run.status === "running") count += 1;
+  for (const session of sessions) {
+    if (session.activeRunId !== null) count += 1;
   }
   return count;
 }
@@ -152,19 +169,19 @@ export function connectionView(snapshot: ClientSnapshot): StatusView {
   }
 }
 
-const RUN_STATUS_VIEWS: Readonly<
-  Record<RunSnapshot["status"], { readonly label: string; readonly tone: StatusView["tone"] }>
-> = Object.freeze({
-  accepted: { label: "已接受（等待开始）", tone: "active" },
-  running: { label: "运行中", tone: "active" },
-  completed: { label: "已完成", tone: "ok" },
-  limited: { label: "达到步数上限", tone: "warn" },
-  cancelled: { label: "已取消", tone: "warn" },
-  failed: { label: "失败", tone: "error" },
-});
+const RUN_STATUS_VIEWS: Readonly<Record<RunStatus, { readonly label: string; readonly tone: StatusView["tone"] }>> =
+  Object.freeze({
+    accepted: { label: "已接受（等待开始）", tone: "active" },
+    running: { label: "运行中", tone: "active" },
+    completed: { label: "已完成", tone: "ok" },
+    limited: { label: "达到步数上限", tone: "warn" },
+    cancelled: { label: "已取消", tone: "warn" },
+    failed: { label: "失败", tone: "error" },
+    interrupted: { label: "已中断（上一次 Host 未完成）", tone: "warn" },
+  });
 
 export interface RunView {
-  readonly status: RunSnapshot["status"];
+  readonly status: RunStatus;
   readonly label: string;
   readonly tone: StatusView["tone"];
   readonly error: ProtocolError | null;
@@ -172,7 +189,7 @@ export interface RunView {
   readonly note: string | null;
 }
 
-export function runView(run: RunSnapshot): RunView {
+export function runView(run: RunSummary): RunView {
   const base = RUN_STATUS_VIEWS[run.status];
   let note: string | null = null;
   if (run.status === "limited") {
@@ -181,6 +198,11 @@ export function runView(run: RunSnapshot): RunView {
     note = "未记录的部分不会进入历史；已经执行过的工具不会因此回滚。";
   } else if (run.status === "failed") {
     note = "未记录的部分不会进入历史；已经执行过的工具不会因此回滚。";
+  } else if (run.status === "interrupted") {
+    note =
+      run.executionKnowledge === "not-started"
+        ? "上一次运行只记录到「已接受」，没有开始标记：可以确认它没有被执行。请重新提交。"
+        : "上一次运行有开始标记但没有终态：无法确认是否已经产生副作用。该会话已阻塞，不会自动恢复执行。";
   }
   return {
     status: run.status,

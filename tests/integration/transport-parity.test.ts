@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createClient } from "@every-dagent/client";
 import { connectHttpChannel, startHttpBinding, type HttpBinding } from "@every-dagent/web";
 
-import { createClientOn, createHostPlatform, waitFor } from "../helpers/platform.js";
+import { createClientOn, createHostPlatform, runSettled, waitFor } from "../helpers/platform.js";
 import {
   demoPlugin,
   partialThenAbortReply,
@@ -104,7 +104,7 @@ function webScenario() {
 
 /** Everything both carriers must show, whatever carries the frames. */
 function expectSameWalk(report: ClientCliReport): void {
-  expect(report.description?.protocolVersion).toBe("1");
+  expect(report.description?.protocolVersion).toBe("2");
   expect(report.description?.capabilities.reverseRequests).toBe(true);
   expect(report.createdReturnedToCaller).toBe(true);
   expect(report.listedContainsCreated).toBe(true);
@@ -179,18 +179,16 @@ describe("a client can move between carriers", () => {
     await client.connect();
     const firstHost = client.getSnapshot().description?.hostInstanceId;
     const session = (await client.sessions.create()).session;
-    await client.runs.start({ sessionId: session.sessionId, submissionId: "sub-carrier", text: "over memory" });
-    await waitFor(() => client.getSnapshot().presentation?.runs.some((run) => run.live === null) === true, {
-      what: "the run over memory",
-    });
+    const started = await client.runs.start({ sessionId: session.sessionId, submissionId: "sub-carrier", text: "over memory" });
+    await waitFor(() => runSettled(client.getSnapshot(), started.run.runId), { what: "the run over memory" });
 
     await client.reconnect();
 
     expect(attempts).toBe(2);
     expect(client.getSnapshot().status).toBe("ready");
     expect(client.getSnapshot().description?.hostInstanceId).toBe(firstHost);
-    expect(client.getSnapshot().presentation?.sessions.map((item) => item.sessionId)).toEqual([session.sessionId]);
-    expect(client.getSnapshot().presentation?.runs[0]?.status).toBe("completed");
+    expect(client.getSnapshot().presentation?.sessions.items.map((item) => item.sessionId)).toEqual([session.sessionId]);
+    expect(client.getSnapshot().presentation?.runs.items[0]?.status).toBe("completed");
 
     await platform.shutdown();
   });

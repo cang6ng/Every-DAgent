@@ -35,6 +35,18 @@ function importSpecifiers(source: string): string[] {
   return specifiers;
 }
 
+/**
+ * Source with its comments removed, for the two patterns that are English words.
+ *
+ * `window` is the natural noun for the bounded directory this client holds
+ * ("this client's bounded window"), and a comment cannot reach a browser
+ * global. Every other pattern still scans the raw source, because a directive
+ * such as `@ts-ignore` only ever lives in a comment.
+ */
+function codeOnly(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/gm, "$1");
+}
+
 describe("dependency boundary", () => {
   it("keeps the source tree to the planned modules", () => {
     expect([...srcRelative].sort()).toEqual(
@@ -69,8 +81,6 @@ describe("dependency boundary", () => {
       /\bWebSocket\b/,
       /\bEventSource\b/,
       /\bXMLHttpRequest\b/,
-      /\bdocument\s*\./,
-      /\bwindow\s*\./,
       /\bfetch\s*\(/,
       /\bprocess\s*\./,
       /\bBuffer\b/,
@@ -82,10 +92,17 @@ describe("dependency boundary", () => {
       /@every-dagent\/(host|agent-core|plugin-system|model-pi-ai|plugin-calculator)/,
       /\bvitest\b/,
     ];
+    // The DOM globals are the browser-facing half of this rule, and they are
+    // matched on code: the fold's own documentation calls the directory it keeps
+    // "a bounded window".
+    const forbiddenInCode = [/\bdocument\s*\./, /\bwindow\s*\./];
     for (const file of srcFiles) {
       const source = readFileSync(file, "utf8");
       for (const pattern of forbidden) {
         expect(source, `${file} must not match ${pattern}`).not.toMatch(pattern);
+      }
+      for (const pattern of forbiddenInCode) {
+        expect(codeOnly(source), `${file} must not match ${pattern} in code`).not.toMatch(pattern);
       }
     }
   });
@@ -139,7 +156,7 @@ describe("public surface", () => {
       },
     });
 
-    // The facade is the twelve frozen operations, and nothing shaped like a
+    // The facade is the frozen v2 operations, and nothing shaped like a
     // generic request entry point.
     expect(Object.keys(factory).sort()).toEqual([
       "closeSubscription",
@@ -154,8 +171,15 @@ describe("public surface", () => {
       "sessions",
       "subscribe",
     ]);
-    expect(Object.keys(factory.sessions).sort()).toEqual(["create", "get", "list"]);
-    expect(Object.keys(factory.runs).sort()).toEqual(["cancel", "get", "start"]);
+    expect(Object.keys(factory.sessions).sort()).toEqual([
+      "create",
+      "delete",
+      "get",
+      "history",
+      "list",
+      "rename",
+    ]);
+    expect(Object.keys(factory.runs).sort()).toEqual(["cancel", "get", "list", "start"]);
     expect(Object.keys(factory.plugins).sort()).toEqual(["disable", "enable", "list"]);
   });
 });

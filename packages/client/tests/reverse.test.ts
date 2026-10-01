@@ -18,9 +18,9 @@ import type { ReverseHandlerContext, ReverseHandlerOutcome, ReverseHandlerRegist
 
 import { createScenario, flush } from "./helpers/scenario.js";
 import type { FakeHost } from "./helpers/fake-host.js";
-import { sessionSnapshot } from "./helpers/values.js";
+import { sessionSummary } from "./helpers/values.js";
 
-const SESSION = sessionSnapshot({ sessionId: "s-1" });
+const SESSION = sessionSummary({ sessionId: "s-1" });
 
 type Answer = (params: JsonValue, context: ReverseHandlerContext) => ReverseHandlerOutcome | Promise<ReverseHandlerOutcome>;
 
@@ -64,7 +64,7 @@ interface HostRequestInput {
 function sendHostRequest(host: FakeHost, input: HostRequestInput): void {
   const candidate = {
     kind: "host-request",
-    protocolVersion: "1",
+    protocolVersion: "2",
     requestId: input.requestId,
     method: input.method,
     params: input.params,
@@ -180,7 +180,7 @@ describe("what the dispatcher answers", () => {
     // A frame behind the request is processed while the handler is still open:
     // the fold has already happened, and no answer has travelled.
     scenario.host.emit({ type: "session.created", session: SESSION });
-    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(1);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items).toHaveLength(1);
 
     await flush();
     expect(clientAnswers(scenario, "h-1")).toHaveLength(0);
@@ -397,7 +397,7 @@ describe("an abort listener is foreign code", () => {
     // host sends on it is applied as the first one.
     host.emit({ type: "session.created", session: SESSION });
     expect(scenario.client.getSnapshot().presentation?.watermark.sequence).toBe(1);
-    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(1);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items).toHaveLength(1);
   });
 
   for (const operation of ["resync", "close"] as const) {
@@ -704,7 +704,7 @@ describe("the result contract is foreign code too", () => {
     scenario.host.sendRaw(
       JSON.stringify({
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: scenario.host.hostInstanceId,
         streamId: scenario.host.currentStreamId,
         sequence: scenario.host.currentSequence + 1,

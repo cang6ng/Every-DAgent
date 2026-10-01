@@ -16,7 +16,7 @@ import type { JsonValue } from "@every-dagent/protocol";
 import { createClient } from "@every-dagent/client";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createHostPlatform, waitFor } from "../helpers/platform.js";
+import { createHostPlatform, runSettled, waitFor } from "../helpers/platform.js";
 import { demoPlugin, scriptedModel, textReply, toolReply } from "../helpers/demo-fixtures.js";
 
 const open: { close(): Promise<void> }[] = [];
@@ -64,13 +64,14 @@ async function runWithInput(input: unknown): Promise<{
   await client.connect();
   await client.plugins.enable({ pluginId: "echo" });
   const { session } = await client.sessions.create();
-  await client.runs.start({ sessionId: session.sessionId, submissionId: `sub-${fixture.executions.length}`, text: "use the tool" });
+  const started = await client.runs.start({
+    sessionId: session.sessionId,
+    submissionId: `sub-${fixture.executions.length}`,
+    text: "use the tool",
+  });
 
-  await waitFor(
-    () => client.getSnapshot().presentation?.sessions[0]?.canonical.some((item) => item.kind === "tool-call") === true,
-    { what: "the canonical tool call" },
-  );
-  const canonical = client.getSnapshot().presentation?.sessions[0]?.canonical ?? [];
+  await waitFor(() => runSettled(client.getSnapshot(), started.run.runId), { what: "the run to settle" });
+  const canonical = (await client.sessions.history({ sessionId: session.sessionId })).page.items;
   const call = canonical.find((item) => item.kind === "tool-call");
   const projection =
     call !== undefined && call.kind === "tool-call"
@@ -109,12 +110,9 @@ describe("a tool input the wire can carry", () => {
     await client.connect();
     await client.plugins.enable({ pluginId: "echo" });
     const { session } = await client.sessions.create();
-    await client.runs.start({ sessionId: session.sessionId, submissionId: "sub-snapshot", text: "use the tool" });
+    const started = await client.runs.start({ sessionId: session.sessionId, submissionId: "sub-snapshot", text: "use the tool" });
 
-    await waitFor(
-      () => client.getSnapshot().presentation?.sessions[0]?.canonical.some((item) => item.kind === "tool-call") === true,
-      { what: "the canonical tool call" },
-    );
+    await waitFor(() => runSettled(client.getSnapshot(), started.run.runId), { what: "the run to settle" });
 
     // The tool really received the original object.
     expect(fixture.executions[0]?.input).toBe(original);
@@ -122,7 +120,8 @@ describe("a tool input the wire can carry", () => {
     // Edit the original after publication: what the client holds must not move.
     (original.payload.items as number[]).push(4);
 
-    const call = (client.getSnapshot().presentation?.sessions[0]?.canonical ?? []).find((item) => item.kind === "tool-call");
+    const committed = (await client.sessions.history({ sessionId: session.sessionId })).page.items;
+    const call = committed.find((item) => item.kind === "tool-call");
     expect(call).toMatchObject({ kind: "tool-call", input: { kind: "json", value: { payload: { items: [1, 2, 3] } } } });
     client.disconnect();
   });

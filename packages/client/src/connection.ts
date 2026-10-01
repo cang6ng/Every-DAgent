@@ -55,7 +55,7 @@ import {
 
 import type { ClientMisuseReason, ConnectionLostReason, ProtocolViolationReason } from "./errors.js";
 import { ClientError, clientMisuse, connectionLost, protocolViolation, remoteError } from "./errors.js";
-import { deepFreeze, foldEvent } from "./fold.js";
+import { applyHistoryPage, deepFreeze, foldEvent, foldHistoryEvent, foldLiveEvent } from "./fold.js";
 import type { ReverseHandlerContext, ReverseHandlerOutcome, ReverseTable } from "./reverse.js";
 import type { ClientSnapshot, ConnectionStatus, PresentationStore } from "./store.js";
 import { createStore } from "./store.js";
@@ -140,8 +140,12 @@ const CAPABILITY_OF: Readonly<Record<OperationName, keyof HostCapabilities | und
   "sessions.list": "sessions",
   "sessions.create": "sessions",
   "sessions.get": "sessions",
+  "sessions.history": "historyPages",
+  "sessions.rename": "sessionMutations",
+  "sessions.delete": "sessionMutations",
   "runs.start": "runs",
   "runs.get": "runs",
+  "runs.list": "runs",
   "runs.cancel": "runs",
   "plugins.list": "plugins",
   "plugins.enable": "plugins",
@@ -248,6 +252,28 @@ function verifyResultIdentity(
     case "plugins.disable": {
       const plugin = fieldsOf(resultFields?.["plugin"] ?? null);
       return plugin?.["id"] === paramFields?.["pluginId"] ? undefined : fail;
+    }
+    case "sessions.history": {
+      const page = fieldsOf(resultFields?.["page"] ?? null);
+      return page?.["sessionId"] === paramFields?.["sessionId"] ? undefined : fail;
+    }
+    case "sessions.rename": {
+      const session = fieldsOf(resultFields?.["session"] ?? null);
+      return session?.["sessionId"] === paramFields?.["sessionId"] ? undefined : fail;
+    }
+    case "sessions.delete": {
+      return resultFields?.["sessionId"] === paramFields?.["sessionId"] ? undefined : fail;
+    }
+    case "runs.list": {
+      const runs = fieldsOf(resultFields?.["runs"] ?? null);
+      if (runs === undefined || paramFields === undefined) return fail;
+      const items = runs["items"];
+      if (!Array.isArray(items)) return fail;
+      for (const item of items) {
+        const run = fieldsOf(item);
+        if (run?.["sessionId"] !== paramFields["sessionId"]) return fail;
+      }
+      return undefined;
     }
     default:
       return undefined;
@@ -765,13 +791,19 @@ export class ClientConnection {
           };
           this.everOpened = true;
           finish();
+          // A cut replaces what the client knows. Live drafts and loaded
+          // history belonged to the previous cut — or to a previous host — and
+          // presenting either under a new one would claim facts nobody sent.
           this.store.update({
             presentation: deepFreeze(snapshot),
             presentationHost: "current",
+            live: Object.freeze({}),
+            history: Object.freeze({}),
             stale: false,
             status: "ready",
             error: null,
           });
+          this.refreshLive(owner);
         },
         decline: (error) => {
           finish(error);
@@ -904,6 +936,62 @@ export class ClientConnection {
       rejected?.fail(connectionLost("send-failed"));
       this.endWithLoss(owner, "send-failed");
     }
+  }
+
+  /**
+   * Re-reads the live timeline of whatever this snapshot says is running.
+   *
+   * A cut carries summaries, not drafts: the timeline belongs to the run, and a
+   * snapshot can only say that one exists. It is fetched here, best effort and
+   * at most once per active run — the contract allows exactly one — so a
+   * reconnected reader sees the same in-progress output it saw before, without
+   * the cut having to carry something that is not durable fact.
+   */
+  private refreshLive(owner: number): void {
+    const snapshot = this.store.get().presentation;
+    if (snapshot === null) return;
+
+    for (const session of snapshot.sessions.items) {
+      const runId = session.activeRunId;
+      if (runId === null) continue;
+      if (Object.hasOwn(this.store.get().live, runId)) continue;
+
+      void this.request("runs.get", { runId }).then(
+        (result) => {
+          if (!this.owns(owner)) return;
+          const run = result.run;
+          if (run.status !== "accepted" && run.status !== "running") return;
+          // An event that arrived while this was in flight is newer than the
+          // answer; it wins.
+          if (Object.hasOwn(this.store.get().live, runId)) return;
+          this.store.update({ live: Object.freeze({ ...this.store.get().live, [runId]: run }) });
+        },
+        () => undefined,
+      );
+    }
+  }
+
+  /**
+   * Reads one history page and records it as loaded.
+   *
+   * The fold happens where the answer is accepted, not where the caller is, so
+   * a page that arrives is part of the client's coverage even when the caller
+   * that asked for it has gone away.
+   */
+  requestHistory(
+    params: OperationMap["sessions.history"]["params"],
+  ): Promise<OperationMap["sessions.history"]["result"]> {
+    return new Promise<OperationMap["sessions.history"]["result"]>((resolve, reject) => {
+      this.send("sessions.history", params, {
+        accept: (result) => {
+          this.store.update({ history: applyHistoryPage(this.store.get().history, result.page) });
+          resolve(result);
+        },
+        decline: (error) => {
+          reject(error);
+        },
+      });
+    });
   }
 
   request<M extends OperationName>(
@@ -1060,7 +1148,8 @@ export class ClientConnection {
       if (!this.holdsStream(owner, stream)) return;
     }
 
-    const presentation = this.store.get().presentation;
+    const current = this.store.get();
+    const presentation = current.presentation;
     if (presentation === null) {
       this.protocolFailure(owner, "snapshot-fence");
       return;
@@ -1074,11 +1163,17 @@ export class ClientConnection {
       this.protocolFailure(owner, folded.reason);
       return;
     }
+    const live = foldLiveEvent(current.live, event);
+    if (!live.ok) {
+      this.protocolFailure(owner, live.reason);
+      return;
+    }
+    const history = foldHistoryEvent(current.history, event);
 
     // The frame is applied whole or not at all: the position moves only once the
     // fold has accepted it, so a rejected event leaves no trace.
     stream.expected = event.sequence + 1;
-    this.store.update({ presentation: folded.presentation });
+    this.store.update({ presentation: folded.presentation, live: live.live, history });
   }
 
   // -------------------------------------------------------------------------

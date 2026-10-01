@@ -12,7 +12,10 @@ import { describe, expect, it, vi } from "vitest";
 import { decodeFrame } from "@every-dagent/protocol";
 
 import { createScenario, flush, statusTransitions } from "./helpers/scenario.js";
-import { sessionSnapshot } from "./helpers/values.js";
+import { sessionPage, sessionSummary } from "./helpers/values.js";
+
+/** The catalogue versions an event carries: what the fake host would announce. */
+const COLLECTIONS = { sessions: 1, runs: 1, plugins: 1 } as const;
 
 describe("the bootstrap sequence", () => {
   it("walks connecting → connected → syncing → ready, and is never ready without a snapshot", async () => {
@@ -33,12 +36,12 @@ describe("the bootstrap sequence", () => {
     expect(snapshot.presentationHost).toBe("current");
   });
 
-  it("describes itself as generation 1 with the reverse capability and the caller's name", async () => {
+  it("describes itself as generation 2 with the reverse capability and the caller's name", async () => {
     const scenario = createScenario({ client: { name: "cli-fixture", version: "2.0.0" } });
     await scenario.ready();
 
     const params = scenario.host.lastDescribe;
-    expect(params?.supportedProtocolVersions).toEqual(["1"]);
+    expect(params?.supportedProtocolVersions).toEqual(["2"]);
     expect(params?.client).toEqual({ name: "cli-fixture", version: "2.0.0" });
     expect(params?.capabilities).toEqual({ reverseRequests: true });
   });
@@ -51,17 +54,17 @@ describe("the bootstrap sequence", () => {
     await flush();
 
     const host = scenario.host;
-    const first = sessionSnapshot({ sessionId: "s-1" });
-    const second = sessionSnapshot({ sessionId: "s-2" });
+    const first = sessionSummary({ sessionId: "s-1" });
+    const second = sessionSummary({ sessionId: "s-2" });
 
     // One synchronous batch: the snapshot response, then an event on the stream
     // it just created — the exact order the host promises to deliver in.
-    host.serveOpen({ sessions: [first] });
+    host.serveOpen({ sessions: sessionPage([first]) });
     host.emit({ type: "session.created", session: second });
     await connecting;
 
     const snapshot = scenario.client.getSnapshot();
-    expect(snapshot.presentation?.sessions.map((session) => session.sessionId)).toEqual(["s-1", "s-2"]);
+    expect(snapshot.presentation?.sessions.items.map((session) => session.sessionId)).toEqual(["s-2", "s-1"]);
     expect(snapshot.status).toBe("ready");
     expect(snapshot.stale).toBe(false);
   });
@@ -73,10 +76,10 @@ describe("the bootstrap sequence", () => {
     scenario.host.serveDescribe();
     await flush();
 
-    scenario.host.serveOpen({ sessions: [sessionSnapshot({ sessionId: "s-1" })] });
+    scenario.host.serveOpen({ sessions: sessionPage([sessionSummary({ sessionId: "s-1" })]) });
     await connecting;
 
-    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(1);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items).toHaveLength(1);
   });
 });
 
@@ -128,7 +131,7 @@ describe("what bootstrap refuses", () => {
     scenario.host.sendRaw(
       JSON.stringify({
         kind: "host-response",
-        protocolVersion: "2",
+        protocolVersion: "1",
         hostInstanceId: scenario.host.hostInstanceId,
         requestId,
         result: {},
@@ -163,13 +166,13 @@ describe("what bootstrap refuses", () => {
     scenario.host.sendRaw(
       JSON.stringify({
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: scenario.host.hostInstanceId,
         streamId: "stream-early",
         sequence: 1,
         type: "session.created",
         scope: { kind: "session", sessionId: "s-1" },
-        payload: { session: sessionSnapshot({ sessionId: "s-1" }) },
+        payload: { session: sessionSummary({ sessionId: "s-1" }), collections: COLLECTIONS },
       }),
     );
 
@@ -184,13 +187,13 @@ describe("what bootstrap refuses", () => {
     scenario.host.sendRaw(
       JSON.stringify({
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: scenario.host.hostInstanceId,
         streamId: "not-the-stream",
         sequence: 1,
         type: "session.created",
         scope: { kind: "session", sessionId: "s-1" },
-        payload: { session: sessionSnapshot({ sessionId: "s-1" }) },
+        payload: { session: sessionSummary({ sessionId: "s-1" }), collections: COLLECTIONS },
       }),
     );
 

@@ -11,6 +11,7 @@
 import type {
   ActiveRunSnapshot,
   ClientRequest,
+  CollectionRevisions,
   HostCapabilities,
   HostDescription,
   HostEvent,
@@ -23,14 +24,17 @@ import type {
   ProtocolChannelListener,
   ProtocolErrorCode,
   RunSnapshot,
-  SessionSnapshot,
+  RunSummaryPage,
+  SessionSummary,
+  SessionSummaryPage,
+  StorageIdentity,
   TerminalRunSnapshot,
 } from "@every-dagent/protocol";
 import { PROTOCOL_VERSION, decodeFrame, encodeFrame, validateMessage } from "@every-dagent/protocol";
 
 type Base = {
   readonly kind: "host-event";
-  readonly protocolVersion: "1";
+  readonly protocolVersion: "2";
   readonly hostInstanceId: string;
   readonly streamId: string;
   readonly sequence: number;
@@ -41,7 +45,22 @@ type ClientRequestEnvelope = Extract<DecodedMessage, { kind: "client-request" }>
 
 /** One event a test wants on the current stream, without the envelope boilerplate. */
 export type FakeEvent =
-  | { readonly type: "session.created"; readonly session: SessionSnapshot }
+  | {
+      readonly type: "session.created";
+      readonly session: SessionSummary;
+      readonly collections?: CollectionRevisions;
+    }
+  | {
+      readonly type: "session.updated";
+      readonly session: SessionSummary;
+      readonly collections?: CollectionRevisions;
+    }
+  | {
+      readonly type: "session.deleted";
+      readonly sessionId: string;
+      readonly generation: number;
+      readonly collections?: CollectionRevisions;
+    }
   | { readonly type: "run.updated"; readonly run: ActiveRunSnapshot }
   | {
       readonly type: "run.output.delta";
@@ -64,8 +83,14 @@ export type FakeEvent =
       readonly ok: boolean;
       readonly content: string;
     }
-  | { readonly type: "run.ended"; readonly run: TerminalRunSnapshot; readonly session: SessionSnapshot }
+  | {
+      readonly type: "run.ended";
+      readonly run: TerminalRunSnapshot;
+      readonly session: SessionSummary;
+      readonly collections?: CollectionRevisions;
+    }
   | { readonly type: "plugin.updated"; readonly plugin: PluginSummary }
+  | { readonly type: "collection.invalidated"; readonly collections: CollectionRevisions }
   | {
       readonly type: "host.request.cancelled";
       readonly requestId: string;
@@ -123,9 +148,11 @@ export interface FakeHost {
   close(): void;
   /** A well-formed snapshot for this host, with the given catalogues. */
   snapshot(fields?: {
-    readonly sessions?: readonly SessionSnapshot[];
-    readonly runs?: readonly RunSnapshot[];
+    readonly sessions?: SessionSummaryPage;
+    readonly runs?: RunSummaryPage;
     readonly plugins?: readonly PluginSummary[];
+    readonly storage?: StorageIdentity;
+    readonly collections?: CollectionRevisions;
   }): HostSnapshot;
   /** The request id of the nth request of one method, for answering out of band. */
   requestIdOf(method: OperationName, index?: number): string | undefined;
@@ -149,6 +176,10 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
     plugins: true,
     subscriptions: true,
     reverseRequests: true,
+    historyPages: true,
+    sessionMutations: true,
+    settings: false,
+    approvals: false,
     ...options.capabilities,
   });
   const auto = options.auto ?? true;
@@ -258,11 +289,20 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
       result: {
         protocolVersion: PROTOCOL_VERSION,
         hostInstanceId,
-        host: { name: "fake-host", version: "1.0.0" },
+        host: { name: "fake-host", version: "2.0.0" },
+        storage: defaultStorage(),
         capabilities,
         clientCapabilities: { reverseRequests: options.clientCapabilitiesReverse ?? true },
-        limits: { maxActiveRuns: options.maxActiveRuns ?? 1 },
-        retention: "host-lifetime",
+        limits: {
+          maxActiveRuns: options.maxActiveRuns ?? 1,
+          maxInputBytes: 16 * 1024,
+          maxRecordBytes: 64 * 1024,
+          maxPageItems: 50,
+          maxPageBytes: 192 * 1024,
+          maxFrameBytes: 256 * 1024,
+          maxOutboxBytes: 1024 * 1024,
+          maxTitleChars: 200,
+        },
         ...overrides,
       },
     };
@@ -273,18 +313,34 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
     hostSide.send(encoded.output);
   }
 
+  function defaultStorage(): StorageIdentity {
+    return Object.freeze({ storageId: "fake-storage", retention: "ephemeral", schemaVersion: 1 });
+  }
+
+  function defaultCollections(): CollectionRevisions {
+    return Object.freeze({ sessions: 1, runs: 1, plugins: 1 });
+  }
+
   function snapshot(
     fields: {
-      readonly sessions?: readonly SessionSnapshot[];
-      readonly runs?: readonly RunSnapshot[];
+      readonly sessions?: SessionSummaryPage;
+      readonly runs?: RunSummaryPage;
       readonly plugins?: readonly PluginSummary[];
+      readonly storage?: StorageIdentity;
+      readonly collections?: CollectionRevisions;
     } = {},
   ): HostSnapshot {
     return Object.freeze({
       hostInstanceId,
       watermark: Object.freeze({ streamId: streamId ?? "unopened", sequence: 0 }),
-      sessions: Object.freeze([...(fields.sessions ?? [])]),
-      runs: Object.freeze([...(fields.runs ?? [])]),
+      storage: fields.storage ?? defaultStorage(),
+      collections: fields.collections ?? defaultCollections(),
+      sessions:
+        fields.sessions ??
+        Object.freeze({ items: Object.freeze([]), collectionRevision: 1, nextCursor: null, hasMore: false }),
+      runs:
+        fields.runs ??
+        Object.freeze({ items: Object.freeze([]), collectionRevision: 1, nextCursor: null, hasMore: false }),
       plugins: Object.freeze([...(fields.plugins ?? [])]),
     });
   }
@@ -362,7 +418,27 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
           ...base,
           type: "session.created",
           scope: { kind: "session", sessionId: event.session.sessionId },
-          payload: { session: event.session },
+          payload: { session: event.session, collections: event.collections ?? defaultCollections() },
+        });
+        return;
+      case "session.updated":
+        sendEvent({
+          ...base,
+          type: "session.updated",
+          scope: { kind: "session", sessionId: event.session.sessionId },
+          payload: { session: event.session, collections: event.collections ?? defaultCollections() },
+        });
+        return;
+      case "session.deleted":
+        sendEvent({
+          ...base,
+          type: "session.deleted",
+          scope: { kind: "session", sessionId: event.sessionId },
+          payload: {
+            sessionId: event.sessionId,
+            generation: event.generation,
+            collections: event.collections ?? defaultCollections(),
+          },
         });
         return;
       case "run.updated":
@@ -402,7 +478,19 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
           ...base,
           type: "run.ended",
           scope: { kind: "run", sessionId: event.run.sessionId, runId: event.run.runId },
-          payload: { run: event.run, session: event.session },
+          payload: {
+            run: event.run,
+            session: event.session,
+            collections: event.collections ?? defaultCollections(),
+          },
+        });
+        return;
+      case "collection.invalidated":
+        sendEvent({
+          ...base,
+          type: "collection.invalidated",
+          scope: { kind: "host" },
+          payload: { collections: event.collections },
         });
         return;
       case "plugin.updated":

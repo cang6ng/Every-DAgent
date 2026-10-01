@@ -16,24 +16,27 @@ import { createClient } from "../src/index.js";
 
 import { createScenario, flush, openWith, statusTransitions } from "./helpers/scenario.js";
 import { createFakeHost, type FakeHost } from "./helpers/fake-host.js";
-import { sessionSnapshot } from "./helpers/values.js";
+import { sessionPage, sessionSummary } from "./helpers/values.js";
 
-const SESSION = sessionSnapshot({ sessionId: "s-1" });
+const SESSION = sessionSummary({ sessionId: "s-1" });
+
+/** The catalogue versions an event carries: what the fake host would announce. */
+const COLLECTIONS = { sessions: 1, runs: 1, plugins: 1 } as const;
 
 describe("reconnecting", () => {
   it("replaces the presentation from the new connection", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
 
     const reconnecting = scenario.client.reconnect();
     await flush();
     scenario.host.serveDescribe();
     await flush();
-    scenario.host.serveOpen({ sessions: [sessionSnapshot({ sessionId: "s-2" })] });
+    scenario.host.serveOpen({ sessions: sessionPage([sessionSummary({ sessionId: "s-2" })]) });
     await reconnecting;
 
     expect(scenario.client.getSnapshot().status).toBe("ready");
-    expect(scenario.client.getSnapshot().presentation?.sessions.map((session) => session.sessionId)).toEqual(["s-2"]);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items.map((session) => session.sessionId)).toEqual(["s-2"]);
     expect(scenario.attempts).toBe(2);
   });
 
@@ -41,7 +44,7 @@ describe("reconnecting", () => {
     const scenario = createScenario({
       makeHost: (index) => createFakeHost({ auto: false, hostInstanceId: index === 0 ? "host-1" : "host-2" }),
     });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
 
     const reconnecting = scenario.client.reconnect();
     await flush();
@@ -53,7 +56,7 @@ describe("reconnecting", () => {
     expect(during.presentation?.hostInstanceId).toBe("host-1");
     expect(during.stale).toBe(true);
 
-    scenario.host.serveOpen({ sessions: [] });
+    scenario.host.serveOpen({ sessions: sessionPage([]) });
     await reconnecting;
 
     const after = scenario.client.getSnapshot();
@@ -64,7 +67,7 @@ describe("reconnecting", () => {
 
   it("keeps the presentation as unconfirmed until the new connection describes itself", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
 
     const reconnecting = scenario.client.reconnect();
     await flush();
@@ -72,19 +75,19 @@ describe("reconnecting", () => {
     const snapshot = scenario.client.getSnapshot();
     expect(snapshot.status).toBe("syncing");
     expect(snapshot.presentationHost).toBe("unconfirmed");
-    expect(snapshot.presentation?.sessions).toHaveLength(1);
+    expect(snapshot.presentation?.sessions.items).toHaveLength(1);
 
     scenario.host.serveDescribe();
     await flush();
     expect(scenario.client.getSnapshot().presentationHost).toBe("current");
 
-    scenario.host.serveOpen({ sessions: [SESSION] });
+    scenario.host.serveOpen({ sessions: sessionPage([SESSION]) });
     await reconnecting;
   });
 
   it("merges a reconnect that arrives while one is in flight", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
 
     const first = scenario.client.reconnect();
     const second = scenario.client.reconnect();
@@ -93,7 +96,7 @@ describe("reconnecting", () => {
     expect(scenario.attempts).toBe(2);
     scenario.host.serveDescribe();
     await flush();
-    scenario.host.serveOpen({ sessions: [] });
+    scenario.host.serveOpen({ sessions: sessionPage([]) });
     await expect(first).resolves.toBeUndefined();
     await expect(second).resolves.toBeUndefined();
   });
@@ -120,7 +123,7 @@ describe("an old connection cannot touch a new one", () => {
     await flush();
     scenario.host.serveDescribe();
     await flush();
-    scenario.host.serveOpen({ sessions: [] });
+    scenario.host.serveOpen({ sessions: sessionPage([]) });
     await reconnecting;
 
     // The answer to the old connection's request, delivered by a transport that
@@ -128,22 +131,22 @@ describe("an old connection cannot touch a new one", () => {
     firstHost.deliverLate(
       JSON.stringify({
         kind: "host-response",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: instanceId,
         requestId,
-        result: { sessions: [] },
+        result: { sessions: sessionPage([]) },
       }),
     );
     const failure = await listing;
 
     expect(failure).toMatchObject({ code: "CONNECTION_LOST", outcome: "unknown" });
     expect(scenario.client.getSnapshot().status).toBe("ready");
-    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(0);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items).toHaveLength(0);
   });
 
   it("ignores an event that arrives after reconnecting", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const oldHost = scenario.host;
     const oldStream = oldHost.currentStreamId;
 
@@ -151,36 +154,36 @@ describe("an old connection cannot touch a new one", () => {
     await flush();
     scenario.host.serveDescribe();
     await flush();
-    scenario.host.serveOpen({ sessions: [sessionSnapshot({ sessionId: "s-2" })] });
+    scenario.host.serveOpen({ sessions: sessionPage([sessionSummary({ sessionId: "s-2" })]) });
     await reconnecting;
 
     oldHost.deliverLate(
       JSON.stringify({
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: oldHost.hostInstanceId,
         streamId: oldStream,
         sequence: oldHost.currentSequence + 1,
         type: "session.created",
         scope: { kind: "session", sessionId: "s-old" },
-        payload: { session: sessionSnapshot({ sessionId: "s-old" }) },
+        payload: { session: sessionSummary({ sessionId: "s-old" }), collections: COLLECTIONS },
       }),
     );
 
     expect(scenario.client.getSnapshot().status).toBe("ready");
-    expect(scenario.client.getSnapshot().presentation?.sessions.map((session) => session.sessionId)).toEqual(["s-2"]);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items.map((session) => session.sessionId)).toEqual(["s-2"]);
   });
 
   it("ignores a close from the old connection after the new one is ready", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const oldHost = scenario.host;
 
     const reconnecting = scenario.client.reconnect();
     await flush();
     scenario.host.serveDescribe();
     await flush();
-    scenario.host.serveOpen({ sessions: [SESSION] });
+    scenario.host.serveOpen({ sessions: sessionPage([SESSION]) });
     await reconnecting;
 
     oldHost.closeLate();
@@ -220,14 +223,14 @@ describe("an old connection cannot touch a new one", () => {
 describe("disconnecting", () => {
   it("keeps the presentation, marks it stale, and stops claiming anything about runs", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
 
     scenario.client.disconnect();
 
     const snapshot = scenario.client.getSnapshot();
     expect(snapshot.status).toBe("disconnected");
     expect(snapshot.stale).toBe(true);
-    expect(snapshot.presentation?.sessions).toHaveLength(1);
+    expect(snapshot.presentation?.sessions.items).toHaveLength(1);
     expect(snapshot.error).toBeNull();
   });
 
@@ -243,14 +246,14 @@ describe("disconnecting", () => {
 
   it("can be followed by a fresh connection", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     scenario.client.disconnect();
 
     const connecting = scenario.client.connect();
     await flush();
     scenario.host.serveDescribe();
     await flush();
-    scenario.host.serveOpen({ sessions: [SESSION] });
+    scenario.host.serveOpen({ sessions: sessionPage([SESSION]) });
     await connecting;
 
     expect(scenario.client.getSnapshot().status).toBe("ready");
@@ -311,19 +314,19 @@ describe("invalidation comes before publication", () => {
     old.deliverLate(
       JSON.stringify({
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: old.hostInstanceId,
         streamId: old.currentStreamId,
         sequence: 1,
         type: "session.created",
         scope: { kind: "session", sessionId: "late" },
-        payload: { session: sessionSnapshot({ sessionId: "late" }) },
+        payload: { session: sessionSummary({ sessionId: "late" }), collections: COLLECTIONS },
       }),
     );
     old.deliverLate(
       JSON.stringify({
         kind: "host-request",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: old.hostInstanceId,
         streamId: old.currentStreamId,
         requestId: "late-request",
@@ -414,7 +417,7 @@ describe("invalidation comes before publication", () => {
 
   it("a protocol failure cannot retire a connection opened while it was being reported", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const failed = scenario.host;
 
     let reconnected = false;
@@ -430,7 +433,7 @@ describe("invalidation comes before publication", () => {
     failed.sendRaw(
       JSON.stringify({
         kind: "host-response",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: failed.hostInstanceId,
         requestId: failed.requestIdOf("subscriptions.open", 1) ?? "",
         result: { wrong: "shape" },
@@ -443,7 +446,7 @@ describe("invalidation comes before publication", () => {
     await flush();
     scenario.host.serveDescribe();
     await flush();
-    scenario.host.serveOpen({ sessions: [SESSION] });
+    scenario.host.serveOpen({ sessions: sessionPage([SESSION]) });
     await fresh;
 
     expect(reconnected).toBe(true);

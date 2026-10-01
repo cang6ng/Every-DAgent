@@ -19,28 +19,29 @@ import {
   runIn,
   runningRun,
   sessionIn,
-  sessionSnapshot,
+  sessionPage,
+  sessionSummary,
   textItem,
   toolItem,
 } from "./helpers/values.js";
 
-const SESSION = sessionSnapshot({ sessionId: "s-1" });
+const SESSION = sessionSummary({ sessionId: "s-1" });
 
 describe("session and plugin events", () => {
-  it("appends a created session in directory order", async () => {
+  it("puts a created session at the front of the directory window", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
 
-    scenario.host.emit({ type: "session.created", session: sessionSnapshot({ sessionId: "s-2" }) });
+    scenario.host.emit({ type: "session.created", session: sessionSummary({ sessionId: "s-2" }) });
 
-    expect(scenario.client.getSnapshot().presentation?.sessions.map((item) => item.sessionId)).toEqual(["s-1", "s-2"]);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items.map((item) => item.sessionId)).toEqual(["s-2", "s-1"]);
   });
 
   it("refuses a session that is already there", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
 
-    scenario.host.emit({ type: "session.created", session: sessionSnapshot({ sessionId: "s-1" }) });
+    scenario.host.emit({ type: "session.created", session: sessionSummary({ sessionId: "s-1" }) });
 
     expect(scenario.client.getSnapshot().status).toBe("protocol-error");
     expect(scenario.client.getSnapshot().error?.reason).toBe("invalid-event");
@@ -73,7 +74,7 @@ describe("session and plugin events", () => {
 describe("run events", () => {
   it("adds an accepted run and points the session at it, in one update", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     let notifications = 0;
     scenario.client.subscribe(() => {
       notifications += 1;
@@ -83,13 +84,13 @@ describe("run events", () => {
 
     const presentation = scenario.client.getSnapshot().presentation;
     expect(notifications).toBe(1);
-    expect(presentation?.runs.map((run) => run.runId)).toEqual(["r-1"]);
-    expect(sessionIn(presentation?.sessions ?? [], "s-1")?.activeRunId).toBe("r-1");
+    expect(presentation?.runs.items.map((run) => run.runId)).toEqual(["r-1"]);
+    expect(sessionIn(presentation?.sessions.items ?? [], "s-1")?.activeRunId).toBe("r-1");
   });
 
   it("moves accepted to running without losing the run's identity", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
 
     scenario.host.emit({
@@ -97,15 +98,17 @@ describe("run events", () => {
       run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1", turnId: "turn-1", live: [textItem("i-1", "hi")] }),
     });
 
-    const run = scenario.client.getSnapshot().presentation?.runs[0];
+    const run = scenario.client.getSnapshot().presentation?.runs.items[0];
     expect(run?.status).toBe("running");
     expect(run?.turnId).toBe("turn-1");
-    expect(run?.live).toHaveLength(1);
+    // The timeline of a run this client watched start lives in the live replica,
+    // never in the durable run window.
+    expect(scenario.client.getSnapshot().live["r-1"]?.live).toHaveLength(1);
   });
 
   it("refuses a run whose identity changed", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
     scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
 
@@ -115,12 +118,14 @@ describe("run events", () => {
     });
 
     expect(scenario.client.getSnapshot().status).toBe("protocol-error");
-    expect(scenario.client.getSnapshot().error?.reason).toBe("run-identity");
+    // The directory fold refuses a run that changed its identity as an event
+    // that cannot follow from the summary it already published.
+    expect(scenario.client.getSnapshot().error?.reason).toBe("invalid-event");
   });
 
   it("refuses a run whose turn id moved", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
     scenario.host.emit({
       type: "run.updated",
@@ -137,7 +142,7 @@ describe("run events", () => {
 
   it("refuses a second active run for the same session", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
 
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-2", sessionId: "s-1", submissionId: "sub-2" }) });
@@ -147,7 +152,7 @@ describe("run events", () => {
 
   it("refuses content for a run the client does not have", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
 
     scenario.host.emit({ type: "run.output.delta", sessionId: "s-1", runId: "r-missing", itemId: "i-1", text: "hi" });
 
@@ -163,7 +168,7 @@ describe("live text and tools", () => {
    */
   async function withRun(text = "hello") {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1", text }) });
     scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1", text }) });
     return scenario;
@@ -175,7 +180,7 @@ describe("live text and tools", () => {
     scenario.host.emit({ type: "run.output.delta", sessionId: "s-1", runId: "r-1", itemId: "i-1", text: "hel" });
     scenario.host.emit({ type: "run.output.delta", sessionId: "s-1", runId: "r-1", itemId: "i-1", text: "lo" });
 
-    const live = scenario.client.getSnapshot().presentation?.runs[0]?.live;
+    const live = scenario.client.getSnapshot().live["r-1"]?.live;
     expect(live).toHaveLength(1);
     expect(live?.[0]).toMatchObject({ kind: "text", itemId: "i-1", text: "hello" });
   });
@@ -188,7 +193,7 @@ describe("live text and tools", () => {
     scenario.host.emit({ type: "run.tool.call", sessionId: "s-1", runId: "r-1", item: tool });
     scenario.host.emit({ type: "run.output.delta", sessionId: "s-1", runId: "r-1", itemId: "i-2", text: "after" });
 
-    const live = scenario.client.getSnapshot().presentation?.runs[0]?.live;
+    const live = scenario.client.getSnapshot().live["r-1"]?.live;
     expect(live?.map((item) => item.kind)).toEqual(["text", "tool", "text"]);
     expect(live?.[0]).toMatchObject({ text: "before" });
     expect(live?.[2]).toMatchObject({ text: "after" });
@@ -202,7 +207,7 @@ describe("live text and tools", () => {
     scenario.host.emit({ type: "run.tool.call", sessionId: "s-1", runId: "r-1", item: first });
     scenario.host.emit({ type: "run.tool.call", sessionId: "s-1", runId: "r-1", item: second });
 
-    const live = scenario.client.getSnapshot().presentation?.runs[0]?.live;
+    const live = scenario.client.getSnapshot().live["r-1"]?.live;
     expect(live).toHaveLength(2);
     expect(live?.[0]).toMatchObject({ invocationId: "inv-1" });
     expect(live?.[1]).toMatchObject({ invocationId: "inv-2" });
@@ -219,7 +224,7 @@ describe("live text and tools", () => {
 
     scenario.host.emit({ type: "run.tool.result", sessionId: "s-1", runId: "r-1", invocationId: "inv-1", ok: false, content: "it failed" });
 
-    const live = scenario.client.getSnapshot().presentation?.runs[0]?.live;
+    const live = scenario.client.getSnapshot().live["r-1"]?.live;
     expect(live?.[0]).toMatchObject({ kind: "tool", result: { ok: false, content: "it failed" } });
   });
 
@@ -265,45 +270,43 @@ describe("live text and tools", () => {
 describe("the terminal correction", () => {
   it("applies the terminal run and the settled session in one notification", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
     scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
     scenario.host.emit({ type: "run.output.delta", sessionId: "s-1", runId: "r-1", itemId: "i-1", text: "draft" });
 
-    const seen: { readonly runLive: unknown; readonly activeRunId: unknown }[] = [];
+    const seen: { readonly liveRun: unknown; readonly activeRunId: unknown }[] = [];
     scenario.client.subscribe(() => {
-      const presentation = scenario.client.getSnapshot().presentation;
+      const snapshot = scenario.client.getSnapshot();
       seen.push({
-        runLive: presentation?.runs[0]?.live,
-        activeRunId: sessionIn(presentation?.sessions ?? [], "s-1")?.activeRunId,
+        liveRun: snapshot.live["r-1"],
+        activeRunId: sessionIn(snapshot.presentation?.sessions.items ?? [], "s-1")?.activeRunId,
       });
     });
 
-    const canonical = [
-      { id: "c-1", turnId: "turn-1", kind: "user" as const, text: "hello" },
-      { id: "c-2", turnId: "turn-1", kind: "assistant" as const, text: "hello back" },
-    ];
     scenario.host.emit({
       type: "run.ended",
       run: completedRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }),
-      session: sessionSnapshot({ sessionId: "s-1", canonical }),
+      session: sessionSummary({ sessionId: "s-1", committedSeq: 2, historyRevision: 1 }),
     });
 
     // One notification, and it carries both halves already applied: the draft is
     // gone with the run, and the session points at nothing while holding history.
     expect(seen).toHaveLength(1);
-    expect(seen[0]?.runLive).toBeNull();
+    expect(seen[0]?.liveRun).toBeUndefined();
     expect(seen[0]?.activeRunId).toBeNull();
 
     const presentation = scenario.client.getSnapshot().presentation;
-    expect(presentation?.runs[0]?.status).toBe("completed");
-    expect(sessionIn(presentation?.sessions ?? [], "s-1")?.canonical).toHaveLength(2);
+    expect(presentation?.runs.items[0]?.status).toBe("completed");
+    // The two items the terminal turn committed are the session's new high-water
+    // (`committedSeq`); the conversation itself is read through `sessions.history`.
+    expect(sessionIn(presentation?.sessions.items ?? [], "s-1")?.committedSeq).toBe(2);
   });
 
   it("refuses an end for a run that is already terminal", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
-    const ending = { type: "run.ended" as const, run: completedRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }), session: sessionSnapshot({ sessionId: "s-1" }) };
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
+    const ending = { type: "run.ended" as const, run: completedRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }), session: sessionSummary({ sessionId: "s-1" }) };
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
     scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
     scenario.host.emit(ending);
@@ -321,17 +324,20 @@ describe("the terminal correction", () => {
     text: "hello",
     turnId: "turn-1",
     cancelRequested: false,
+    acceptedAt: 1_700_000_000_000,
+    startedAt: 1_700_000_000_001,
+    endedAt: 1_700_000_000_002,
   } as const;
 
   /** The successful terminal outcomes. */
   function terminal(status: "completed" | "limited" | "cancelled"): TerminalRunSnapshot {
     switch (status) {
       case "completed":
-        return { ...RUN, status: "completed", endReason: "completed", error: null, live: null };
+        return { ...RUN, status: "completed", endReason: "completed", error: null, executionKnowledge: null, live: null };
       case "limited":
-        return { ...RUN, status: "limited", endReason: "max_steps", error: null, live: null };
+        return { ...RUN, status: "limited", endReason: "max_steps", error: null, executionKnowledge: null, live: null };
       case "cancelled":
-        return { ...RUN, status: "cancelled", endReason: "cancelled", error: null, live: null };
+        return { ...RUN, status: "cancelled", endReason: "cancelled", error: null, executionKnowledge: null, live: null };
     }
   }
 
@@ -342,6 +348,7 @@ describe("the terminal correction", () => {
       status: "failed",
       endReason,
       error: { code: "INTERNAL_ERROR", message: "the run failed" },
+      executionKnowledge: null,
       live: null,
     };
   }
@@ -352,14 +359,14 @@ describe("the terminal correction", () => {
   for (const status of ["completed", "limited", "cancelled"] as const) {
     it(`refuses a ${status} ending for a run the client never saw running`, async () => {
       const scenario = createScenario({ host: { auto: false } });
-      await openWith(scenario, { sessions: [SESSION] });
+      await openWith(scenario, { sessions: sessionPage([SESSION]) });
       scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
       const published = scenario.client.getSnapshot().presentation;
 
       scenario.host.emit({
         type: "run.ended",
         run: terminal(status),
-        session: sessionSnapshot({ sessionId: "s-1" }),
+        session: sessionSummary({ sessionId: "s-1" }),
       });
 
       // Nothing of the frame was published — not the run, not the session, not
@@ -368,14 +375,14 @@ describe("the terminal correction", () => {
       expect(snapshot.status).toBe("protocol-error");
       expect(snapshot.error?.reason).toBe("invalid-event");
       expect(snapshot.presentation).toBe(published);
-      expect(runIn(published?.runs ?? [], "r-1")?.status).toBe("accepted");
+      expect(runIn(published?.runs.items ?? [], "r-1")?.status).toBe("accepted");
       expect(snapshot.presentation?.watermark.sequence).toBe(published?.watermark.sequence);
     });
   }
 
   it("accepts the host's own failure as the terminal move out of accepted", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
 
     let notifications = 0;
@@ -385,15 +392,17 @@ describe("the terminal correction", () => {
     scenario.host.emit({
       type: "run.ended",
       run: failed("host_error"),
-      session: sessionSnapshot({ sessionId: "s-1", status: "blocked" }),
+      session: sessionSummary({ sessionId: "s-1", status: "blocked", blockedReason: "host-fault" }),
     });
 
     expect(notifications).toBe(1);
     expect(scenario.client.getSnapshot().status).toBe("ready");
     const presentation = scenario.client.getSnapshot().presentation;
-    expect(runIn(presentation?.runs ?? [], "r-1")?.status).toBe("failed");
-    expect(runIn(presentation?.runs ?? [], "r-1")?.live).toBeNull();
-    expect(sessionIn(presentation?.sessions ?? [], "s-1")?.activeRunId).toBeNull();
+    expect(runIn(presentation?.runs.items ?? [], "r-1")?.status).toBe("failed");
+    // A terminal run has no timeline at all: the run window holds summaries, and
+    // the draft this client watched start is forgotten with the run.
+    expect(scenario.client.getSnapshot().live["r-1"]).toBeUndefined();
+    expect(sessionIn(presentation?.sessions.items ?? [], "s-1")?.activeRunId).toBeNull();
   });
 
   // The rule is about stages, not about end reasons: a failure the host writes
@@ -401,19 +410,19 @@ describe("the terminal correction", () => {
   // refusing a legal terminal would end a connection over a name.
   it("accepts a failed ending for a run that never started, whatever the host calls the failure", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
 
-    scenario.host.emit({ type: "run.ended", run: failed("error"), session: sessionSnapshot({ sessionId: "s-1" }) });
+    scenario.host.emit({ type: "run.ended", run: failed("error"), session: sessionSummary({ sessionId: "s-1" }) });
 
     expect(scenario.client.getSnapshot().status).toBe("ready");
-    expect(runIn(scenario.client.getSnapshot().presentation?.runs ?? [], "r-1")?.status).toBe("failed");
+    expect(runIn(scenario.client.getSnapshot().presentation?.runs.items ?? [], "r-1")?.status).toBe("failed");
   });
 
   for (const status of ["completed", "limited", "cancelled"] as const) {
     it(`accepts a ${status} ending once the run has been published as running`, async () => {
       const scenario = createScenario({ host: { auto: false } });
-      await openWith(scenario, { sessions: [SESSION] });
+      await openWith(scenario, { sessions: sessionPage([SESSION]) });
       scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
       scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
 
@@ -424,7 +433,7 @@ describe("the terminal correction", () => {
       scenario.host.emit({
         type: "run.ended",
         run: terminal(status),
-        session: sessionSnapshot({ sessionId: "s-1" }),
+        session: sessionSummary({ sessionId: "s-1" }),
       });
 
       // One notification, carrying the terminal run and the settled session
@@ -432,9 +441,9 @@ describe("the terminal correction", () => {
       expect(notifications).toBe(1);
       expect(scenario.client.getSnapshot().status).toBe("ready");
       const presentation = scenario.client.getSnapshot().presentation;
-      expect(runIn(presentation?.runs ?? [], "r-1")?.status).toBe(status);
-      expect(runIn(presentation?.runs ?? [], "r-1")?.live).toBeNull();
-      expect(sessionIn(presentation?.sessions ?? [], "s-1")?.activeRunId).toBeNull();
+      expect(runIn(presentation?.runs.items ?? [], "r-1")?.status).toBe(status);
+      expect(scenario.client.getSnapshot().live["r-1"]).toBeUndefined();
+      expect(sessionIn(presentation?.sessions.items ?? [], "s-1")?.activeRunId).toBeNull();
     });
   }
 });
@@ -448,7 +457,7 @@ describe("unknown events", () => {
     host.sendRaw(
       JSON.stringify({
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: host.hostInstanceId,
         streamId: host.currentStreamId,
         sequence: host.currentSequence + 1,
@@ -464,13 +473,13 @@ describe("unknown events", () => {
 
   it("refuses an event whose scope contradicts its payload", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     const host = scenario.host;
 
     host.sendRaw(
       JSON.stringify({
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: host.hostInstanceId,
         streamId: host.currentStreamId,
         sequence: host.currentSequence + 1,
@@ -488,7 +497,7 @@ describe("unknown events", () => {
 describe("content and runs must fit the history the client published", () => {
   async function running(): Promise<ReturnType<typeof createScenario>> {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
     scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
     return scenario;
@@ -529,7 +538,7 @@ describe("content and runs must fit the history the client published", () => {
 
   it("refuses a run that begins as running without an accepted publication", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
 
     scenario.host.emit({ type: "run.updated", run: runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
 
@@ -546,7 +555,7 @@ describe("content and runs must fit the history the client published", () => {
 
   it("refuses content before the run has reached running", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [SESSION] });
+    await openWith(scenario, { sessions: sessionPage([SESSION]) });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
 
     scenario.host.emit({ type: "run.output.delta", sessionId: "s-1", runId: "r-1", itemId: "i-1", text: "too early" });
@@ -563,13 +572,16 @@ describe("content and runs must fit the history the client published", () => {
       item: toolItem({ itemId: "i-1", invocationId: "inv-1", name: "original" }),
     });
 
+    // An occurrence a full replacement carries back is identified by its kind,
+    // its item id and the input it was called with; rewriting the input is a
+    // rewrite of the occurrence, not an extension of the timeline.
     scenario.host.emit({
       type: "run.updated",
       run: runningRun({
         runId: "r-1",
         sessionId: "s-1",
         submissionId: "sub-1",
-        live: [toolItem({ itemId: "i-1", invocationId: "inv-1", name: "REWRITTEN" })],
+        live: [toolItem({ itemId: "i-1", invocationId: "inv-1", name: "original", input: { kind: "json", value: { step: 2 } } })],
       }),
     });
 
@@ -591,7 +603,7 @@ describe("content and runs must fit the history the client published", () => {
     });
 
     expect(scenario.client.getSnapshot().status).toBe("ready");
-    expect(scenario.client.getSnapshot().presentation?.runs[0]).toMatchObject({
+    expect(scenario.client.getSnapshot().live["r-1"]).toMatchObject({
       status: "running",
       live: [{ itemId: "i-1", kind: "text", text: "hello world" }],
     });

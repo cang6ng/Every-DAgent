@@ -144,7 +144,19 @@ describe("the shell when things go wrong, in a real browser", () => {
       expect(await session.evaluate<boolean>('document.body.textContent.includes("不是一次完整回答")')).toBe(true);
       expect(await session.evaluate<string>(runStatus)).not.toContain("已完成");
 
-      // Twelve steps, each a call and a result, each shown exactly once.
+      // Twelve steps, each a call and a result, each shown exactly once. The
+      // turn is longer than one history page carries: the newest page arrives
+      // on its own, and the older ones are read the way a reader reads them —
+      // never stitched silently into one conversation nobody read.
+      await session.waitFor(countOf('[data-testid="tool-card"]'), (value) => value !== "0", 20000, "the newest history page");
+      const footer = 'document.querySelector(".conversation__foot")?.textContent ?? ""';
+      for (let page = 0; page < 4; page += 1) {
+        if ((await session.evaluate<string>(countOf('[data-testid="tool-card"]'))) === "24") break;
+        if ((await session.evaluate<string>(countOf('[data-testid="load-older"]'))) === "0") break;
+        const loaded = await session.evaluate<string>(footer);
+        await session.click('[data-testid="load-older"]');
+        await session.waitFor(footer, (value) => value !== loaded, 20000, "the older history page");
+      }
       expect(await session.evaluate<string>(countOf('[data-testid="tool-card"]'))).toBe("24");
       expect(await session.evaluate<string>(countOf('[data-testid="live-run"]'))).toBe("0");
 

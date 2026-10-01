@@ -27,7 +27,7 @@ import type { ReverseHandlerContext, ReverseHandlerOutcome } from "../../package
 import { createClientWith } from "../../packages/client/src/client.js";
 import type { ReverseProfile } from "../../packages/host/src/reverse.js";
 
-import { createHostPlatform, waitFor, type HostPlatform } from "../helpers/platform.js";
+import { createHostPlatform, runSettled, waitFor, type HostPlatform } from "../helpers/platform.js";
 import {
   demoPlugin,
   partialThenGatedReply,
@@ -75,6 +75,38 @@ async function platformFor(
   }
   open.push({ close: () => platform.shutdown() });
   return { platform, model };
+}
+
+/**
+ * Everything the client currently shows as a live draft, joined as text.
+ *
+ * A timeline belongs to the run being executed and lives in the client's live
+ * map: this is the client's own view of what it has been shown so far.
+ */
+function liveText(which: Client): string {
+  return Object.values(which.getSnapshot().live)
+    .flatMap((run) => run.live)
+    .map((item) => (item.kind === "text" ? item.text : ""))
+    .join("");
+}
+
+/**
+ * Walks a session's committed history from its fence back to its start.
+ *
+ * v2 history is read in bounded pages, so "the whole session" is a traversal
+ * and not one array: the walk ends where the page says it does.
+ */
+async function readCanonical(which: Client, sessionId: string): Promise<readonly CanonicalItem[]> {
+  const pages: (readonly CanonicalItem[])[] = [];
+  let cursor: string | undefined;
+  for (;;) {
+    const result = await which.sessions.history(cursor === undefined ? { sessionId } : { sessionId, cursor });
+    pages.unshift(result.page.items);
+    const next = result.page.nextCursor;
+    if (next === null) break;
+    cursor = next;
+  }
+  return pages.flat();
 }
 
 /**
@@ -144,7 +176,11 @@ for (const carrier of ["memory", "web"] as const) {
       const states: { readonly host: string; readonly stale: boolean; readonly sessions: number }[] = [];
       const unsubscribe = client.subscribe(() => {
         const snapshot = client.getSnapshot();
-        states.push({ host: snapshot.presentationHost, stale: snapshot.stale, sessions: snapshot.presentation?.sessions.length ?? 0 });
+        states.push({
+          host: snapshot.presentationHost,
+          stale: snapshot.stale,
+          sessions: snapshot.presentation?.sessions.items.length ?? 0,
+        });
       });
 
       try {
@@ -153,7 +189,7 @@ for (const carrier of ["memory", "web"] as const) {
         const unanswered = client
           .runs.start({ sessionId: session.sessionId, submissionId: "pending-move", text: "once" })
           .catch((error: unknown) => error);
-        await waitFor(() => lost && client.getSnapshot().presentation?.runs.length === 1);
+        await waitFor(() => lost && client.getSnapshot().presentation?.runs.items.length === 1);
 
         target = second;
         await client.reconnect();
@@ -167,7 +203,7 @@ for (const carrier of ["memory", "web"] as const) {
         expect(states.some((state) => state.host === "unconfirmed" && state.sessions === 1 && state.stale)).toBe(true);
         expect(states.some((state) => state.host === "previous" && state.sessions === 1 && state.stale)).toBe(true);
         expect(client.getSnapshot().presentationHost).toBe("current");
-        expect(client.getSnapshot().presentation?.sessions).toEqual([]);
+        expect(client.getSnapshot().presentation?.sessions.items).toEqual([]);
 
         // Nothing was replayed: one start in total, and the second host never
         // saw the submission at all.
@@ -213,7 +249,7 @@ for (const carrier of ["memory", "web"] as const) {
         const session = (await client.sessions.create()).session;
         const params = { sessionId: session.sessionId, submissionId: "lost-same", text: "one run" };
         const unanswered = client.runs.start(params).catch((error: unknown) => error);
-        await waitFor(() => dropped === 1 && client.getSnapshot().presentation?.runs[0]?.live?.length === 1);
+        await waitFor(() => dropped === 1 && liveText(client) === "accepted-prefix");
 
         // The observer saw the run the client could not be told about.
         const original = await observer.runs.get({ submissionId: "lost-same" });
@@ -221,7 +257,7 @@ for (const carrier of ["memory", "web"] as const) {
 
         client.disconnect();
         finish();
-        await waitFor(() => observer.getSnapshot().presentation?.runs[0]?.status === "completed");
+        await waitFor(() => observer.getSnapshot().presentation?.runs.items[0]?.status === "completed");
         await client.reconnect();
 
         expect(await unanswered).toMatchObject({ code: "CONNECTION_LOST", outcome: "unknown" });
@@ -264,32 +300,36 @@ for (const carrier of ["memory", "web"] as const) {
       ]);
       const client = createClient({ connect: (): Promise<ProtocolChannel> => fixture.platform.connect() });
       const observer = createClient({ connect: (): Promise<ProtocolChannel> => fixture.platform.connect() });
-      const content = (which: Client): string =>
-        (which.getSnapshot().presentation?.runs[0]?.live ?? []).map((item) => (item.kind === "text" ? item.text : "")).join("");
 
       try {
         await client.connect();
         await observer.connect();
         const session = (await client.sessions.create()).session;
-        await client.runs.start({ sessionId: session.sessionId, submissionId: "prefix", text: "go" });
-        await waitFor(() => content(client) === "before-中");
+        const started = await client.runs.start({ sessionId: session.sessionId, submissionId: "prefix", text: "go" });
+        await waitFor(() => liveText(client) === "before-中");
 
         // The client goes away while the run keeps producing: the host's own
         // state grows, and the client's replica cannot.
         client.disconnect();
         offline();
-        await waitFor(() => content(observer) === "before-中-offline-😀");
+        await waitFor(() => liveText(observer) === "before-中-offline-😀");
 
         // The snapshot, not a replay of events, is what puts the client back in
-        // step — and it carries exactly what the host holds.
+        // step — and it carries exactly what the host holds: the cut names the
+        // active run, and the client re-reads the timeline of that run.
         await client.reconnect();
-        expect(content(client)).toBe("before-中-offline-😀");
+        await waitFor(() => liveText(client) === "before-中-offline-😀", { what: "the grown prefix to come back" });
+        expect(liveText(client)).toBe("before-中-offline-😀");
 
         finish();
-        await waitFor(() => client.getSnapshot().presentation?.runs[0]?.status === "completed");
-        // The terminal correction: no live draft beside the canonical history.
-        expect(client.getSnapshot().presentation?.runs[0]?.live).toBeNull();
-        expect(JSON.stringify(client.getSnapshot().presentation?.sessions[0]?.canonical)).toContain("before-中-offline-😀-end");
+        await waitFor(() => client.getSnapshot().presentation?.runs.items[0]?.status === "completed");
+        // The terminal correction: no live draft beside the committed history.
+        expect(client.getSnapshot().live[started.run.runId]).toBeUndefined();
+        const committed = await client.sessions.history({ sessionId: session.sessionId });
+        expect(JSON.stringify(committed.page.items)).toContain("before-中-offline-😀-end");
+        expect(JSON.stringify(client.getSnapshot().history[session.sessionId]?.items)).toContain(
+          "before-中-offline-😀-end",
+        );
         expect(fixture.model.requests).toHaveLength(1);
       } finally {
         offline();
@@ -321,11 +361,8 @@ for (const carrier of ["memory", "web"] as const) {
       );
       const client = createClient({ connect: (): Promise<ProtocolChannel> => fixture.platform.connect() });
       const observer = createClient({ connect: (): Promise<ProtocolChannel> => fixture.platform.connect() });
-      const run = (which: Client) => which.getSnapshot().presentation?.runs[0];
-      const session = (which: Client) => which.getSnapshot().presentation?.sessions[0];
-      const canonical = (which: Client): readonly CanonicalItem[] => session(which)?.canonical ?? [];
-      const liveText = (which: Client): string =>
-        (run(which)?.live ?? []).map((item) => (item.kind === "text" ? item.text : "")).join("");
+      const run = (which: Client) => which.getSnapshot().presentation?.runs.items[0];
+      const session = (which: Client) => which.getSnapshot().presentation?.sessions.items[0];
 
       try {
         await client.connect();
@@ -333,7 +370,11 @@ for (const carrier of ["memory", "web"] as const) {
         // The tool the run will call: registered on the host, enabled by a client.
         await client.plugins.enable({ pluginId: "demo" });
         const created = (await client.sessions.create()).session;
-        await client.runs.start({ sessionId: created.sessionId, submissionId: "offline-terminal", text: "go" });
+        const started = await client.runs.start({
+          sessionId: created.sessionId,
+          submissionId: "offline-terminal",
+          text: "go",
+        });
         await waitFor(() => liveText(client) === "seen-live");
 
         // The client goes away with a live prefix on screen. The run then reaches
@@ -343,7 +384,8 @@ for (const carrier of ["memory", "web"] as const) {
         client.disconnect();
         release();
         await waitFor(() => run(observer)?.status === "completed");
-        expect(canonical(observer).map((item) => item.kind)).toEqual([
+        const observerCanonical = await readCanonical(observer, created.sessionId);
+        expect(observerCanonical.map((item) => item.kind)).toEqual([
           "user",
           "assistant",
           "tool-call",
@@ -359,10 +401,11 @@ for (const carrier of ["memory", "web"] as const) {
         // the state that only ever existed while it was away.
         await client.reconnect();
         expect(run(client)?.status).toBe("completed");
-        // No live draft beside the canonical history, and no stale prefix kept.
-        expect(run(client)?.live).toBeNull();
-        expect(canonical(client)).toEqual(canonical(observer));
-        expect(canonical(client)).toContainEqual(
+        // No live draft beside the committed history, and no stale prefix kept.
+        expect(client.getSnapshot().live[started.run.runId]).toBeUndefined();
+        const clientCanonical = await readCanonical(client, created.sessionId);
+        expect(clientCanonical).toEqual(observerCanonical);
+        expect(clientCanonical).toContainEqual(
           expect.objectContaining({ kind: "tool-result", name: "demo.tool", content: "tool answered" }),
         );
         // The session is free, and the snapshot named a new stream — from which
@@ -370,9 +413,11 @@ for (const carrier of ["memory", "web"] as const) {
         expect(session(client)?.activeRunId).toBeNull();
         expect(client.getSnapshot().presentation?.watermark.streamId).not.toBe(streamBefore);
         expect(client.getSnapshot().presentation?.watermark.sequence).toBe(0);
-        await client.runs.start({ sessionId: created.sessionId, submissionId: "after", text: "again" });
-        await waitFor(() =>
-          canonical(client).some((item) => item.kind === "assistant" && item.text === "after the resync"),
+        const again = await client.runs.start({ sessionId: created.sessionId, submissionId: "after", text: "again" });
+        await waitFor(() => runSettled(client.getSnapshot(), again.run.runId), { what: "the second run to settle" });
+        const afterCanonical = await readCanonical(client, created.sessionId);
+        expect(afterCanonical.some((item) => item.kind === "assistant" && item.text === "after the resync")).toBe(
+          true,
         );
         // Two runs: the first took two steps (the tool call and the answer that
         // followed it), the second one. Nothing ran twice.
@@ -441,11 +486,13 @@ for (const carrier of ["memory", "web"] as const) {
         ) as { hostInstanceId: string; streamId: string; requestId: string };
 
         // A frame from another connection, naming this request: it is dropped by
-        // the host's own correlation, and the request stays unsettled.
+        // the host's own correlation, and the request stays unsettled. The frame
+        // is otherwise a well-formed v2 answer — the one thing wrong with it is
+        // the connection it arrived on.
         otherWire.send(
           JSON.stringify({
             kind: "client-response",
-            protocolVersion: "1",
+            protocolVersion: "2",
             hostInstanceId: request.hostInstanceId,
             streamId: request.streamId,
             requestId: request.requestId,

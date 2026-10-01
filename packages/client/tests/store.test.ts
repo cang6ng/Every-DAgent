@@ -10,7 +10,7 @@
 import { describe, expect, it } from "vitest";
 
 import { openWith, createScenario } from "./helpers/scenario.js";
-import { sessionSnapshot } from "./helpers/values.js";
+import { activeRun, sessionPage, sessionSummary } from "./helpers/values.js";
 
 describe("snapshot identity", () => {
   it("returns the same object while nothing changes", async () => {
@@ -86,23 +86,23 @@ describe("snapshot identity", () => {
 describe("isolation", () => {
   it("hands out frozen data that cannot be edited into the client's state", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [sessionSnapshot({ sessionId: "s-1" })] });
+    await openWith(scenario, { sessions: sessionPage([sessionSummary({ sessionId: "s-1" })]) });
 
     const presentation = scenario.client.getSnapshot().presentation;
     expect(presentation).not.toBeNull();
     expect(Object.isFrozen(presentation)).toBe(true);
     expect(() => {
-      (presentation?.sessions as unknown as string[]).push("s-2");
+      (presentation?.sessions.items as unknown as string[]).push("s-2");
     }).toThrow();
-    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(1);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items).toHaveLength(1);
   });
 
   it("shares the branches an event did not touch", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: [sessionSnapshot({ sessionId: "s-1" })] });
+    await openWith(scenario, { sessions: sessionPage([sessionSummary({ sessionId: "s-1" })]) });
     const before = scenario.client.getSnapshot().presentation;
 
-    scenario.host.emit({ type: "session.created", session: sessionSnapshot({ sessionId: "s-2" }) });
+    scenario.host.emit({ type: "session.created", session: sessionSummary({ sessionId: "s-2" }) });
     const after = scenario.client.getSnapshot().presentation;
 
     expect(after?.sessions).not.toBe(before?.sessions);
@@ -120,12 +120,12 @@ describe("the store is not a response cache", () => {
 
     const created = scenario.client.sessions.create();
     host.respond(host.requestIdOf("sessions.create") ?? "", "sessions.create", {
-      session: sessionSnapshot({ sessionId: "s-created" }),
+      session: sessionSummary({ sessionId: "s-created" }),
     });
 
     await expect(created).resolves.toMatchObject({ session: { sessionId: "s-created" } });
     expect(scenario.client.getSnapshot().presentation).toBe(before);
-    expect(scenario.client.getSnapshot().presentation?.sessions).toHaveLength(0);
+    expect(scenario.client.getSnapshot().presentation?.sessions.items).toHaveLength(0);
   });
 
   it("ignores a run result too", async () => {
@@ -136,18 +136,7 @@ describe("the store is not a response cache", () => {
 
     const started = scenario.client.runs.start({ sessionId: "s-1", submissionId: "sub-1", text: "hello" });
     host.respond(host.requestIdOf("runs.start") ?? "", "runs.start", {
-      run: {
-        runId: "r-1",
-        submissionId: "sub-1",
-        sessionId: "s-1",
-        text: "hello",
-        turnId: null,
-        cancelRequested: false,
-        status: "accepted",
-        endReason: null,
-        error: null,
-        live: [],
-      },
+      run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }),
     });
 
     await started;

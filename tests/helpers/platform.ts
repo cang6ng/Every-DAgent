@@ -15,9 +15,9 @@ import type { Host, HostOptions } from "@every-dagent/host";
 // subpath a consumer could use.
 import { composeHost, type AttachedConnection } from "../../packages/host/src/host.js";
 import type { ReverseProfile } from "../../packages/host/src/reverse.js";
-import type { ProtocolChannel } from "@every-dagent/protocol";
+import type { LiveItem, ProtocolChannel } from "@every-dagent/protocol";
 
-import { createClient, type Client } from "@every-dagent/client";
+import { createClient, type Client, type ClientSnapshot } from "@every-dagent/client";
 // The composition seam for test-only reverse profiles, reached the same way: a
 // source path inside this repository, never a package subpath.
 import { createClientWith, type ClientInternals } from "../../packages/client/src/client.js";
@@ -94,6 +94,29 @@ export function createClientOn(platform: HostPlatform, options: ClientOnPlatform
   return options.internals === undefined
     ? createClient(optionsWithoutInternals)
     : createClientWith(optionsWithoutInternals, options.internals);
+}
+
+/**
+ * Whether a run's summary is terminal and its draft is gone.
+ *
+ * In v2 the timeline of a run that is still executing lives in the client's
+ * `live` map, never on the summary: a settled run is one whose status is
+ * terminal *and* whose timeline the replica no longer holds, which is the pair
+ * the old single `live === null` on a run snapshot used to say.
+ */
+export function runSettled(snapshot: ClientSnapshot, runId: string): boolean {
+  const run = snapshot.presentation?.runs.items.find((candidate) => candidate.runId === runId);
+  return (
+    run !== undefined &&
+    run.status !== "accepted" &&
+    run.status !== "running" &&
+    snapshot.live[runId] === undefined
+  );
+}
+
+/** The live timeline of one run, as the client currently holds it. */
+export function liveOf(snapshot: ClientSnapshot, runId: string): readonly LiveItem[] {
+  return snapshot.live[runId]?.live ?? [];
 }
 
 /**

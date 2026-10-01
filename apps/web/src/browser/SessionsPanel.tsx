@@ -1,15 +1,16 @@
 /**
- * The session rail: the directory the host publishes, and the selection.
+ * The session rail: the bounded directory the host publishes, and the selection.
  *
- * There is no naming, no renaming and no deletion, because the protocol has
- * none — a session is an id, a creation time and a status, and the panel shows
- * exactly that. Selecting is local and cheap; it is remembered with the host
+ * A session is a title, a creation time, a last-changed time and a status, and
+ * the panel shows exactly that — including how much of the directory it is
+ * holding: a bounded window says so rather than looking like the whole
+ * collection. Selecting is local and cheap; it is remembered with the host
  * instance it belongs to, so a reconnect to a different host does not carry a
  * selection across.
  */
 
 import type { ClientSnapshot } from "@every-dagent/client";
-import type { SessionSnapshot } from "@every-dagent/protocol";
+import type { SessionSummary } from "@every-dagent/protocol";
 
 import { formatClock, shortId } from "./presentation.js";
 import type { ShellUiState } from "./controller.js";
@@ -17,14 +18,16 @@ import type { ShellUiState } from "./controller.js";
 export interface SessionsPanelProps {
   readonly snapshot: ClientSnapshot;
   readonly ui: ShellUiState;
-  readonly selected: SessionSnapshot | null;
+  readonly selected: SessionSummary | null;
   readonly canWrite: boolean;
+  readonly durable: boolean;
   onCreate(): void;
   onSelect(sessionId: string): void;
 }
 
 export function SessionsPanel(props: SessionsPanelProps) {
-  const sessions = props.snapshot.presentation?.sessions ?? [];
+  const page = props.snapshot.presentation?.sessions;
+  const sessions = page?.items ?? [];
 
   return (
     <section className="panel" data-testid="sessions-panel">
@@ -42,7 +45,7 @@ export function SessionsPanel(props: SessionsPanelProps) {
       </header>
       {sessions.length === 0 ? (
         <p className="empty" data-testid="sessions-empty">
-          没有会话。新建一个即可开始；Host 重启后这里会重新变空。
+          没有会话。新建一个即可开始。
         </p>
       ) : (
         <ul className="sessions">
@@ -58,9 +61,9 @@ export function SessionsPanel(props: SessionsPanelProps) {
                   data-selected={selected ? "true" : "false"}
                   onClick={() => props.onSelect(session.sessionId)}
                 >
-                  <span className="session__label">会话 {shortId(session.sessionId)}</span>
+                  <span className="session__label">{session.title}</span>
                   <span className="session__meta">
-                    {formatClock(session.createdAt)}
+                    {formatClock(session.updatedAt)}
                     {session.status === "blocked" ? " · 已阻塞" : ""}
                     {session.activeRunId !== null ? " · 运行中" : ""}
                   </span>
@@ -70,6 +73,18 @@ export function SessionsPanel(props: SessionsPanelProps) {
           })}
         </ul>
       )}
+      {page !== undefined && (page.hasMore || page.nextCursor !== null) && (
+        <p className="panel__note" data-testid="sessions-window">
+          仅显示最近的 {sessions.length} 个会话；更早的会话仍在 Host 上（
+          {props.durable ? "durable 存储" : "本次进程内存中"}）。
+        </p>
+      )}
+      {page !== undefined && !page.hasMore && page.nextCursor === null && (
+        <p className="panel__note" data-testid="sessions-complete">
+          共 {sessions.length} 个会话（{props.durable ? "durable 存储" : "本次进程内存中"}）。
+        </p>
+      )}
     </section>
   );
 }
+

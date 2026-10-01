@@ -13,13 +13,12 @@ import { describe, expect, it } from "vitest";
 
 import { ClientError, type Client, type ClientSnapshot } from "@every-dagent/client";
 import type {
-  CanonicalItem,
   HostSnapshot,
   OperationMap,
   PluginSummary,
   ProtocolErrorCode,
   RunSnapshot,
-  SessionSnapshot,
+  SessionSummary,
 } from "@every-dagent/protocol";
 
 import { createShellControllerWith, explainError, normalizedOrigin } from "../src/browser/controller.js";
@@ -27,8 +26,22 @@ import { memorySelectionStorage } from "../src/browser/selection.js";
 
 const INSTANCE = "host-instance-a";
 
-function sessionFixture(sessionId: string, canonical: readonly CanonicalItem[] = []): SessionSnapshot {
-  return { sessionId, createdAt: 1_700_000_000_000, status: "ready", activeRunId: null, canonical };
+const STORAGE = { storageId: "storage-1", retention: "ephemeral" as const, schemaVersion: 1 };
+
+function sessionFixture(sessionId: string): SessionSummary {
+  return {
+    sessionId,
+    generation: 1,
+    title: `会话 ${sessionId}`,
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_000,
+    status: "ready",
+    blockedReason: null,
+    metadataRevision: 0,
+    historyRevision: 0,
+    committedSeq: 0,
+    activeRunId: null,
+  };
 }
 
 function pluginFixture(id: string, status: PluginSummary["status"] = "disabled"): PluginSummary {
@@ -36,19 +49,46 @@ function pluginFixture(id: string, status: PluginSummary["status"] = "disabled")
 }
 
 function runFixture(runId: string, sessionId: string, status: RunSnapshot["status"] = "completed"): RunSnapshot {
-  const base = { runId, submissionId: `sub-${runId}`, sessionId, text: "hi", turnId: null, cancelRequested: false };
+  const base = {
+    runId,
+    submissionId: `sub-${runId}`,
+    sessionId,
+    text: "hi",
+    turnId: null,
+    cancelRequested: false,
+    acceptedAt: 1_700_000_000_000,
+    startedAt: null,
+    endedAt: null,
+  };
   switch (status) {
     case "accepted":
+      return { ...base, status: "accepted", endReason: null, error: null, executionKnowledge: null, live: [], liveTruncated: false };
     case "running":
-      return { ...base, status, endReason: null, error: null, live: [] };
+      return { ...base, status: "running", endReason: null, error: null, executionKnowledge: null, live: [], liveTruncated: false };
     case "completed":
-      return { ...base, status: "completed", endReason: "completed", error: null, live: null };
+      return { ...base, status: "completed", endReason: "completed", error: null, executionKnowledge: null, live: null };
     case "limited":
-      return { ...base, status: "limited", endReason: "max_steps", error: null, live: null };
+      return { ...base, status: "limited", endReason: "max_steps", error: null, executionKnowledge: null, live: null };
     case "cancelled":
-      return { ...base, status: "cancelled", endReason: "cancelled", error: null, live: null };
+      return { ...base, status: "cancelled", endReason: "cancelled", error: null, executionKnowledge: null, live: null };
     case "failed":
-      return { ...base, status: "failed", endReason: "error", error: { code: "INTERNAL_ERROR", message: "it failed" }, live: null };
+      return {
+        ...base,
+        status: "failed",
+        endReason: "error",
+        error: { code: "INTERNAL_ERROR", message: "it failed" },
+        executionKnowledge: null,
+        live: null,
+      };
+    case "interrupted":
+      return {
+        ...base,
+        status: "interrupted",
+        endReason: "interrupted",
+        error: null,
+        executionKnowledge: "unknown",
+        live: null,
+      };
   }
 }
 
@@ -56,8 +96,10 @@ function presentationFixture(parts: Partial<HostSnapshot> = {}): HostSnapshot {
   return {
     hostInstanceId: INSTANCE,
     watermark: { streamId: "stream-1", sequence: 3 },
-    sessions: [],
-    runs: [],
+    storage: STORAGE,
+    collections: { sessions: 1, runs: 1, plugins: 1 },
+    sessions: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
+    runs: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
     plugins: [],
     ...parts,
   };
@@ -67,16 +109,37 @@ function snapshotFixture(parts: Partial<ClientSnapshot> = {}): ClientSnapshot {
   const base: ClientSnapshot = {
     status: "ready",
     description: {
-      protocolVersion: "1",
+      protocolVersion: "2",
       hostInstanceId: INSTANCE,
       host: { name: "every-dagent-host", version: "0.1.0" },
-      capabilities: { sessions: true, runs: true, plugins: true, subscriptions: true, reverseRequests: false },
+      storage: STORAGE,
+      capabilities: {
+        sessions: true,
+        runs: true,
+        plugins: true,
+        subscriptions: true,
+        reverseRequests: false,
+        historyPages: true,
+        sessionMutations: true,
+        settings: false,
+        approvals: false,
+      },
       clientCapabilities: { reverseRequests: true },
-      limits: { maxActiveRuns: 1 },
-      retention: "host-lifetime",
+      limits: {
+        maxActiveRuns: 1,
+        maxInputBytes: 65536,
+        maxRecordBytes: 262144,
+        maxPageItems: 50,
+        maxPageBytes: 196608,
+        maxFrameBytes: 262144,
+        maxOutboxBytes: 1048576,
+        maxTitleChars: 200,
+      },
     },
     presentation: presentationFixture(),
     presentationHost: "current",
+    live: {},
+    history: {},
     stale: false,
     error: null,
   };
@@ -153,7 +216,9 @@ class FakeClient implements Client {
   readonly sessions = {
     list: (): Promise<OperationMap["sessions.list"]["result"]> => {
       this.calls.push({ method: "sessions.list", params: {} });
-      return Promise.resolve({ sessions: [] });
+      return Promise.resolve({
+        sessions: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
+      });
     },
     create: (): Promise<OperationMap["sessions.create"]["result"]> => {
       this.calls.push({ method: "sessions.create", params: {} });
@@ -163,6 +228,18 @@ class FakeClient implements Client {
     },
     get: (params: OperationMap["sessions.get"]["params"]): Promise<OperationMap["sessions.get"]["result"]> => {
       this.calls.push({ method: "sessions.get", params });
+      return Promise.reject(new Error("not used"));
+    },
+    history: (params: OperationMap["sessions.history"]["params"]): Promise<OperationMap["sessions.history"]["result"]> => {
+      this.calls.push({ method: "sessions.history", params });
+      return Promise.reject(new Error("not used"));
+    },
+    rename: (params: OperationMap["sessions.rename"]["params"]): Promise<OperationMap["sessions.rename"]["result"]> => {
+      this.calls.push({ method: "sessions.rename", params });
+      return Promise.reject(new Error("not used"));
+    },
+    delete: (params: OperationMap["sessions.delete"]["params"]): Promise<OperationMap["sessions.delete"]["result"]> => {
+      this.calls.push({ method: "sessions.delete", params });
       return Promise.reject(new Error("not used"));
     },
   };
@@ -175,6 +252,10 @@ class FakeClient implements Client {
     get: (params: OperationMap["runs.get"]["params"]): Promise<OperationMap["runs.get"]["result"]> => {
       this.calls.push({ method: "runs.get", params });
       return this.onRunGet === undefined ? Promise.reject(new Error("no get behaviour")) : this.onRunGet(params);
+    },
+    list: (params: OperationMap["runs.list"]["params"]): Promise<OperationMap["runs.list"]["result"]> => {
+      this.calls.push({ method: "runs.list", params });
+      return Promise.resolve({ runs: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false } });
     },
     cancel: (params: OperationMap["runs.cancel"]["params"]): Promise<OperationMap["runs.cancel"]["result"]> => {
       this.calls.push({ method: "runs.cancel", params });

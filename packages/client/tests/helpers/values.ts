@@ -12,21 +12,39 @@ import type {
   LiveItem,
   LiveToolItem,
   PluginSummary,
-  RunSnapshot,
-  SessionSnapshot,
+  RunSummary,
+  SessionSummary,
+  SessionSummaryPage,
   TerminalRunSnapshot,
 } from "@every-dagent/protocol";
 import { decodeFrame, validateMessage } from "@every-dagent/protocol";
 
-export function sessionSnapshot(
-  overrides: Partial<SessionSnapshot> & { readonly sessionId: string },
-): SessionSnapshot {
+/** One session summary: a fresh identity with no history and no active run. */
+export function sessionSummary(
+  overrides: Partial<SessionSummary> & { readonly sessionId: string },
+): SessionSummary {
   return Object.freeze({
+    generation: 1,
+    title: `Session ${overrides.sessionId}`,
     createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_000,
     status: "ready" as const,
+    blockedReason: null,
+    metadataRevision: 1,
+    historyRevision: 0,
+    committedSeq: 0,
     activeRunId: null,
-    canonical: Object.freeze([]),
     ...overrides,
+  });
+}
+
+/** One bounded page holding exactly the sessions given. */
+export function sessionPage(items: readonly SessionSummary[]): SessionSummaryPage {
+  return Object.freeze({
+    items: Object.freeze([...items]),
+    collectionRevision: 1,
+    nextCursor: null,
+    hasMore: false,
   });
 }
 
@@ -41,10 +59,15 @@ export function activeRun(
     text: "hello",
     turnId: null,
     cancelRequested: false,
+    acceptedAt: 1_700_000_000_000,
+    startedAt: null,
+    endedAt: null,
     status: "accepted" as const,
     endReason: null,
     error: null,
+    executionKnowledge: null,
     live: Object.freeze([]),
+    liveTruncated: false,
     ...overrides,
   });
 }
@@ -56,7 +79,7 @@ export function runningRun(
     readonly submissionId: string;
   },
 ): ActiveRunSnapshot {
-  return activeRun({ ...overrides, status: "running" as const });
+  return activeRun({ startedAt: 1_700_000_000_001, ...overrides, status: "running" as const });
 }
 
 export function completedRun(input: {
@@ -73,9 +96,13 @@ export function completedRun(input: {
     text: input.text ?? "hello",
     turnId: input.turnId ?? "turn-1",
     cancelRequested: false,
+    acceptedAt: 1_700_000_000_000,
+    startedAt: 1_700_000_000_001,
+    endedAt: 1_700_000_000_002,
     status: "completed" as const,
     endReason: "completed" as const,
     error: null,
+    executionKnowledge: null,
     live: null,
   });
 }
@@ -144,14 +171,14 @@ export function eventsOf(frames: readonly string[]): readonly { readonly type: s
 }
 
 /** Finds one run in a snapshot, by id. */
-export function runIn(runs: readonly RunSnapshot[], runId: string): RunSnapshot | undefined {
+export function runIn(runs: readonly RunSummary[], runId: string): RunSummary | undefined {
   return runs.find((run) => run.runId === runId);
 }
 
 /** Finds one session in a snapshot, by id. */
 export function sessionIn(
-  sessions: readonly SessionSnapshot[],
+  sessions: readonly SessionSummary[],
   sessionId: string,
-): SessionSnapshot | undefined {
+): SessionSummary | undefined {
   return sessions.find((session) => session.sessionId === sessionId);
 }

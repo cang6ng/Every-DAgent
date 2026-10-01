@@ -68,7 +68,7 @@ describe("the wire error a client publishes", () => {
     scenario.host.sendRaw(
       JSON.stringify({
         kind: "host-response",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: scenario.host.hostInstanceId,
         requestId: scenario.host.requestIdOf("subscriptions.open", 1) ?? "",
         error: source,

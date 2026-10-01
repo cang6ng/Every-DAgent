@@ -15,7 +15,7 @@ import { createClient } from "@every-dagent/client";
 import { createCalculatorPlugin } from "@every-dagent/plugin-calculator";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createHostPlatform, waitFor } from "../helpers/platform.js";
+import { createHostPlatform, runSettled, waitFor } from "../helpers/platform.js";
 import { scriptedModel, textReply, toolReply } from "../helpers/demo-fixtures.js";
 
 const open: { close(): Promise<void> }[] = [];
@@ -43,16 +43,15 @@ async function accept(modelClient: ModelClient, submissionId: string): Promise<O
   await client.connect();
   await client.plugins.enable({ pluginId: "calculator" });
   const { session } = await client.sessions.create();
-  await client.runs.start({ sessionId: session.sessionId, submissionId, text: "6*7 是多少" });
+  const started = await client.runs.start({ sessionId: session.sessionId, submissionId, text: "6*7 是多少" });
 
-  await waitFor(
-    () =>
-      client.getSnapshot().presentation?.runs.some((run) => run.status === "completed") === true &&
-      client.getSnapshot().presentation?.sessions[0]?.canonical.some((item) => item.kind === "assistant") === true,
-    { what: "the run to settle", timeoutMs: 5000 },
-  );
+  await waitFor(() => runSettled(client.getSnapshot(), started.run.runId), {
+    what: "the run to settle",
+    timeoutMs: 5000,
+  });
 
-  const canonical = client.getSnapshot().presentation?.sessions[0]?.canonical ?? [];
+  // The settled turn is read the v2 way: one bounded page of committed history.
+  const canonical = (await client.sessions.history({ sessionId: session.sessionId })).page.items;
   const result = canonical.find((item) => item.kind === "tool-result");
   // A step that only asked for a tool records an empty assistant message, so
   // the answered one is the last assistant item, not the first.

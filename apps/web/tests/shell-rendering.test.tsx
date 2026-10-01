@@ -12,8 +12,16 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import type { ClientSnapshot } from "@every-dagent/client";
-import type { CanonicalItem, LiveItem, PluginSummary, RunSnapshot, SessionSnapshot } from "@every-dagent/protocol";
+import type { ClientSnapshot, HistoryCoverage } from "@every-dagent/client";
+import type {
+  ActiveRunSnapshot,
+  CanonicalItem,
+  HostSnapshot,
+  LiveItem,
+  PluginSummary,
+  RunSummary,
+  SessionSummary,
+} from "@every-dagent/protocol";
 
 import { App } from "../src/browser/App.js";
 import { ConnectionPanel } from "../src/browser/ConnectionPanel.js";
@@ -29,6 +37,8 @@ import { memorySelectionStorage } from "../src/browser/selection.js";
 
 const INSTANCE = "instance-abcdefgh";
 
+const DURABLE_STORAGE = { storageId: "storage-1", retention: "durable" as const, schemaVersion: 1 };
+
 function uiState(parts: Partial<ShellUiState> = {}): ShellUiState {
   return {
     bindingOrigin: "http://127.0.0.1:4100",
@@ -37,8 +47,22 @@ function uiState(parts: Partial<ShellUiState> = {}): ShellUiState {
     startingRun: false,
     cancellingRunId: null,
     pluginPending: {},
+    historyLoading: false,
     notices: [],
     unknownWrites: [],
+    ...parts,
+  };
+}
+
+function presentation(parts: Partial<HostSnapshot> = {}): HostSnapshot {
+  return {
+    hostInstanceId: INSTANCE,
+    watermark: { streamId: "s", sequence: 1 },
+    storage: DURABLE_STORAGE,
+    collections: { sessions: 1, runs: 1, plugins: 1 },
+    sessions: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
+    runs: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
+    plugins: [],
     ...parts,
   };
 }
@@ -47,33 +71,80 @@ function snapshot(parts: Partial<ClientSnapshot> = {}): ClientSnapshot {
   const base: ClientSnapshot = {
     status: "ready",
     description: {
-      protocolVersion: "1",
+      protocolVersion: "2",
       hostInstanceId: INSTANCE,
       host: { name: "every-dagent-host", version: "0.1.0" },
-      capabilities: { sessions: true, runs: true, plugins: true, subscriptions: true, reverseRequests: false },
+      storage: DURABLE_STORAGE,
+      capabilities: {
+        sessions: true,
+        runs: true,
+        plugins: true,
+        subscriptions: true,
+        reverseRequests: false,
+        historyPages: true,
+        sessionMutations: true,
+        settings: false,
+        approvals: false,
+      },
       clientCapabilities: { reverseRequests: true },
-      limits: { maxActiveRuns: 1 },
-      retention: "host-lifetime",
+      limits: {
+        maxActiveRuns: 1,
+        maxInputBytes: 65536,
+        maxRecordBytes: 262144,
+        maxPageItems: 50,
+        maxPageBytes: 196608,
+        maxFrameBytes: 262144,
+        maxOutboxBytes: 1048576,
+        maxTitleChars: 200,
+      },
     },
-    presentation: {
-      hostInstanceId: INSTANCE,
-      watermark: { streamId: "s", sequence: 1 },
-      sessions: [],
-      runs: [],
-      plugins: [],
-    },
+    presentation: presentation(),
     presentationHost: "current",
+    live: {},
+    history: {},
     stale: false,
     error: null,
   };
   return { ...base, ...parts };
 }
 
-function session(parts: Partial<SessionSnapshot> = {}): SessionSnapshot {
-  return { sessionId: "session-1", createdAt: 1_700_000_000_000, status: "ready", activeRunId: null, canonical: [], ...parts };
+function session(parts: Partial<SessionSummary> = {}): SessionSummary {
+  return {
+    sessionId: "session-1",
+    generation: 1,
+    title: "会话 session-1",
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_000,
+    status: "ready",
+    blockedReason: null,
+    metadataRevision: 0,
+    historyRevision: 1,
+    committedSeq: 4,
+    activeRunId: null,
+    ...parts,
+  };
 }
 
-function activeRun(parts: Partial<RunSnapshot> = {}): RunSnapshot {
+/** What the client has read of one session's history, as `Conversation` takes it. */
+function coverage(items: readonly CanonicalItem[], parts: Partial<HistoryCoverage> = {}): HistoryCoverage {
+  return {
+    storageId: "storage-1",
+    sessionId: "session-1",
+    generation: 1,
+    historyRevision: 1,
+    fenceSeq: 4,
+    fromSeq: 0,
+    toSeq: 4,
+    atStart: true,
+    atFence: true,
+    behind: false,
+    nextCursor: null,
+    items,
+    ...parts,
+  };
+}
+
+function activeRun(parts: Partial<ActiveRunSnapshot> = {}): ActiveRunSnapshot {
   const base = {
     runId: "run-1",
     submissionId: "sub-1",
@@ -81,8 +152,33 @@ function activeRun(parts: Partial<RunSnapshot> = {}): RunSnapshot {
     text: "算一下",
     turnId: null,
     cancelRequested: false,
+    acceptedAt: 1_700_000_000_000,
+    startedAt: 1_700_000_000_000,
+    endedAt: null,
+    live: [],
+    liveTruncated: false,
   };
-  return { ...base, status: "running", endReason: null, error: null, live: [], ...parts } as RunSnapshot;
+  return { ...base, status: "running", endReason: null, error: null, executionKnowledge: null, ...parts };
+}
+
+/** The durable summary a settled run is shown by, once its timeline is gone. */
+function runSummary(parts: Partial<RunSummary> = {}): RunSummary {
+  return {
+    runId: "run-1",
+    submissionId: "sub-1",
+    sessionId: "session-1",
+    text: "算一下",
+    turnId: null,
+    cancelRequested: false,
+    acceptedAt: 1_700_000_000_000,
+    startedAt: 1_700_000_000_000,
+    endedAt: 1_700_000_000_000,
+    status: "completed",
+    endReason: "completed",
+    error: null,
+    executionKnowledge: null,
+    ...parts,
+  };
 }
 
 const noop = (): void => undefined;
@@ -151,10 +247,10 @@ describe("the connection chip and panel", () => {
 
 describe("the conversation", () => {
   const canonical: readonly CanonicalItem[] = [
-    { id: "item-1", turnId: "turn-1", kind: "user", text: "算一下 6*7" },
-    { id: "item-2", turnId: "turn-1", kind: "tool-call", invocationId: "inv-1", callId: "call-1", name: "calculator", input: { kind: "json", value: { a: 6, b: 7 } } },
-    { id: "item-3", turnId: "turn-1", kind: "tool-result", invocationId: "inv-1", callId: "call-1", name: "calculator", ok: true, content: "42" },
-    { id: "item-4", turnId: "turn-1", kind: "assistant", text: "结果是 42。" },
+    { id: "item-1", turnId: "turn-1", seq: 0, kind: "user", text: "算一下 6*7" },
+    { id: "item-2", turnId: "turn-1", seq: 1, kind: "tool-call", invocationId: "inv-1", callId: "call-1", name: "calculator", input: { kind: "json", value: { a: 6, b: 7 } } },
+    { id: "item-3", turnId: "turn-1", seq: 2, kind: "tool-result", invocationId: "inv-1", callId: "call-1", name: "calculator", ok: true, content: "42" },
+    { id: "item-4", turnId: "turn-1", seq: 3, kind: "assistant", text: "结果是 42。" },
   ];
 
   it("renders history and labels the live area as live", () => {
@@ -163,7 +259,14 @@ describe("the conversation", () => {
       { kind: "tool", itemId: "live-2", invocationId: "inv-2", callId: "", name: "calculator", input: { kind: "json", value: { a: 1, b: 2 } }, result: null },
     ];
     const markup = renderToStaticMarkup(
-      <Conversation session={session({ canonical, activeRunId: "run-1" })} activeRun={activeRun({ live })} />,
+      <Conversation
+        session={session({ activeRunId: "run-1" })}
+        coverage={coverage(canonical)}
+        activeRun={activeRun({ live })}
+        loading={false}
+        onLoadOlder={noop}
+        onLoadNewer={noop}
+      />,
     );
 
     expect(markup).toContain("data-testid=\"msg-user\"");
@@ -178,11 +281,30 @@ describe("the conversation", () => {
     expect(markup).toContain("（空）");
   });
 
+  it("says a conversation that has not been read yet is unread, not empty", () => {
+    // The absence of coverage is a fact of its own: nothing has been read,
+    // which is not the same as the session having no recorded messages.
+    const markup = renderToStaticMarkup(
+      <Conversation session={session()} coverage={null} activeRun={null} loading={false} onLoadOlder={noop} onLoadNewer={noop} />,
+    );
+    expect(markup).toContain("data-testid=\"history-unloaded\"");
+    expect(markup).toContain("尚未读取该会话的历史");
+  });
+
   it("keeps a blocked session readable but says it cannot continue", () => {
     const markup = renderToStaticMarkup(
-      <Conversation session={session({ status: "blocked", canonical })} activeRun={null} />,
+      <Conversation
+        session={session({ status: "blocked", blockedReason: "unknown-execution" })}
+        coverage={coverage(canonical)}
+        activeRun={null}
+        loading={false}
+        onLoadOlder={noop}
+        onLoadNewer={noop}
+      />,
     );
     expect(markup).toContain("data-testid=\"blocked-banner\"");
+    // The banner names the reason the host gave, not a generic "blocked".
+    expect(markup).toContain("无法确认是否已经产生副作用");
     expect(markup).toContain("结果是 42。");
   });
 
@@ -210,12 +332,19 @@ describe("the conversation", () => {
 
 describe("the run strip", () => {
   it("offers cancel while active and stops offering it once requested", () => {
-    const active = renderToStaticMarkup(<RunStrip run={activeRun()} cancelling={false} canWrite onCancel={noop} />);
+    const active = renderToStaticMarkup(
+      <RunStrip run={runSummary({ status: "running", endReason: null, endedAt: null })} cancelling={false} canWrite onCancel={noop} />,
+    );
     expect(active).toContain("运行中");
     expect(active).toContain("data-testid=\"cancel-button\"");
 
     const requested = renderToStaticMarkup(
-      <RunStrip run={activeRun({ cancelRequested: true })} cancelling={false} canWrite onCancel={noop} />,
+      <RunStrip
+        run={runSummary({ status: "running", endReason: null, endedAt: null, cancelRequested: true })}
+        cancelling={false}
+        canWrite
+        onCancel={noop}
+      />,
     );
     expect(requested).toContain("data-testid=\"cancel-requested\"");
     expect(requested).not.toContain("data-testid=\"cancel-button\"");
@@ -225,14 +354,14 @@ describe("the run strip", () => {
 
   it("never describes a limited or cancelled run as a completion", () => {
     const limited = renderToStaticMarkup(
-      <RunStrip run={{ ...(activeRun() as object), status: "limited", endReason: "max_steps", error: null, live: null } as RunSnapshot} cancelling={false} canWrite onCancel={noop} />,
+      <RunStrip run={runSummary({ status: "limited", endReason: "max_steps" })} cancelling={false} canWrite onCancel={noop} />,
     );
     expect(limited).toContain("达到步数上限");
     expect(limited).toContain("不是一次完整回答");
     expect(limited).not.toContain("已完成");
 
     const cancelled = renderToStaticMarkup(
-      <RunStrip run={{ ...(activeRun() as object), status: "cancelled", endReason: "cancelled", error: null, live: null } as RunSnapshot} cancelling={false} canWrite onCancel={noop} />,
+      <RunStrip run={runSummary({ status: "cancelled", endReason: "cancelled" })} cancelling={false} canWrite onCancel={noop} />,
     );
     expect(cancelled).toContain("不会因此回滚");
   });
@@ -240,7 +369,11 @@ describe("the run strip", () => {
   it("shows a failed run's safe error", () => {
     const failed = renderToStaticMarkup(
       <RunStrip
-        run={{ ...(activeRun() as object), status: "failed", endReason: "error", error: { code: "INTERNAL_ERROR", message: "it failed" }, live: null } as RunSnapshot}
+        run={runSummary({
+          status: "failed",
+          endReason: "error",
+          error: { code: "INTERNAL_ERROR", message: "it failed" },
+        })}
         cancelling={false}
         canWrite
         onCancel={noop}
@@ -248,6 +381,33 @@ describe("the run strip", () => {
     );
     expect(failed).toContain("data-testid=\"run-error\"");
     expect(failed).toContain("INTERNAL_ERROR");
+  });
+
+  it("describes an interrupted run by what the record can prove", () => {
+    // `interrupted` is its own terminal: a previous host stopped without
+    // committing an outcome. An execution that was never observed running is
+    // provably not-started; one with a running marker cannot be called either way.
+    const notStarted = renderToStaticMarkup(
+      <RunStrip
+        run={runSummary({ status: "interrupted", endReason: "interrupted", executionKnowledge: "not-started" })}
+        cancelling={false}
+        canWrite
+        onCancel={noop}
+      />,
+    );
+    expect(notStarted).toContain("已中断");
+    expect(notStarted).toContain("可以确认它没有被执行");
+
+    const unknown = renderToStaticMarkup(
+      <RunStrip
+        run={runSummary({ status: "interrupted", endReason: "interrupted", executionKnowledge: "unknown" })}
+        cancelling={false}
+        canWrite
+        onCancel={noop}
+      />,
+    );
+    expect(unknown).toContain("无法确认是否已经产生副作用");
+    expect(unknown).not.toContain("可以确认它没有被执行");
   });
 });
 
@@ -267,7 +427,7 @@ describe("the plugin panel", () => {
 
   it("offers the one operation each state actually has", () => {
     const markup = renderToStaticMarkup(
-      <PluginsPanel snapshot={snapshot({ presentation: { hostInstanceId: INSTANCE, watermark: { streamId: "s", sequence: 1 }, sessions: [], runs: [], plugins } })} ui={uiState()} canWrite hostBusy={false} onSetEnabled={noop} />,
+      <PluginsPanel snapshot={snapshot({ presentation: presentation({ plugins }) })} ui={uiState()} canWrite hostBusy={false} onSetEnabled={noop} />,
     );
     expect(markup).toContain("data-testid=\"plugin-enable\" data-plugin-id=\"calculator\"");
     expect(markup).toContain("data-testid=\"plugin-disable\" data-plugin-id=\"text-stats\"");
@@ -280,7 +440,7 @@ describe("the plugin panel", () => {
 
   it("explains a busy host instead of hiding the buttons' reason", () => {
     const markup = renderToStaticMarkup(
-      <PluginsPanel snapshot={snapshot({ presentation: { hostInstanceId: INSTANCE, watermark: { streamId: "s", sequence: 1 }, sessions: [], runs: [], plugins } })} ui={uiState()} canWrite hostBusy onSetEnabled={noop} />,
+      <PluginsPanel snapshot={snapshot({ presentation: presentation({ plugins }) })} ui={uiState()} canWrite hostBusy onSetEnabled={noop} />,
     );
     expect(markup).toContain("data-testid=\"plugins-busy\"");
     expect(markup).toContain("disabled");
@@ -295,7 +455,7 @@ describe("the plugin panel", () => {
     ];
     const markup = renderToStaticMarkup(
       <PluginsPanel
-        snapshot={snapshot({ presentation: { hostInstanceId: INSTANCE, watermark: { streamId: "s", sequence: 1 }, sessions: [], runs: [], plugins: inherited } })}
+        snapshot={snapshot({ presentation: presentation({ plugins: inherited }) })}
         ui={uiState()}
         canWrite
         hostBusy={false}
@@ -420,8 +580,22 @@ describe("the host panel and the whole shell", () => {
         getSnapshot: () => disconnected,
         getState: () => disconnected,
         subscribe: () => () => undefined,
-        sessions: { list: async () => ({ sessions: [] }), create: async () => ({ session: session() }), get: async () => ({ session: session() }) },
-        runs: { start: async () => ({ run: activeRun() }), get: async () => ({ run: activeRun() }), cancel: async () => ({ run: activeRun() }) },
+        sessions: {
+          list: async () => ({ sessions: presentation().sessions }),
+          create: async () => ({ session: session() }),
+          get: async () => ({ session: session() }),
+          history: async () => {
+            throw new Error("nothing is read here");
+          },
+          rename: async () => ({ session: session() }),
+          delete: async () => ({ sessionId: "session-1", generation: 1, deleted: true as const }),
+        },
+        runs: {
+          start: async () => ({ run: activeRun() }),
+          get: async () => ({ run: activeRun() }),
+          list: async () => ({ runs: presentation().runs }),
+          cancel: async () => ({ run: activeRun() }),
+        },
         plugins: { list: async () => ({ plugins: [] }), enable: async () => ({ plugin: plugins0() }), disable: async () => ({ plugin: plugins0() }) },
       },
       { storage: memorySelectionStorage(), initialBinding: null },

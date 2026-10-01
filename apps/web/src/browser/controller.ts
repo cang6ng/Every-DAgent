@@ -58,6 +58,8 @@ export interface ShellUiState {
   /** The run whose cancel request is in flight, if any. */
   readonly cancellingRunId: string | null;
   readonly pluginPending: Readonly<Record<string, "enable" | "disable">>;
+  /** True while a history page for the selected session is being read. */
+  readonly historyLoading: boolean;
   readonly notices: readonly Notice[];
   readonly unknownWrites: readonly UnknownWrite[];
 }
@@ -83,6 +85,12 @@ export interface ShellActions {
   checkUnknown(unknownId: string): Promise<void>;
   /** Re-sends the *same* start submission, letting host dedup decide, on the user's explicit ask. */
   resubmitUnknownStart(unknownId: string): Promise<void>;
+  /** Reads the newest history page of one session, if it is not already loaded. */
+  ensureHistory(sessionId: string): Promise<void>;
+  /** Reads the next older page inside the loaded fence. */
+  loadOlderHistory(sessionId: string): Promise<void>;
+  /** Re-reads the newest page, starting a new fence over the current history. */
+  reloadHistory(sessionId: string): Promise<void>;
   /** Re-synchronizes the presentation (a fresh snapshot replaces the old one). */
   refresh(): Promise<void>;
   dismissUnknown(unknownId: string): void;
@@ -128,6 +136,12 @@ const REMOTE_HINTS: Readonly<Record<ProtocolErrorCode, string>> = Object.freeze(
   PLUGIN_PERMISSION_DENIED: "插件权限被拒绝",
   PLUGIN_OPERATION_FAILED: "插件操作失败",
   SUBMISSION_CONFLICT: "提交标识冲突",
+  SUBMISSION_RETIRED: "该提交所属的会话已被删除，不能重用",
+  STALE_CURSOR: "分页游标对应的集合版本已经变化，请重新读取",
+  REVISION_CONFLICT: "会话在你读取之后已经变化，请刷新后重试",
+  LIMIT_EXCEEDED: "超过 Host 的大小或预算限制",
+  SETTINGS_INVALID: "设置不符合 Host 接受的 schema",
+  STORAGE_UNAVAILABLE: "持久存储不可用：写入未被确认",
   REQUEST_CANCELLED: "请求已被取消",
   INTERNAL_ERROR: "Host 内部错误",
 });
@@ -220,6 +234,7 @@ function createController(internals: ControllerInternals): ShellController {
     startingRun: false,
     cancellingRunId: null,
     pluginPending: Object.freeze<Record<string, "enable" | "disable">>({}),
+    historyLoading: false,
     notices: Object.freeze([]) as readonly Notice[],
     unknownWrites: Object.freeze([]) as readonly UnknownWrite[],
   });
@@ -277,6 +292,29 @@ function createController(internals: ControllerInternals): ShellController {
       return;
     }
     addNotice("error", explainError(error));
+  }
+
+  /**
+   * One history read, with the shell's own bookkeeping around it.
+   *
+   * The client records the page as loaded where the answer arrives; this only
+   * tracks that a read is in flight and reports a refusal in the user's words. A
+   * failed read changes nothing about what is loaded, and the gap it was meant
+   * to fill stays visible.
+   */
+  async function loadPage(sessionId: string, params: { readonly cursor?: string }): Promise<void> {
+    if (state.historyLoading) return;
+    set({ historyLoading: true });
+    try {
+      await client.sessions.history({
+        sessionId,
+        ...(params.cursor === undefined ? {} : { cursor: params.cursor }),
+      });
+    } catch (error) {
+      addNotice("error", explainError(error));
+    } finally {
+      set({ historyLoading: false });
+    }
   }
 
   return {
@@ -489,6 +527,32 @@ function createController(internals: ControllerInternals): ShellController {
         }
         addNotice("error", explainError(error));
       }
+    },
+
+    async ensureHistory(sessionId: string): Promise<void> {
+      const snapshot = client.getSnapshot();
+      const coverage = Object.hasOwn(snapshot.history, sessionId) ? snapshot.history[sessionId] : undefined;
+      if (coverage !== undefined && !coverage.behind) return;
+      // A coverage that has fallen behind the committed high-water is read
+      // again from the newest end: a later page inside the old fence would stop
+      // before the new turns, and stitching two fences would present a
+      // conversation nobody read.
+      if (coverage !== undefined && coverage.behind) {
+        await this.reloadHistory(sessionId);
+        return;
+      }
+      await loadPage(sessionId, {});
+    },
+
+    async loadOlderHistory(sessionId: string): Promise<void> {
+      const snapshot = client.getSnapshot();
+      const coverage = Object.hasOwn(snapshot.history, sessionId) ? snapshot.history[sessionId] : undefined;
+      if (coverage === undefined || coverage.nextCursor === null) return;
+      await loadPage(sessionId, { cursor: coverage.nextCursor });
+    },
+
+    async reloadHistory(sessionId: string): Promise<void> {
+      await loadPage(sessionId, {});
     },
 
     async refresh(): Promise<void> {

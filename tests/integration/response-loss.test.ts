@@ -10,7 +10,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { createClientOn, createHostPlatform, waitFor } from "../helpers/platform.js";
+import { createClientOn, createHostPlatform, liveOf, runSettled, waitFor } from "../helpers/platform.js";
 import {
   demoPlugin,
   gatedReply,
@@ -68,16 +68,15 @@ describe("a lost runs.start answer", () => {
     await client.reconnect();
 
     const recovered = await client.runs.get({ submissionId: SUBMISSION });
-    await waitFor(
-      () => client.getSnapshot().presentation?.runs.some((run) => run.runId === recovered.run.runId && run.live === null) === true,
-      { what: "the recovered run to settle" },
-    );
+    await waitFor(() => runSettled(client.getSnapshot(), recovered.run.runId), {
+      what: "the recovered run to settle",
+    });
 
     const outcome = await lost;
     expect(outcome).toMatchObject({ code: "CONNECTION_LOST", outcome: "unknown" });
     expect(fixtureCalls(model)).toBe(2); // one tool step and one answer step: exactly one run
     expect(demo.executions).toHaveLength(1);
-    expect(client.getSnapshot().presentation?.runs).toHaveLength(1);
+    expect(client.getSnapshot().presentation?.runs.items).toHaveLength(1);
 
     // Re-submitting the very same submission is the same submission.
     const again = await client.runs.start({
@@ -113,9 +112,10 @@ describe("a lost runs.start answer", () => {
       submissionId: "sub-away",
       text: "keep going without me",
     });
-    await waitFor(() => client.getSnapshot().presentation?.runs.some((run) => run.runId === started.run.runId) === true, {
-      what: "the run to be announced",
-    });
+    await waitFor(
+      () => client.getSnapshot().presentation?.runs.items.some((run) => run.runId === started.run.runId) === true,
+      { what: "the run to be announced" },
+    );
 
     client.disconnect();
 
@@ -126,12 +126,11 @@ describe("a lost runs.start answer", () => {
     });
 
     await client.reconnect();
-    await waitFor(
-      () => client.getSnapshot().presentation?.runs.some((run) => run.runId === started.run.runId && run.live === null) === true,
-      { what: "the finished run to appear after reconnecting" },
-    );
+    await waitFor(() => runSettled(client.getSnapshot(), started.run.runId), {
+      what: "the finished run to appear after reconnecting",
+    });
 
-    const run = client.getSnapshot().presentation?.runs.find((candidate) => candidate.runId === started.run.runId);
+    const run = client.getSnapshot().presentation?.runs.items.find((candidate) => candidate.runId === started.run.runId);
     expect(run?.status).toBe("completed");
     const sent = platform.carriers.flatMap((carrier) =>
       carrier.log.filter((entry) => entry.direction === "client-to-host").map((entry) => entry.frame),
@@ -149,7 +148,7 @@ describe("a lost runs.start answer", () => {
 
     const session = (await client.sessions.create()).session;
     await client.runs.start({ sessionId: session.sessionId, submissionId: "sub-old", text: "the first host's work" });
-    await waitFor(() => client.getSnapshot().presentation?.runs.length === 1, { what: "the run to appear" });
+    await waitFor(() => client.getSnapshot().presentation?.runs.items.length === 1, { what: "the run to appear" });
 
     // A second host: a different instance, with its own lifetime.
     const other = createHostPlatform({ modelClient: scriptedModel([textReply("other")]).client, plugins: [] });
@@ -160,7 +159,7 @@ describe("a lost runs.start answer", () => {
     expect(onOther.getSnapshot().description?.hostInstanceId).not.toBe(client.getSnapshot().description?.hostInstanceId);
     // The old submission means nothing here: nothing was executed for it.
     await expect(onOther.runs.get({ submissionId: "sub-old" })).rejects.toMatchObject({ code: "RUN_NOT_FOUND" });
-    expect(onOther.getSnapshot().presentation?.runs).toHaveLength(0);
+    expect(onOther.getSnapshot().presentation?.runs.items).toHaveLength(0);
     expect(sessionOnOther.sessionId).not.toBe(session.sessionId);
 
     await platform.shutdown();
@@ -184,23 +183,14 @@ describe("a lost runs.start answer", () => {
       text: "still running",
     });
     await waitFor(
-      () => client.getSnapshot().presentation?.runs.some((run) => run.runId === started.run.runId) === true,
+      () => client.getSnapshot().presentation?.runs.items.some((run) => run.runId === started.run.runId) === true,
       { what: "the run to be announced" },
     );
 
-    await waitFor(
-      () =>
-        client
-          .getSnapshot()
-          .presentation?.runs.some(
-            (candidate) => candidate.runId === started.run.runId && (candidate.live?.length ?? 0) > 0,
-          ) === true,
-      { what: "the live prefix to be visible before the disconnect" },
-    );
-    const beforeDisconnect = client
-      .getSnapshot()
-      .presentation?.runs.find((candidate) => candidate.runId === started.run.runId);
-    expect(beforeDisconnect?.live?.map((item) => (item.kind === "text" ? item.text : ""))).toEqual([
+    await waitFor(() => liveOf(client.getSnapshot(), started.run.runId).length > 0, {
+      what: "the live prefix to be visible before the disconnect",
+    });
+    expect(liveOf(client.getSnapshot(), started.run.runId).map((item) => (item.kind === "text" ? item.text : ""))).toEqual([
       "the beginning",
     ]);
 
@@ -209,17 +199,20 @@ describe("a lost runs.start answer", () => {
 
     // The same host keeps the live prefix, so the replica is whole again
     // without any event replay — and the prefix is the text that was really
-    // there, not a placeholder.
-    const run = client.getSnapshot().presentation?.runs.find((candidate) => candidate.runId === started.run.runId);
+    // there, not a placeholder. A cut carries summaries rather than drafts, so
+    // the timeline comes back through the run the snapshot names as active.
+    const run = client.getSnapshot().presentation?.runs.items.find((candidate) => candidate.runId === started.run.runId);
     expect(run?.status).toBe("running");
-    expect(run?.live?.map((item) => (item.kind === "text" ? item.text : ""))).toEqual(["the beginning"]);
+    await waitFor(() => liveOf(client.getSnapshot(), started.run.runId).length > 0, {
+      what: "the live prefix to come back after reconnecting",
+    });
+    expect(liveOf(client.getSnapshot(), started.run.runId).map((item) => (item.kind === "text" ? item.text : ""))).toEqual([
+      "the beginning",
+    ]);
 
     release?.();
-    await waitFor(
-      () => client.getSnapshot().presentation?.runs.some((candidate) => candidate.runId === started.run.runId && candidate.live === null) === true,
-      { what: "the run to settle" },
-    );
-    expect(client.getSnapshot().presentation?.runs[0]?.status).toBe("completed");
+    await waitFor(() => runSettled(client.getSnapshot(), started.run.runId), { what: "the run to settle" });
+    expect(client.getSnapshot().presentation?.runs.items[0]?.status).toBe("completed");
 
     await platform.shutdown();
   });
@@ -236,22 +229,19 @@ describe("a lost runs.start answer", () => {
       submissionId: "sub-draft",
       text: "draft something",
     });
-    await waitFor(
-      () =>
-        client
-          .getSnapshot()
-          .presentation?.runs.some((run) => run.runId === started.run.runId && (run.live?.length ?? 0) === 1) === true,
-      { what: "the draft to be visible" },
-    );
-    expect(client.getSnapshot().presentation?.runs[0]?.live).toHaveLength(1);
+    await waitFor(() => liveOf(client.getSnapshot(), started.run.runId).length === 1, {
+      what: "the draft to be visible",
+    });
+    expect(liveOf(client.getSnapshot(), started.run.runId)).toHaveLength(1);
 
     await client.runs.cancel({ runId: started.run.runId });
-    await waitFor(
-      () => client.getSnapshot().presentation?.runs.some((run) => run.runId === started.run.runId && run.live === null) === true,
-      { what: "the cancellation to settle" },
-    );
+    await waitFor(() => runSettled(client.getSnapshot(), started.run.runId), {
+      what: "the cancellation to settle",
+    });
 
-    const canonical = client.getSnapshot().presentation?.sessions[0]?.canonical ?? [];
+    // The committed history, read through a page: the cancelled turn left its
+    // input and nothing else — a draft is not history.
+    const canonical = (await client.sessions.history({ sessionId: session.sessionId })).page.items;
     expect(canonical.map((item) => item.kind)).toEqual(["user"]);
     expect(JSON.stringify(canonical)).not.toContain("a draft nobody should keep");
 

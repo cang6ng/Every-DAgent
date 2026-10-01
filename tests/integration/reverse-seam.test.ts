@@ -306,7 +306,12 @@ for (const carrier of ["memory", "web"] as const) {
       const attached = platform.attached[0];
       const outcome = await attached?.reverse.request(ECHO, { value: "while busy" }, 2000).outcome;
       expect(outcome).toEqual({ ok: true, result: { echoed: "while busy" } });
-      await expect(client.sessions.list()).resolves.toEqual({ sessions: [] });
+      // The read is answered too, as one bounded page that holds no session and
+      // promises no more of them.
+      const listed = await client.sessions.list();
+      expect(listed.sessions.items).toEqual([]);
+      expect(listed.sessions.hasMore).toBe(false);
+      expect(listed.sessions.nextCursor).toBeNull();
 
       release();
       await expect(enabling).resolves.toMatchObject({ plugin: { status: "enabled" } });

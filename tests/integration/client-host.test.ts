@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { createClientOn, createHostPlatform, waitFor } from "../helpers/platform.js";
+import { createClientOn, createHostPlatform, runSettled, waitFor } from "../helpers/platform.js";
 import {
   demoPlugin,
   partialThenAbortReply,
@@ -57,7 +57,7 @@ describe("the second client over memory", () => {
     const report = await fixture.cli();
 
     // Describe: the host's own identity and honest capabilities.
-    expect(report.description?.protocolVersion).toBe("1");
+    expect(report.description?.protocolVersion).toBe("2");
     expect(report.description?.capabilities).toMatchObject({
       sessions: true,
       runs: true,
@@ -140,15 +140,7 @@ describe("the second client over memory", () => {
       submissionId: "sub-once",
       text: "please use the tool",
     });
-    await waitFor(
-      () => {
-        const run = client
-          .getSnapshot()
-          .presentation?.runs.find((candidate) => candidate.runId === started.run.runId);
-        return run !== undefined && run.live === null;
-      },
-      { what: "the run to settle" },
-    );
+    await waitFor(() => runSettled(client.getSnapshot(), started.run.runId), { what: "the run to settle" });
 
     // The same payload under the same submission id is the *same* submission:
     // the host answers with the run it already has, and nothing runs twice.
@@ -163,6 +155,37 @@ describe("the second client over memory", () => {
     expect(bySubmission.run.runId).toBe(started.run.runId);
     expect(fixture.demo.executions).toHaveLength(1);
     expect(fixture.model.requests).toHaveLength(2);
+
+    await fixture.platform.shutdown();
+  });
+
+  it("describes a settled run to a client that arrives afterwards", async () => {
+    const fixture = scenario();
+    const first = createClientOn(fixture.platform);
+    await first.connect();
+    await first.plugins.enable({ pluginId: PLUGIN_ID });
+    const created = await first.sessions.create();
+    const started = await first.runs.start({
+      sessionId: created.session.sessionId,
+      submissionId: "sub-settled",
+      text: "please use the tool",
+    });
+    await waitFor(() => runSettled(first.getSnapshot(), started.run.runId), { what: "the run to settle" });
+
+    // The host now holds a terminal run, and the session has stopped pointing
+    // at it. A client joining here reads that state as a snapshot: the window
+    // must carry the committed, ended run — never a live-looking entry beside
+    // a session that says nothing is running.
+    const second = createClientOn(fixture.platform);
+    await second.connect();
+    expect(second.getSnapshot().status).toBe("ready");
+
+    const runs = second.getSnapshot().presentation?.runs.items ?? [];
+    expect(runs.map((run) => run.runId)).toEqual([started.run.runId]);
+    expect(runs[0]).toMatchObject({ status: "completed", endReason: "completed" });
+    expect(runs[0]?.endedAt).not.toBeNull();
+    expect(second.getSnapshot().presentation?.sessions.items[0]?.activeRunId).toBeNull();
+    expect(second.getSnapshot().live).toEqual({});
 
     await fixture.platform.shutdown();
   });

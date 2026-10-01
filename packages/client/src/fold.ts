@@ -1,35 +1,47 @@
 /**
- * The fold: what one validated event means for the presentation replica.
+ * The fold: what one validated event means for the client's replica.
  *
- * This module is pure. It reads the previous snapshot and one event, and returns
- * either the next snapshot or a reason the event cannot follow from the state
- * the client holds. It never sends anything, never consults the connection, and
+ * This module is pure. It reads the previous state and one event, and returns
+ * either the next state or a reason the event cannot follow from what the
+ * client holds. It never sends anything, never consults the connection, and
  * never repairs a gap by guessing: an event that does not fit its own history is
  * a peer error, not something to paper over.
  *
+ * Three replicas are folded separately, and deliberately so.
+ *
+ * The *directory* is a bounded window of session summaries and run summaries —
+ * what a subscriber gets, not a copy of the database. The *live* timelines are
+ * the drafts of runs that are still executing; they are not durable facts, they
+ * never become history, and they are forgotten the moment a run ends. The
+ * *history coverage* is what the client has actually read of each session's
+ * committed conversation, page by page, with the gaps it has not read left
+ * visible rather than filled in.
+ *
  * A single event's schema cannot describe history, so the checks here are about
  * *continuity*: which session a run belongs to, which stage it has reached, and
- * which identities it has already published. A frame that is individually valid
- * and still cannot follow from what was published before it is refused.
+ * which identities have already been published. A frame that is individually
+ * valid and still cannot follow from what was published before it is refused.
  *
  * Immutability is by construction: every node this module creates is frozen,
  * every node it reuses is already frozen, and the arrays it touches are copied
- * rather than edited — so an old snapshot can never change under a reader, and
- * an unchanged branch is shared instead of rebuilt.
+ * rather than edited.
  */
 
 import type {
   ActiveRunSnapshot,
-  DisplayInput,
+  CanonicalItem,
+  CollectionRevisions,
   EventScope,
+  HistoryPage,
   HostEvent,
   HostSnapshot,
+  Id,
   LiveItem,
   PluginSummary,
   RunSnapshot,
   RunStatus,
-  SessionSnapshot,
-  TerminalRunSnapshot,
+  RunSummary,
+  SessionSummary,
   Watermark,
 } from "@every-dagent/protocol";
 
@@ -38,6 +50,17 @@ import type { ProtocolViolationReason } from "./errors.js";
 export type FoldOutcome =
   | { readonly ok: true; readonly presentation: HostSnapshot }
   | { readonly ok: false; readonly reason: ProtocolViolationReason };
+
+/**
+ * How much of each bounded window the client keeps in memory.
+ *
+ * The host's windows are bounded; a client that appended every announcement to
+ * them would grow without limit over a long connection, which is the one thing
+ * a bounded window exists to prevent. Dropping the oldest entry keeps the window
+ * a window, and `hasMore` keeps saying there is more.
+ */
+const MAX_PRESENTED_SESSIONS = 50;
+const MAX_PRESENTED_RUNS = 50;
 
 /** Freezes a value and everything reachable from it. Already-frozen parts are skipped. */
 export function deepFreeze<T>(value: T): T {
@@ -61,7 +84,7 @@ function replaceAt<T>(items: readonly T[], index: number, item: T): readonly T[]
   return Object.freeze(next);
 }
 
-function sameRunIdentity(left: RunSnapshot, right: RunSnapshot): boolean {
+function sameRunIdentity(left: RunSummary, right: RunSummary): boolean {
   return (
     left.runId === right.runId &&
     left.sessionId === right.sessionId &&
@@ -75,30 +98,21 @@ function turnIdFits(bound: string | null, incoming: string | null): boolean {
   return bound === null || bound === incoming;
 }
 
-function activeRunOf(runs: readonly RunSnapshot[], sessionId: string, exceptRunId: string): RunSnapshot | undefined {
-  return runs.find(
-    (run) => run.sessionId === sessionId && run.runId !== exceptRunId && run.live !== null,
-  );
-}
-
 /**
- * The one rule about a run's stages, for every snapshot this module publishes.
+ * The one rule about a run's stages.
  *
- * The spec's state machine is `accepted → running → { completed | limited |
- * cancelled | failed }`, plus `accepted → failed` for a host fault that lands
- * before the Core ever started. What breaks it is not something a later
- * snapshot may assert: a run that ended without the running publication the
- * client has to have seen to explain content, a move out of a terminal stage
- * that would rewrite history the client already presented, or an `accepted` a
- * running run never returns to — once running is published, the acceptance is
- * over for good.
- *
- * The end reason is the host's own account of *why* a failure happened, not a
- * stage the client tracks, so it is not part of this rule.
+ * The state machine is `accepted → running → { completed | limited | cancelled
+ * | failed | interrupted }`, plus `accepted → failed` for a host fault that
+ * lands before the Core ever started. What breaks it is not something a later
+ * snapshot may assert: a run that ended without the running publication, or a
+ * move out of a terminal stage that would rewrite history already presented.
  */
 function runStageAllows(from: RunStatus, to: RunStatus): boolean {
   switch (from) {
     case "accepted":
+      // A run may only end straight from acceptance as a host failure; anything
+      // else has to have been observed running first, because a reader explains
+      // content by that publication.
       return to === "accepted" || to === "running" || to === "failed";
     case "running":
       return to !== "accepted";
@@ -108,7 +122,10 @@ function runStageAllows(from: RunStatus, to: RunStatus): boolean {
 }
 
 function withWatermark(base: Omit<HostSnapshot, "watermark">, watermark: Watermark): HostSnapshot {
-  return Object.freeze({ ...base, watermark: Object.freeze({ streamId: watermark.streamId, sequence: watermark.sequence }) });
+  return Object.freeze({
+    ...base,
+    watermark: Object.freeze({ streamId: watermark.streamId, sequence: watermark.sequence }),
+  });
 }
 
 /** Structural equality for the JSON the protocol carries, used on display inputs and results. */
@@ -129,9 +146,9 @@ function sameJson(left: unknown, right: unknown): boolean {
   );
 }
 
-function sameDisplayInput(left: DisplayInput, right: DisplayInput): boolean {
-  if (left.kind !== right.kind) return false;
-  if (left.kind === "json" && right.kind === "json") return sameJson(left.value, right.value);
+function sameDisplayInput(left: LiveItem & { kind: "tool" }, right: LiveItem & { kind: "tool" }): boolean {
+  if (left.input.kind !== right.input.kind) return false;
+  if (left.input.kind === "json" && right.input.kind === "json") return sameJson(left.input.value, right.input.value);
   return true;
 }
 
@@ -140,7 +157,8 @@ function sameDisplayInput(left: DisplayInput, right: DisplayInput): boolean {
  *
  * A run.updated carries the whole timeline, so a rewrite of something already
  * shown would silently change history the client has already presented. Text
- * may grow; the identity of an occurrence may not.
+ * may grow; the identity of an occurrence may not — and once a result has been
+ * published it is settled, so its only move is from "not yet" to one outcome.
  */
 function sameLiveIdentity(left: LiveItem, right: LiveItem): boolean {
   if (left.kind !== right.kind || left.itemId !== right.itemId) return false;
@@ -149,7 +167,7 @@ function sameLiveIdentity(left: LiveItem, right: LiveItem): boolean {
     left.invocationId !== right.invocationId ||
     left.callId !== right.callId ||
     left.name !== right.name ||
-    !sameDisplayInput(left.input, right.input)
+    !sameDisplayInput(left, right)
   ) {
     return false;
   }
@@ -170,61 +188,128 @@ function liveContinues(previous: readonly LiveItem[], next: readonly LiveItem[])
   return seen.size === next.length;
 }
 
+function newRevisions(base: CollectionRevisions, incoming: CollectionRevisions): CollectionRevisions {
+  return Object.freeze({
+    sessions: Math.max(base.sessions, incoming.sessions),
+    runs: Math.max(base.runs, incoming.runs),
+    plugins: Math.max(base.plugins, incoming.plugins),
+  });
+}
+
+function summaryOfActive(run: ActiveRunSnapshot): RunSummary {
+  const { live, liveTruncated, ...rest } = run;
+  void live;
+  void liveTruncated;
+  return Object.freeze(rest);
+}
+
 /**
- * Applies one event.
+ * Puts one run summary into the bounded window, newest first.
+ *
+ * A run the window has never held is inserted only when it is newer than what
+ * the window carries; the window is a recent slice, and an old run arriving
+ * late belongs to the part of the collection this client is not holding.
+ */
+function withRun(previous: readonly RunSummary[], run: RunSummary): readonly RunSummary[] | undefined {
+  const index = indexOfId(previous, run.runId, (item) => item.runId);
+  if (index >= 0) {
+    const existing = previous[index];
+    if (existing === undefined) return undefined;
+    if (existing.status !== run.status && !runStageAllows(existing.status, run.status)) return undefined;
+    if (!sameRunIdentity(existing, run)) return undefined;
+    if (!turnIdFits(existing.turnId, run.turnId)) return undefined;
+    return replaceAt(previous, index, run);
+  }
+
+  if (previous.length === 0) return Object.freeze([run]);
+  const oldest = previous[previous.length - 1];
+  if (oldest !== undefined && run.acceptedAt < oldest.acceptedAt) return previous;
+  const grown = Object.freeze([run, ...previous]);
+  return grown.length > MAX_PRESENTED_RUNS ? Object.freeze(grown.slice(0, MAX_PRESENTED_RUNS)) : grown;
+}
+
+function withSession(previous: readonly SessionSummary[], session: SessionSummary): readonly SessionSummary[] {
+  const index = indexOfId(previous, session.sessionId, (item) => item.sessionId);
+  if (index >= 0) return replaceAt(previous, index, session);
+  const grown = Object.freeze([session, ...previous]);
+  return grown.length > MAX_PRESENTED_SESSIONS ? Object.freeze(grown.slice(0, MAX_PRESENTED_SESSIONS)) : grown;
+}
+
+function withoutSession(previous: readonly SessionSummary[], sessionId: string): readonly SessionSummary[] {
+  const index = indexOfId(previous, sessionId, (item) => item.sessionId);
+  if (index < 0) return previous;
+  const next = [...previous];
+  next.splice(index, 1);
+  return Object.freeze(next);
+}
+
+/** Whether the client's window is no longer the newest slice of the collection. */
+function windowHasMore(page: { readonly hasMore: boolean; readonly nextCursor: Id | null }, grew: boolean): boolean {
+  return page.hasMore || page.nextCursor !== null || grew;
+}
+
+/**
+ * Applies one event to the bounded directory.
  *
  * `watermark` is the stream position this event occupies; it is written into the
  * result even when the event changed nothing else, because the position itself
  * is state — that is what makes a duplicate detectable later.
  */
-export function foldEvent(
-  previous: HostSnapshot,
-  event: HostEvent,
-  watermark: Watermark,
-): FoldOutcome {
+export function foldEvent(previous: HostSnapshot, event: HostEvent, watermark: Watermark): FoldOutcome {
   // The event is a validated, isolated snapshot: freezing it here means every
   // node the fold inserts is immutable from the moment it is published.
   deepFreeze(event);
 
   switch (event.type) {
     case "session.created":
-      return foldSessionCreated(previous, event.payload.session, watermark);
+      return foldSessionCreated(previous, event.payload.session, event.payload.collections, watermark);
+    case "session.updated":
+      return foldSessionUpdated(previous, event.payload.session, event.payload.collections, watermark);
+    case "session.deleted":
+      return foldSessionDeleted(previous, event.scope.sessionId, event.payload.collections, watermark);
     case "run.updated":
       return foldRunUpdated(previous, event.payload.run, watermark);
-    case "run.output.delta":
-      return foldOutputDelta(previous, event.scope, event.payload.itemId, event.payload.text, watermark);
-    case "run.tool.call":
-      return foldToolCall(previous, event.scope, event.payload.item, watermark);
-    case "run.tool.result":
-      return foldToolResult(previous, event.scope, event.payload, watermark);
     case "run.ended":
-      return foldRunEnded(previous, event.scope, event.payload.run, event.payload.session, watermark);
+      return foldRunEnded(previous, event, watermark);
+    case "collection.invalidated":
+      return foldCollectionInvalidated(previous, event.payload.collections, watermark);
     case "plugin.updated":
       return foldPluginUpdated(previous, event.payload.plugin, watermark);
-    case "host.request.cancelled":
-      // Control traffic, not conversation: the dispatcher aborts the handler,
-      // and all this leaves behind is the stream position it consumed.
+    case "run.output.delta":
+    case "run.tool.call":
+    case "run.tool.result":
+      // Live content moves the live replica, never the directory: a draft is not
+      // a durable fact and must not appear among them.
       return {
         ok: true,
-        presentation: withWatermark(
-          {
-            hostInstanceId: previous.hostInstanceId,
-            sessions: previous.sessions,
-            runs: previous.runs,
-            plugins: previous.plugins,
-          },
-          watermark,
-        ),
+        presentation: withWatermark(directoryOf(previous), watermark),
+      };
+    case "host.request.cancelled":
+      return {
+        ok: true,
+        presentation: withWatermark(directoryOf(previous), watermark),
       };
   }
 }
 
+function directoryOf(previous: HostSnapshot): Omit<HostSnapshot, "watermark"> {
+  return {
+    hostInstanceId: previous.hostInstanceId,
+    storage: previous.storage,
+    collections: previous.collections,
+    sessions: previous.sessions,
+    runs: previous.runs,
+    plugins: previous.plugins,
+  };
+}
+
 function foldSessionCreated(
   previous: HostSnapshot,
-  session: SessionSnapshot,
+  session: SessionSummary,
+  collections: CollectionRevisions,
   watermark: Watermark,
 ): FoldOutcome {
-  if (indexOfId(previous.sessions, session.sessionId, (item) => item.sessionId) >= 0) {
+  if (indexOfId(previous.sessions.items, session.sessionId, (item) => item.sessionId) >= 0) {
     return { ok: false, reason: "invalid-event" };
   }
 
@@ -232,61 +317,110 @@ function foldSessionCreated(
     ok: true,
     presentation: withWatermark(
       {
-        hostInstanceId: previous.hostInstanceId,
-        sessions: Object.freeze([...previous.sessions, session]),
-        runs: previous.runs,
-        plugins: previous.plugins,
+        ...directoryOf(previous),
+        collections: newRevisions(previous.collections, collections),
+        sessions: Object.freeze({
+          items: withSession(previous.sessions.items, session),
+          collectionRevision: collections.sessions,
+          nextCursor: previous.sessions.nextCursor,
+          hasMore: windowHasMore(previous.sessions, previous.sessions.items.length >= MAX_PRESENTED_SESSIONS),
+        }),
       },
       watermark,
     ),
   };
 }
 
-function foldRunUpdated(
+function foldSessionUpdated(
   previous: HostSnapshot,
-  run: ActiveRunSnapshot,
+  session: SessionSummary,
+  collections: CollectionRevisions,
   watermark: Watermark,
 ): FoldOutcome {
-  const sessionIndex = indexOfId(previous.sessions, run.sessionId, (item) => item.sessionId);
-  if (sessionIndex < 0) return { ok: false, reason: "invalid-event" };
-  const session = previous.sessions[sessionIndex];
-  if (session === undefined) return { ok: false, reason: "invalid-event" };
+  const index = indexOfId(previous.sessions.items, session.sessionId, (item) => item.sessionId);
+  if (index >= 0) {
+    const existing = previous.sessions.items[index];
+    if (existing === undefined) return { ok: false, reason: "invalid-event" };
+    if (existing.generation !== session.generation) {
+      // A different identity under the same id is not an update; it is the id
+      // being reused, which this protocol never does.
+      return { ok: false, reason: "invalid-event" };
+    }
+    if (session.metadataRevision <= existing.metadataRevision && session.committedSeq < existing.committedSeq) {
+      // Revisions only move forward, and committed history is never shortened.
+      return { ok: false, reason: "invalid-event" };
+    }
+  }
 
+  return {
+    ok: true,
+    presentation: withWatermark(
+      {
+        ...directoryOf(previous),
+        collections: newRevisions(previous.collections, collections),
+        sessions: Object.freeze({
+          items: withSession(previous.sessions.items, session),
+          collectionRevision: collections.sessions,
+          nextCursor: previous.sessions.nextCursor,
+          hasMore: previous.sessions.hasMore || previous.sessions.nextCursor !== null,
+        }),
+      },
+      watermark,
+    ),
+  };
+}
+
+function foldSessionDeleted(
+  previous: HostSnapshot,
+  sessionId: string,
+  collections: CollectionRevisions,
+  watermark: Watermark,
+): FoldOutcome {
+  return {
+    ok: true,
+    presentation: withWatermark(
+      {
+        ...directoryOf(previous),
+        collections: newRevisions(previous.collections, collections),
+        sessions: Object.freeze({
+          items: withoutSession(previous.sessions.items, sessionId),
+          collectionRevision: collections.sessions,
+          nextCursor: previous.sessions.nextCursor,
+          hasMore: previous.sessions.hasMore || previous.sessions.nextCursor !== null,
+        }),
+        runs: Object.freeze({
+          ...previous.runs,
+          items: Object.freeze(previous.runs.items.filter((run) => run.sessionId !== sessionId)),
+          collectionRevision: collections.runs,
+        }),
+      },
+      watermark,
+    ),
+  };
+}
+
+function foldRunUpdated(previous: HostSnapshot, run: ActiveRunSnapshot, watermark: Watermark): FoldOutcome {
+  const sessionIndex = indexOfId(previous.sessions.items, run.sessionId, (item) => item.sessionId);
+  if (sessionIndex < 0) {
+    // The run's session is outside this client's bounded window. The directory
+    // cannot place it, so it is refused rather than filed somewhere plausible.
+    return { ok: false, reason: "invalid-event" };
+  }
+  const session = previous.sessions.items[sessionIndex];
+  if (session === undefined) return { ok: false, reason: "invalid-event" };
   if (session.activeRunId !== null && session.activeRunId !== run.runId) {
     // One session, one active run: a second one cannot be true at the same time.
     return { ok: false, reason: "invalid-event" };
   }
-  if (activeRunOf(previous.runs, run.sessionId, run.runId) !== undefined) {
-    return { ok: false, reason: "invalid-event" };
-  }
 
-  const runIndex = indexOfId(previous.runs, run.runId, (item) => item.runId);
-  let runs: readonly RunSnapshot[];
-  if (runIndex < 0) {
-    // A run this client has never seen can only be announced as accepted: the
-    // `accepted → running` order is part of the contract, and a snapshot that
-    // already holds a running run is the one exception (it is not an event).
-    if (run.status !== "accepted") return { ok: false, reason: "invalid-event" };
-    runs = Object.freeze([...previous.runs, run]);
-  } else {
-    const existing = previous.runs[runIndex];
-    if (existing === undefined) return { ok: false, reason: "invalid-event" };
-    // A run's stage only moves forward, and only a run that still has a
-    // timeline has one to extend; its identity is fixed for its life.
-    if (existing.live === null || !runStageAllows(existing.status, run.status)) {
-      return { ok: false, reason: "invalid-event" };
-    }
-    if (!sameRunIdentity(existing, run) || !turnIdFits(existing.turnId, run.turnId)) {
-      return { ok: false, reason: "run-identity" };
-    }
-    if (!liveContinues(existing.live, run.live)) return { ok: false, reason: "run-identity" };
-    runs = replaceAt(previous.runs, runIndex, run);
-  }
+  const summary = summaryOfActive(run);
+  const items = withRun(previous.runs.items, summary);
+  if (items === undefined) return { ok: false, reason: "invalid-event" };
 
   // The active-run pointer moves in the same update as the run it points at:
   // a reader never sees the run without the session that owns it.
   const sessions = replaceAt(
-    previous.sessions,
+    previous.sessions.items,
     sessionIndex,
     Object.freeze({ ...session, activeRunId: run.runId }),
   );
@@ -294,193 +428,363 @@ function foldRunUpdated(
   return {
     ok: true,
     presentation: withWatermark(
-      { hostInstanceId: previous.hostInstanceId, sessions, runs, plugins: previous.plugins },
-      watermark,
-    ),
-  };
-}
-
-/**
- * The run a content event belongs to.
- *
- * The event's own scope says which session it claims to come from, and that
- * claim has to match the run this client actually published — a run belongs to
- * one session for its whole life, and a frame that says otherwise is not a
- * content update for anything.
- */
-function contentRunAt(
-  previous: HostSnapshot,
-  scope: Extract<EventScope, { kind: "run" }>,
-): { readonly index: number; readonly run: Extract<RunSnapshot, { live: readonly LiveItem[] }> } | undefined {
-  const index = indexOfId(previous.runs, scope.runId, (item) => item.runId);
-  if (index < 0) return undefined;
-  const run = previous.runs[index];
-  if (run === undefined || run.live === null) return undefined;
-  if (run.sessionId !== scope.sessionId) return undefined;
-  // Content follows the run's running publication, never its acceptance.
-  if (run.status !== "running") return undefined;
-  return { index, run };
-}
-
-function foldOutputDelta(
-  previous: HostSnapshot,
-  scope: Extract<EventScope, { kind: "run" }>,
-  itemId: string,
-  text: string,
-  watermark: Watermark,
-): FoldOutcome {
-  const live = contentRunAt(previous, scope);
-  if (live === undefined) return { ok: false, reason: "invalid-event" };
-
-  const itemIndex = indexOfId(live.run.live, itemId, (item) => item.itemId);
-  let items: readonly LiveItem[];
-  if (itemIndex < 0) {
-    // The first chunk of a new text item; the host decides where one ends.
-    items = Object.freeze([
-      ...live.run.live,
-      Object.freeze({ kind: "text" as const, itemId, text }),
-    ]);
-  } else {
-    const item = live.run.live[itemIndex];
-    if (item === undefined || item.kind !== "text") return { ok: false, reason: "invalid-event" };
-    items = replaceAt(live.run.live, itemIndex, Object.freeze({ kind: "text" as const, itemId, text: item.text + text }));
-  }
-
-  return replacedRun(previous, live.index, { ...live.run, live: items }, watermark);
-}
-
-function foldToolCall(
-  previous: HostSnapshot,
-  scope: Extract<EventScope, { kind: "run" }>,
-  item: Extract<LiveItem, { kind: "tool" }>,
-  watermark: Watermark,
-): FoldOutcome {
-  const live = contentRunAt(previous, scope);
-  if (live === undefined) return { ok: false, reason: "invalid-event" };
-
-  // Item ids and invocation ids identify one occurrence each: a repeated
-  // `callId` is not a repeat, but a repeated id is a contradiction.
-  if (indexOfId(live.run.live, item.itemId, (candidate) => candidate.itemId) >= 0) {
-    return { ok: false, reason: "invalid-event" };
-  }
-  if (
-    live.run.live.some((candidate) => candidate.kind === "tool" && candidate.invocationId === item.invocationId)
-  ) {
-    return { ok: false, reason: "invalid-event" };
-  }
-
-  const items = Object.freeze([...live.run.live, item]);
-  return replacedRun(previous, live.index, { ...live.run, live: items }, watermark);
-}
-
-function foldToolResult(
-  previous: HostSnapshot,
-  scope: Extract<EventScope, { kind: "run" }>,
-  payload: { readonly invocationId: string; readonly ok: boolean; readonly content: string },
-  watermark: Watermark,
-): FoldOutcome {
-  const live = contentRunAt(previous, scope);
-  if (live === undefined) return { ok: false, reason: "invalid-event" };
-
-  const itemIndex = live.run.live.findIndex(
-    (candidate) =>
-      candidate.kind === "tool" &&
-      candidate.invocationId === payload.invocationId &&
-      candidate.result === null,
-  );
-  if (itemIndex < 0) {
-    // A result fills the open occurrence it belongs to, and nothing else: an
-    // unknown one would have to be invented, and a settled one would have to be
-    // overwritten.
-    return { ok: false, reason: "invalid-event" };
-  }
-
-  const item = live.run.live[itemIndex];
-  if (item === undefined || item.kind !== "tool") return { ok: false, reason: "invalid-event" };
-  const items = replaceAt(
-    live.run.live,
-    itemIndex,
-    Object.freeze({ ...item, result: Object.freeze({ ok: payload.ok, content: payload.content }) }),
-  );
-
-  return replacedRun(previous, live.index, { ...live.run, live: items }, watermark);
-}
-
-function foldRunEnded(
-  previous: HostSnapshot,
-  scope: Extract<EventScope, { kind: "run" }>,
-  run: TerminalRunSnapshot,
-  session: SessionSnapshot,
-  watermark: Watermark,
-): FoldOutcome {
-  const runIndex = indexOfId(previous.runs, run.runId, (item) => item.runId);
-  const sessionIndex = indexOfId(previous.sessions, session.sessionId, (item) => item.sessionId);
-  if (runIndex < 0 || sessionIndex < 0) return { ok: false, reason: "invalid-event" };
-  if (scope.sessionId !== session.sessionId || scope.sessionId !== run.sessionId) {
-    return { ok: false, reason: "invalid-event" };
-  }
-
-  const existing = previous.runs[runIndex];
-  if (existing === undefined || !runStageAllows(existing.status, run.status)) {
-    return { ok: false, reason: "invalid-event" };
-  }
-  if (!sameRunIdentity(existing, run)) return { ok: false, reason: "run-identity" };
-  if (!turnIdFits(existing.turnId, run.turnId)) return { ok: false, reason: "run-identity" };
-
-  // One update carries both halves: the terminal run and the settled session.
-  // A reader never sees a finished run beside a session that still points at it.
-  return {
-    ok: true,
-    presentation: withWatermark(
       {
-        hostInstanceId: previous.hostInstanceId,
-        sessions: replaceAt(previous.sessions, sessionIndex, session),
-        runs: replaceAt(previous.runs, runIndex, run),
-        plugins: previous.plugins,
+        ...directoryOf(previous),
+        sessions: Object.freeze({ ...previous.sessions, items: sessions }),
+        runs: Object.freeze({ ...previous.runs, items }),
       },
       watermark,
     ),
   };
 }
 
-function foldPluginUpdated(
+function foldRunEnded(
   previous: HostSnapshot,
-  plugin: PluginSummary,
+  event: Extract<HostEvent, { type: "run.ended" }>,
   watermark: Watermark,
 ): FoldOutcome {
+  const run = event.payload.run;
+  const session = event.payload.session;
+  const collections = event.payload.collections;
+
+  const scope = event.scope;
+  if (scope.sessionId !== session.sessionId || scope.sessionId !== run.sessionId) {
+    return { ok: false, reason: "invalid-event" };
+  }
+
+  const sessionIndex = indexOfId(previous.sessions.items, session.sessionId, (item) => item.sessionId);
+  const runIndex = indexOfId(previous.runs.items, run.runId, (item) => item.runId);
+
+  if (sessionIndex < 0) return { ok: false, reason: "invalid-event" };
+  const existingSession = previous.sessions.items[sessionIndex];
+  const existingRun = runIndex < 0 ? undefined : previous.runs.items[runIndex];
+  if (existingRun !== undefined) {
+    if (!sameRunIdentity(existingRun, run)) return { ok: false, reason: "run-identity" };
+    if (!turnIdFits(existingRun.turnId, run.turnId)) return { ok: false, reason: "run-identity" };
+    if (!runStageAllows(existingRun.status, run.status)) return { ok: false, reason: "invalid-event" };
+  } else if (existingSession !== undefined && existingSession.activeRunId !== run.runId) {
+    // A run this client never saw may be announced as terminal only if its
+    // session did not claim to be running something else.
+    return { ok: false, reason: "invalid-event" };
+  }
+
+  // One update carries both halves: the terminal run, the settled session, and
+  // the catalogue versions the commit produced. A reader never sees a finished
+  // run beside a session that still points at it.
+  const items = runIndex < 0 ? Object.freeze([run, ...previous.runs.items]) : replaceAt(previous.runs.items, runIndex, run);
+  return {
+    ok: true,
+    presentation: withWatermark(
+      {
+        ...directoryOf(previous),
+        collections: newRevisions(previous.collections, collections),
+        sessions: Object.freeze({
+          items: replaceAt(previous.sessions.items, sessionIndex, session),
+          collectionRevision: collections.sessions,
+          nextCursor: previous.sessions.nextCursor,
+          hasMore: previous.sessions.hasMore || previous.sessions.nextCursor !== null,
+        }),
+        runs: Object.freeze({
+          items,
+          collectionRevision: collections.runs,
+          nextCursor: previous.runs.nextCursor,
+          hasMore: previous.runs.hasMore || previous.runs.nextCursor !== null,
+        }),
+      },
+      watermark,
+    ),
+  };
+}
+
+function foldCollectionInvalidated(
+  previous: HostSnapshot,
+  collections: CollectionRevisions,
+  watermark: Watermark,
+): FoldOutcome {
+  return {
+    ok: true,
+    presentation: withWatermark(
+      { ...directoryOf(previous), collections: newRevisions(previous.collections, collections) },
+      watermark,
+    ),
+  };
+}
+
+function foldPluginUpdated(previous: HostSnapshot, plugin: PluginSummary, watermark: Watermark): FoldOutcome {
   const index = indexOfId(previous.plugins, plugin.id, (item) => item.id);
   if (index < 0) return { ok: false, reason: "invalid-event" };
 
   return {
     ok: true,
     presentation: withWatermark(
-      {
-        hostInstanceId: previous.hostInstanceId,
-        sessions: previous.sessions,
-        runs: previous.runs,
-        plugins: replaceAt(previous.plugins, index, plugin),
-      },
+      { ...directoryOf(previous), plugins: replaceAt(previous.plugins, index, plugin) },
       watermark,
     ),
   };
 }
 
-function replacedRun(
-  previous: HostSnapshot,
-  runIndex: number,
-  run: RunSnapshot,
-  watermark: Watermark,
-): FoldOutcome {
-  return {
-    ok: true,
-    presentation: withWatermark(
-      {
-        hostInstanceId: previous.hostInstanceId,
-        sessions: previous.sessions,
-        runs: replaceAt(previous.runs, runIndex, run),
-        plugins: previous.plugins,
-      },
-      watermark,
-    ),
-  };
+// ---------------------------------------------------------------------------
+// The live replica.
+// ---------------------------------------------------------------------------
+
+export type LiveMap = Readonly<Record<Id, ActiveRunSnapshot>>;
+
+export type LiveOutcome =
+  | { readonly ok: true; readonly live: LiveMap }
+  | { readonly ok: false; readonly reason: ProtocolViolationReason };
+
+function withLive(live: LiveMap, runId: string, run: ActiveRunSnapshot): LiveMap {
+  return Object.freeze({ ...live, [runId]: run });
 }
+
+function withoutLive(live: LiveMap, runId: string): LiveMap {
+  if (!Object.hasOwn(live, runId)) return live;
+  const next: Record<string, ActiveRunSnapshot> = {};
+  for (const [key, value] of Object.entries(live)) {
+    if (key === runId) continue;
+    next[key] = value;
+  }
+  return Object.freeze(next);
+}
+
+/**
+ * Applies one event to the live timelines.
+ *
+ * Content events are applied only to a run this client has seen published as
+ * `running`: a chunk that arrives before that publication is a frame the client
+ * cannot place, and inventing the run it belongs to would be inventing state the
+ * host never sent.
+ */
+export function foldLiveEvent(live: LiveMap, event: HostEvent): LiveOutcome {
+  switch (event.type) {
+    case "run.updated": {
+      const run = event.payload.run;
+      const existing = live[run.runId];
+      if (existing !== undefined) {
+        if (!runStageAllows(existing.status, run.status)) return { ok: false, reason: "invalid-event" };
+        if (existing.sessionId !== run.sessionId || existing.submissionId !== run.submissionId) {
+          return { ok: false, reason: "run-identity" };
+        }
+        if (!turnIdFits(existing.turnId, run.turnId)) return { ok: false, reason: "run-identity" };
+        if (!liveContinues(existing.live, run.live)) return { ok: false, reason: "run-identity" };
+      } else if (run.status !== "accepted") {
+        // A run this client has never seen can only be announced as accepted.
+        return { ok: false, reason: "invalid-event" };
+      }
+      return { ok: true, live: withLive(live, run.runId, run) };
+    }
+
+    case "run.output.delta": {
+      const placed = liveRunAt(live, event.scope);
+      if (placed === undefined) return { ok: false, reason: "invalid-event" };
+      const { run } = placed;
+      const payload = event.payload;
+
+      const index = indexOfId(run.live, payload.itemId, (item) => item.itemId);
+      let items: readonly LiveItem[];
+      if (index < 0) {
+        items = Object.freeze([...run.live, Object.freeze({ kind: "text" as const, itemId: payload.itemId, text: payload.text })]);
+      } else {
+        const item = run.live[index];
+        if (item === undefined || item.kind !== "text") return { ok: false, reason: "invalid-event" };
+        items = replaceAt(
+          run.live,
+          index,
+          Object.freeze({ kind: "text" as const, itemId: payload.itemId, text: item.text + payload.text }),
+        );
+      }
+      return { ok: true, live: withLive(live, run.runId, Object.freeze({ ...run, live: items })) };
+    }
+
+    case "run.tool.call": {
+      const placed = liveRunAt(live, event.scope);
+      if (placed === undefined) return { ok: false, reason: "invalid-event" };
+      const { run } = placed;
+      const item = event.payload.item;
+      if (indexOfId(run.live, item.itemId, (candidate) => candidate.itemId) >= 0) {
+        return { ok: false, reason: "invalid-event" };
+      }
+      if (run.live.some((candidate) => candidate.kind === "tool" && candidate.invocationId === item.invocationId)) {
+        return { ok: false, reason: "invalid-event" };
+      }
+      return {
+        ok: true,
+        live: withLive(live, run.runId, Object.freeze({ ...run, live: Object.freeze([...run.live, item]) })),
+      };
+    }
+
+    case "run.tool.result": {
+      const placed = liveRunAt(live, event.scope);
+      if (placed === undefined) return { ok: false, reason: "invalid-event" };
+      const { run } = placed;
+      const index = run.live.findIndex(
+        (candidate) =>
+          candidate.kind === "tool" &&
+          candidate.invocationId === event.payload.invocationId &&
+          candidate.result === null,
+      );
+      if (index < 0) return { ok: false, reason: "invalid-event" };
+      const item = run.live[index];
+      if (item === undefined || item.kind !== "tool") return { ok: false, reason: "invalid-event" };
+      const items = replaceAt(
+        run.live,
+        index,
+        Object.freeze({ ...item, result: Object.freeze({ ok: event.payload.ok, content: event.payload.content }) }),
+      );
+      return { ok: true, live: withLive(live, run.runId, Object.freeze({ ...run, live: items })) };
+    }
+
+    case "run.ended":
+      // The draft is gone: a terminal run has no timeline, and this client holds
+      // the summary the same event published.
+      return { ok: true, live: withoutLive(live, event.payload.run.runId) };
+
+    case "session.deleted": {
+      let next = live;
+      for (const [runId, run] of Object.entries(live)) {
+        if (run.sessionId === event.payload.sessionId) next = withoutLive(next, runId);
+      }
+      return { ok: true, live: next };
+    }
+
+    default:
+      return { ok: true, live };
+  }
+}
+
+function liveRunAt(
+  live: LiveMap,
+  scope: Extract<EventScope, { kind: "run" }>,
+): { readonly run: ActiveRunSnapshot } | undefined {
+  const run = live[scope.runId];
+  if (run === undefined) return undefined;
+  if (run.sessionId !== scope.sessionId) return undefined;
+  // Content follows the run's running publication, never its acceptance.
+  if (run.status !== "running") return undefined;
+  if (run.liveTruncated) return undefined;
+  return { run };
+}
+
+// ---------------------------------------------------------------------------
+// History coverage.
+// ---------------------------------------------------------------------------
+
+/**
+ * What this client has read of one session's committed conversation.
+ *
+ * `behind` is the honest gap marker: it is set when the session's committed
+ * high-water moved past what has been loaded, so a reader can tell "this is the
+ * end of the conversation" from "this is the end of what I have read".
+ */
+export interface HistoryCoverage {
+  readonly storageId: Id;
+  readonly sessionId: Id;
+  readonly generation: number;
+  readonly historyRevision: number;
+  readonly fenceSeq: number;
+  readonly fromSeq: number;
+  readonly toSeq: number;
+  readonly atStart: boolean;
+  readonly atFence: boolean;
+  readonly behind: boolean;
+  readonly nextCursor: Id | null;
+  readonly items: readonly CanonicalItem[];
+}
+
+export type HistoryMap = Readonly<Record<Id, HistoryCoverage>>;
+
+/**
+ * Records one page, merging it with what is already loaded.
+ *
+ * A page that continues the loaded range — same fence, same session, and meeting
+ * the current coverage at its oldest end — extends it. Anything else replaces
+ * it: a page from another fence or another revision is a different traversal,
+ * and gluing two traversals together would present a conversation nobody read.
+ */
+export function applyHistoryPage(history: HistoryMap, page: HistoryPage): HistoryMap {
+  const current = history[page.sessionId];
+  const continues =
+    current !== undefined &&
+    current.storageId === page.storageId &&
+    current.generation === page.generation &&
+    current.fenceSeq === page.fenceSeq &&
+    page.coverage.toSeq === current.fromSeq;
+
+  if (!continues || current === undefined) {
+    return Object.freeze({
+      ...history,
+      [page.sessionId]: Object.freeze({
+        storageId: page.storageId,
+        sessionId: page.sessionId,
+        generation: page.generation,
+        historyRevision: page.historyRevision,
+        fenceSeq: page.fenceSeq,
+        fromSeq: page.coverage.fromSeq,
+        toSeq: page.coverage.toSeq,
+        atStart: page.atStart,
+        atFence: page.atFence,
+        behind: false,
+        nextCursor: page.nextCursor,
+        items: Object.freeze([...page.items]),
+      }),
+    });
+  }
+
+  return Object.freeze({
+    ...history,
+    [page.sessionId]: Object.freeze({
+      ...current,
+      historyRevision: page.historyRevision,
+      fromSeq: page.coverage.fromSeq,
+      atStart: page.atStart,
+      nextCursor: page.nextCursor,
+      items: Object.freeze([...page.items, ...current.items]),
+    }),
+  });
+}
+
+/** Applies one event's effect on what the client has read. */
+export function foldHistoryEvent(history: HistoryMap, event: HostEvent): HistoryMap {
+  switch (event.type) {
+    case "session.deleted": {
+      if (!Object.hasOwn(history, event.payload.sessionId)) return history;
+      const next: Record<string, HistoryCoverage> = {};
+      for (const [key, value] of Object.entries(history)) {
+        if (key === event.payload.sessionId) continue;
+        next[key] = value;
+      }
+      return Object.freeze(next);
+    }
+    case "run.ended": {
+      const session = event.payload.session;
+      const current = history[session.sessionId];
+      if (current === undefined) return history;
+      const behind = session.committedSeq > current.toSeq;
+      if (behind === current.behind) return history;
+      return Object.freeze({ ...history, [session.sessionId]: Object.freeze({ ...current, behind }) });
+    }
+    case "session.updated": {
+      const session = event.payload.session;
+      const current = history[session.sessionId];
+      if (current === undefined) return history;
+      const behind = session.committedSeq > current.toSeq;
+      if (behind === current.behind) return history;
+      return Object.freeze({ ...history, [session.sessionId]: Object.freeze({ ...current, behind }) });
+    }
+    default:
+      return history;
+  }
+}
+
+/** Drops everything loaded for a session whose identity the client no longer holds. */
+export function forgetHistory(history: HistoryMap, sessionId: string): HistoryMap {
+  if (!Object.hasOwn(history, sessionId)) return history;
+  const next: Record<string, HistoryCoverage> = {};
+  for (const [key, value] of Object.entries(history)) {
+    if (key === sessionId) continue;
+    next[key] = value;
+  }
+  return Object.freeze(next);
+}
+
+export type { RunSnapshot };

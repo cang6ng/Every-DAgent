@@ -51,12 +51,23 @@ async function openShell(acceptance?: ShellAcceptance): Promise<OpenShell> {
 
 async function createSession(session: BrowserSession): Promise<string> {
   await session.click('[data-testid="new-session"]');
-  return await session.waitFor(
+  const selected = await session.waitFor(
     'document.querySelector("[data-testid=session-item][data-selected=true]")?.getAttribute("data-session-id") ?? ""',
     (value) => value.length > 0,
     10000,
     "a created session to be selected",
   );
+  // The selection can already be the previous session's when the create is
+  // still in flight — a caller that clicks on from here would be refused by a
+  // disabled button, and its hold would land on this create's answer instead
+  // of the next one's.
+  await session.waitFor(
+    'String(document.querySelector("[data-testid=new-session]").disabled)',
+    (value) => value === "false",
+    10000,
+    "the create to settle",
+  );
+  return selected;
 }
 
 async function enablePlugin(session: BrowserSession, pluginId: string): Promise<void> {
