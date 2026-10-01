@@ -133,11 +133,14 @@ function freezeEvent(event: SessionEvent): SessionEvent {
 /**
  * One window's shape, checked against what a committed log can contain.
  *
- * Two things are proven here and nothing else: the seqs run unbroken from `baseSeq`,
- * and every turn the window holds is closed inside it. The second is what makes
- * "these are complete turns" a fact rather than a hope — a window that opens or closes
- * inside a turn, or that nests one turn inside another, is not a suffix of settled
- * history and cannot be presented as one.
+ * Three things are proven here and nothing else: the seqs run unbroken from
+ * `baseSeq`; every turn the window holds is closed inside it; and every event
+ * inside a turn carries that turn's own id, including the `turn/end` that closes
+ * it. The last is not bookkeeping: a window whose closing record belongs to a
+ * different turn is a window whose boundary is a different turn's, and presenting
+ * it as complete history would hand a caller two turns welded into one turn's
+ * shape. A window that opens or closes inside a turn, that nests one turn inside
+ * another, or that mixes turn ids is refused rather than repaired.
  */
 function assertWindowShape(id: string, baseSeq: number, events: readonly SessionEvent[]): void {
   let openTurn: string | undefined;
@@ -162,6 +165,11 @@ function assertWindowShape(id: string, baseSeq: number, events: readonly Session
     }
     if (openTurn === undefined) {
       throw new Error(`session "${id}" cannot be windowed: ${event.type} at seq ${event.seq} has no open turn`);
+    }
+    if (event.turnId !== openTurn) {
+      throw new Error(
+        `session "${id}" cannot be windowed: ${event.type} at seq ${event.seq} belongs to turn "${event.turnId}", not the open turn "${openTurn}"`,
+      );
     }
     if (event.type === "turn/end") openTurn = undefined;
   }
