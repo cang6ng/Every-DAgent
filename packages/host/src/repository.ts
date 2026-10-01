@@ -277,6 +277,14 @@ export interface Repository {
   renameSession(input: RenameInput): RenameOutcome;
   deleteSession(input: DeleteInput): DeleteOutcome;
   reconcileInterrupted(hostInstanceId: string, at: number): ReconcileResult;
+  /**
+   * Advances the plugin catalogue's revision.
+   *
+   * The plugin catalogue has no durable rows here — plugins are registered by
+   * the composition, not by the store — but its revision is a published fact a
+   * client pages by, so a lifecycle change still has to move it.
+   */
+  bumpPluginRevision(): CollectionRevisions;
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,6 +1141,13 @@ class SqliteRepository implements Repository {
         .run(input.sessionId, session.generation, input.at);
       this.bump("sessions", "runs");
       return { kind: "deleted", generation: session.generation } as const;
+    });
+  }
+
+  bumpPluginRevision(): CollectionRevisions {
+    return this.transaction(() => {
+      this.bump("plugins");
+      return this.revisions;
     });
   }
 

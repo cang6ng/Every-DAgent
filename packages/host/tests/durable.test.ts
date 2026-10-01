@@ -28,13 +28,16 @@ import {
   awaitRunTerminal,
   composeTestHost,
   connect,
+  constantTool,
   flush,
   gate,
   gatedReply,
   nextId,
   scriptedModel,
   testHost,
+  testPlugin,
   textReply,
+  toolReply,
 } from "./helpers/harness.js";
 
 /**
@@ -1087,6 +1090,82 @@ describe("admission limits", () => {
       .map((frame) => JSON.parse(frame) as { readonly requestId?: string; readonly error?: { readonly code?: string } })
       .find((frame) => frame.requestId === "raw-page");
     expect(answer?.error?.code).toBe("INVALID_REQUEST");
+
+    client.detach();
+    await composed.host.shutdown();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A record the store cannot keep whole.
+// ---------------------------------------------------------------------------
+
+describe("records the store cannot keep whole", () => {
+  it("refuses the turn and blocks the session, instead of truncating history", async () => {
+    const oversized = "x".repeat(70 * 1024);
+    const plugin = testPlugin({
+      id: "big-plugin",
+      tools: [constantTool("big", oversized)],
+    });
+    const model = scriptedModel([toolReply("call-1", "big", {}), textReply("done")]);
+    const composed = composeTestHost({ modelClient: model.client, plugins: [plugin] });
+
+    const client = connect(composed.host);
+    await client.describe();
+    await client.call("plugins.enable", { pluginId: "big-plugin" });
+    const session = await client.call("sessions.create", {});
+    const sessionId = session.result?.session.sessionId ?? "";
+
+    const started = await client.call("runs.start", { sessionId, submissionId: "sub-big", text: "use the tool" });
+    const settled = await client.call("runs.get", { runId: started.result?.run.runId ?? "" });
+    // The piece that cannot be stored is the tool result; the model call before
+    // it settled the turn, so this is a host fault after execution rather than a
+    // failure of the turn.
+    for (let attempt = 0; attempt < 100 && settled.result?.run.live !== null; attempt += 1) await flush();
+
+    const run = (await client.call("runs.get", { runId: started.result?.run.runId ?? "" })).result?.run;
+
+    expect(run?.status).toBe("failed");
+    expect(run?.endReason).toBe("host_error");
+    expect(run?.live).toBeNull();
+
+    const after = await client.call("sessions.get", { sessionId });
+    expect(after.result?.session.status).toBe("blocked");
+    expect(after.result?.session.blockedReason).toBe("host-fault");
+    // The old canonical is untouched, and no fragment of the oversized result
+    // was smuggled into it.
+    expect(after.result?.session.committedSeq).toBe(0);
+    expect(composed.repository.getSession(sessionId)?.historyRevision).toBe(0);
+    const page = await client.call("sessions.history", { sessionId });
+    expect(page.result?.page.items).toEqual([]);
+
+    client.detach();
+    await composed.host.shutdown();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The plugin catalogue's revision.
+// ---------------------------------------------------------------------------
+
+describe("catalogue revisions", () => {
+  it("advances the plugin revision and announces it when a lifecycle change lands", async () => {
+    const plugin = testPlugin({ id: "demo", tools: [constantTool("demo")] });
+    const composed = composeTestHost({ modelClient: MODEL().client, plugins: [plugin] });
+    const client = connect(composed.host);
+    await client.describe();
+    await client.call("subscriptions.open", {});
+
+    const before = composed.repository.revisions.plugins;
+    await client.call("plugins.enable", { pluginId: "demo" });
+    const after = composed.repository.revisions.plugins;
+    expect(after).toBeGreaterThan(before);
+
+    const invalidated = await client.waitForEvent("collection.invalidated");
+    expect(invalidated.payload.collections.plugins).toBe(after);
+    // And the summary that changed travelled on its own event.
+    const updated = await client.waitForEvent("plugin.updated");
+    expect(updated.payload.plugin.status).toBe("enabled");
 
     client.detach();
     await composed.host.shutdown();

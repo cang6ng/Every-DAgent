@@ -396,5 +396,19 @@ export function observePlugin(state: HostState, pluginId: string): PluginSummary
   assertEventBuilds(state, build);
   state.plugins.set(pluginId, summary);
   publishEvent(state, build);
+
+  // The catalogue itself changed too. The revision is what a client holding a
+  // page needs in order to know the page is no longer the current catalogue —
+  // and it is the one catalogue change that has no summary of its own to ride
+  // on, which is exactly what `collection.invalidated` is for.
+  try {
+    const revisions = state.repository.bumpPluginRevision();
+    publishEvent(state, collectionInvalidatedEvent(revisions));
+  } catch {
+    // A store that cannot record the revision does not un-change the plugin:
+    // the summary is already published, and the operations that need the store
+    // report its failure themselves.
+  }
+
   return summary;
 }
