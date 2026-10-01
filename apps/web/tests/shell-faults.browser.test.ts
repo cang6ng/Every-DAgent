@@ -75,6 +75,17 @@ const textOf = (selector: string): string => `(document.querySelector(${JSON.str
 const countOf = (selector: string): string => `String(document.querySelectorAll(${JSON.stringify(selector)}).length)`;
 const runStatus = 'document.querySelector("[data-testid=run-status]")?.textContent ?? ""';
 
+/** Polls a fact in the test process (a fixture's own state, not the page's). */
+async function waitForNode(predicate: () => boolean, what: string, timeoutMs = 10000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+  }
+}
+
 describe("the shell when things go wrong, in a real browser", () => {
   it.skipIf(browser === undefined)(
     "keeps start off while a run is in flight and cancels on request",
@@ -258,54 +269,65 @@ describe("the shell when things go wrong, in a real browser", () => {
     async () => {
       const { acceptance, session } = await openShell();
 
-      // A real tool really returns markup-shaped text: the guarantee under test
-      // is about the generic card, not about anything the test typed.
+      // A real tool really returns markup-shaped text, and the model is held
+      // after that observation exists: the live card can be asserted while it
+      // *is* the live card, not after it has quietly become history.
       await enablePlugin(session, "text-stats");
       await createSession(session);
+      acceptance.model.holdNextDangerousResult();
       await sendText(session, "危险结果");
 
-      const resultText = textOf('[data-testid="tool-result-content"]');
-      // The wait is on this round's *tool result*: the payload exists nowhere
-      // else, so no earlier assistant message can satisfy it.
-      await session.waitFor(resultText, (value) => value.includes("__tool_pwned"), 20000, "this round's tool result text");
+      // The lock is the model's own park: from here the run cannot settle, so
+      // everything below reads a frozen live phase rather than a race.
+      await waitForNode(() => acceptance.model.dangerousResultParked(), "the model to park after the tool result");
+
+      const liveResult = '[data-testid="live-run"] [data-testid="tool-result-content"]';
+      await session.waitFor(textOf(liveResult), (value) => value.includes("__tool_pwned"), 20000, "this round's tool result in the live area");
       expect(acceptance.textStats.executions).toEqual([{ text: "危险结果" }]);
 
-      const seen = async (): Promise<{
-        readonly resultText: string;
-        readonly echoedByAssistant: boolean;
-        readonly payloadRan: boolean;
-        readonly resultNodes: number;
-        readonly pageImages: number;
-      }> => ({
-        resultText: await session.evaluate<string>(resultText),
-        echoedByAssistant: (await session.evaluate<string>(textOf('[data-testid="msg-assistant"]'))).includes("__tool_pwned"),
-        payloadRan: await session.evaluate<boolean>('String(window.__tool_pwned) !== "undefined"'),
-        resultNodes: Number(
-          await session.evaluate<string>(
-            countOf('[data-testid="tool-result-content"] script, [data-testid="tool-result-content"] img'),
-          ),
+      // The run is still open, and the result is in the live area and nowhere
+      // else: nothing has settled into history yet.
+      expect(await session.evaluate<string>(runStatus)).toContain("运行中");
+      expect(await session.evaluate<string>(countOf('[data-testid="live-run"]'))).toBe("1");
+      expect(await session.evaluate<string>(countOf('[data-testid="tool-card"]'))).toBe("1");
+      expect(await session.evaluate<string>(countOf('[data-testid="live-run"] [data-testid="tool-card"]'))).toBe("1");
+      expect(await session.evaluate<string>(countOf('[data-testid="msg-assistant"]'))).toBe("0");
+
+      const liveText = await session.evaluate<string>(textOf(liveResult));
+      expect(liveText).toContain('<script>window.__tool_pwned = 1</script>');
+      expect(liveText).toContain("onerror=");
+      expect(await session.evaluate<boolean>('String(window.__tool_pwned) !== "undefined"')).toBe(false);
+      expect(
+        await session.evaluate<string>(
+          countOf('[data-testid="tool-result-content"] script, [data-testid="tool-result-content"] img'),
         ),
-        pageImages: Number(await session.evaluate<string>(countOf("img"))),
-      });
+      ).toBe("0");
+      expect(await session.evaluate<string>(countOf("img"))).toBe("0");
 
-      // Live card: shown verbatim, nothing executed, nothing created.
-      const live = await seen();
-      expect(live.resultText).toContain('<script>window.__tool_pwned = 1</script>');
-      expect(live.resultText).toContain("onerror=");
-      expect(live.payloadRan).toBe(false);
-      expect(live.resultNodes).toBe(0);
-      expect(live.pageImages).toBe(0);
-      // The payload is only in the tool result — the round's assistant message
-      // never carries it, so these assertions cannot be reading a message.
-      expect(live.echoedByAssistant).toBe(false);
-
-      // And it stays inert once the run settles and the card moves to history.
+      // Release: the run settles, the live area empties, the card becomes
+      // history — and is asked the same questions there.
+      acceptance.model.releaseDangerousResult();
       await session.waitFor(runStatus, (value) => value.includes("已完成"), 20000, "the run to finish");
-      const settled = await seen();
-      expect(settled.resultText).toContain("__tool_pwned");
-      expect(settled.payloadRan).toBe(false);
-      expect(settled.resultNodes).toBe(0);
-      expect(settled.pageImages).toBe(0);
+      expect(await session.evaluate<string>(countOf('[data-testid="live-run"]'))).toBe("0");
+
+      const canonicalResult = textOf('[data-testid="tool-result-content"]');
+      await session.waitFor(canonicalResult, (value) => value.includes("__tool_pwned"), 10000, "the canonical tool result");
+      expect(
+        await session.evaluate<string>(countOf('[data-testid="tool-card"][data-tool-name="text-stats"]')),
+      ).toBe("2");
+      const canonicalText = await session.evaluate<string>(canonicalResult);
+      expect(canonicalText).toContain('<script>window.__tool_pwned = 1</script>');
+      expect(canonicalText).toContain("onerror=");
+      expect(await session.evaluate<boolean>('String(window.__tool_pwned) !== "undefined"')).toBe(false);
+      expect(
+        await session.evaluate<string>(
+          countOf('[data-testid="tool-result-content"] script, [data-testid="tool-result-content"] img'),
+        ),
+      ).toBe("0");
+      expect(await session.evaluate<string>(countOf("img"))).toBe("0");
+      // The payload is only ever in the tool result; the round's assistant
+      // message does not carry it, so these assertions are not reading a message.
+      expect(await session.evaluate<string>(textOf('[data-testid="msg-assistant"]'))).not.toContain("__tool_pwned");
 
       expect(session.uncaughtExceptions()).toEqual([]);
     },

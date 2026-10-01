@@ -44,6 +44,20 @@ export interface OfflineModel {
   openGate(): void;
   /** How many replies are waiting right now. */
   waiting(): number;
+  /**
+   * Arms the dangerous-result hold: the next `dangerousResult` run parks at its
+   * second step — after its tool result exists and is on its way to the page,
+   * before anything settles — until `releaseDangerousResult`.
+   *
+   * This is acceptance-fixture machinery, not a product capability: it is the
+   * one deterministic moment in which a page can be asked about the live card
+   * rather than the history it becomes.
+   */
+  holdNextDangerousResult(): void;
+  /** Releases a parked dangerous-result run so it can finish. */
+  releaseDangerousResult(): void;
+  /** Whether a dangerous-result run is parked right now. */
+  dangerousResultParked(): boolean;
 }
 
 function lastUserText(request: ModelRequest): string {
@@ -64,10 +78,33 @@ export function offlineModel(): OfflineModel {
   const requests: ModelRequest[] = [];
   const gates = new Set<() => void>();
   let callId = 0;
+  let holdDangerous = false;
+  let dangerousParked = false;
+  let releaseParked: (() => void) | null = null;
 
   function nextCallId(): string {
     callId += 1;
     return `demo-${callId}`;
+  }
+
+  /** The dangerous-result hold, as an await the abort signal can also end. */
+  async function parkIfArmed(context: RuntimeContext): Promise<void> {
+    if (!holdDangerous) return;
+    holdDangerous = false;
+    dangerousParked = true;
+    const released = new Promise<void>((resolveParked) => {
+      releaseParked = resolveParked;
+    });
+    const aborted = new Promise<void>((resolveAborted) => {
+      if (context.signal.aborted) {
+        resolveAborted();
+        return;
+      }
+      context.signal.addEventListener("abort", () => resolveAborted(), { once: true });
+    });
+    await Promise.race([released, aborted]);
+    dangerousParked = false;
+    releaseParked = null;
   }
 
   async function* reply(request: ModelRequest, context: RuntimeContext): AsyncGenerator<ModelEvent> {
@@ -124,11 +161,20 @@ export function offlineModel(): OfflineModel {
       return;
     }
 
-    if (text.includes(MARKER.dangerousResult) && !sawToolResult(request, "text-stats")) {
-      // The tool really runs and really answers with its dangerous text; the
-      // answer after it stays free of that text, so a page that showed the
-      // payload could only have got it from the tool result.
-      yield { type: "tool-call", call: { callId: nextCallId(), name: "text-stats", input: { text: DANGEROUS_INPUT } } };
+    if (text.includes(MARKER.dangerousResult)) {
+      if (!sawToolResult(request, "text-stats")) {
+        // The tool really runs and really answers with its dangerous text; the
+        // answer after it stays free of that text, so a page that showed the
+        // payload could only have got it from the tool result.
+        yield { type: "tool-call", call: { callId: nextCallId(), name: "text-stats", input: { text: DANGEROUS_INPUT } } };
+        yield { type: "done" };
+        return;
+      }
+      // The observation exists and is on its way to the live presentation. When
+      // the acceptance armed the hold, the run parks here — the one moment the
+      // live card can be asserted before it becomes history.
+      await parkIfArmed(context);
+      yield { type: "text-delta", text: "统计完成。" };
       yield { type: "done" };
       return;
     }
@@ -175,6 +221,17 @@ export function offlineModel(): OfflineModel {
     },
     waiting(): number {
       return gates.size;
+    },
+    holdNextDangerousResult(): void {
+      holdDangerous = true;
+    },
+    releaseDangerousResult(): void {
+      const release = releaseParked;
+      releaseParked = null;
+      release?.();
+    },
+    dangerousResultParked(): boolean {
+      return dangerousParked;
     },
   };
 }
