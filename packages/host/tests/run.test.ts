@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { CanonicalItem, HostEvent } from "@every-dagent/protocol";
+import { MAX_PAGE_ITEMS } from "@every-dagent/protocol";
 
 import {
   abortAwareReply,
@@ -22,10 +23,41 @@ import {
   textAndToolReply,
   textReply,
   toolReply,
+  type TestClient,
 } from "./helpers/harness.js";
 
 function pluginWith(tools: Parameters<typeof testPlugin>[0]["tools"]) {
   return testPlugin({ id: "tools", tools });
+}
+
+/**
+ * One session's committed conversation, as one list.
+ *
+ * v2 keeps history out of the session summary and hands it out in bounded
+ * pages, so reading "the whole conversation" is a traversal: each page is the
+ * newest window not read yet, in log order, and the pages that follow are
+ * older — so a later page is placed in front of what is already collected.
+ * The largest legal page is asked for, so a conversation this size costs one
+ * round trip; the traversal still follows whatever cursor comes back.
+ */
+async function conversation(client: TestClient, sessionId: string): Promise<readonly CanonicalItem[]> {
+  const items: CanonicalItem[] = [];
+  let cursor: string | undefined;
+
+  for (;;) {
+    const response = await client.call(
+      "sessions.history",
+      cursor === undefined ? { sessionId, limit: MAX_PAGE_ITEMS } : { sessionId, limit: MAX_PAGE_ITEMS, cursor },
+    );
+    if (response.result === undefined) {
+      throw new Error(`sessions.history failed: ${response.error.code}`);
+    }
+
+    const page = response.result.page;
+    items.unshift(...page.items);
+    if (page.nextCursor === null) return items;
+    cursor = page.nextCursor;
+  }
 }
 
 describe("run lifecycle", () => {
@@ -96,7 +128,11 @@ describe("run lifecycle", () => {
 
     const after = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session;
     expect(after?.activeRunId).toBeNull();
-    expect(after?.canonical.map((item) => item.kind)).toEqual(["user", "assistant"]);
+    // The settled turn is history, read as its own page rather than off the summary.
+    expect((await conversation(client, session.sessionId)).map((item) => item.kind)).toEqual([
+      "user",
+      "assistant",
+    ]);
     expect(terminal.status).toBe("completed");
   });
 
@@ -188,10 +224,12 @@ describe("run lifecycle", () => {
     expect(terminal.endReason).toBe("max_steps");
     expect(terminal.error).toBeNull();
 
-    const snapshot = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session;
-    expect(snapshot?.canonical.filter((item) => item.kind === "assistant")).toHaveLength(12);
-    expect(snapshot?.canonical.filter((item) => item.kind === "tool-call")).toHaveLength(12);
-    expect(snapshot?.canonical.filter((item) => item.kind === "tool-result")).toHaveLength(12);
+    // The whole turn is one long conversation now: the traversal is what makes
+    // "every item is here" checkable page by page.
+    const history = await conversation(client, session.sessionId);
+    expect(history.filter((item) => item.kind === "assistant")).toHaveLength(12);
+    expect(history.filter((item) => item.kind === "tool-call")).toHaveLength(12);
+    expect(history.filter((item) => item.kind === "tool-result")).toHaveLength(12);
   });
 });
 
@@ -292,8 +330,7 @@ describe("live timeline", () => {
     hold.open();
     await awaitRunTerminal(client, runId);
 
-    const settled = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session;
-    expect(settled?.canonical.map((item) => item.kind)).toEqual([
+    expect((await conversation(client, session.sessionId)).map((item) => item.kind)).toEqual([
       "user",
       "assistant",
       "tool-call",
@@ -331,7 +368,7 @@ describe("live timeline", () => {
     expect(new Set(calls.map((event) => event.payload.item.invocationId)).size).toBe(3);
     expect(new Set(calls.map((event) => event.payload.item.itemId)).size).toBe(3);
 
-    const canonical = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session.canonical ?? [];
+    const canonical = await conversation(client, session.sessionId);
     expect(canonical.filter((item) => item.kind === "tool-call")).toHaveLength(3);
     expect(canonical.filter((item) => item.kind === "tool-result")).toHaveLength(3);
     expect(
@@ -455,8 +492,12 @@ describe("terminal publication", () => {
     expect(ended?.payload.run.live).toBeNull();
     expect(ended?.payload.run).toEqual(terminal);
     expect(ended?.payload.session.activeRunId).toBeNull();
-    expect(ended?.payload.session.canonical.map((item) => item.kind)).toEqual(["user", "assistant"]);
-    expect(ended?.payload.session.canonical[1]).toMatchObject({ kind: "assistant", text: "answer" });
+    // The event carries the settled summary, never the turns it settled: those
+    // are what its new history revision is read through.
+    expect(ended?.payload.session.historyRevision).toBe(1);
+    const history = await conversation(client, session.sessionId);
+    expect(history.map((item) => item.kind)).toEqual(["user", "assistant"]);
+    expect(history[1]).toMatchObject({ kind: "assistant", text: "answer" });
     expect(ended?.scope).toEqual({
       kind: "run",
       sessionId: session.sessionId,
@@ -504,8 +545,7 @@ describe("terminal publication", () => {
     expect(terminal.status).toBe("failed");
     expect(terminal.live).toBeNull();
     // The partial text was never recorded, so it is not history now.
-    const snapshot = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session;
-    expect(snapshot?.canonical.map((item) => item.kind)).toEqual(["user"]);
+    expect((await conversation(client, session.sessionId)).map((item) => item.kind)).toEqual(["user"]);
   });
 
   it("removes a cancelled step's draft without claiming anything about its tools", async () => {
@@ -532,8 +572,7 @@ describe("terminal publication", () => {
 
     expect(terminal.status).toBe("cancelled");
     expect(terminal.live).toBeNull();
-    const snapshot = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session;
-    expect(snapshot?.canonical.map((item) => item.kind)).toEqual(["user"]);
+    expect((await conversation(client, session.sessionId)).map((item) => item.kind)).toEqual(["user"]);
   });
 
   it("announces an accepted run before its own response is written", async () => {
@@ -576,15 +615,15 @@ describe("terminal publication", () => {
     const session = await createSessionThrough(client);
 
     await runToTerminal(client, session.sessionId, "one");
-    const afterFirst = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session;
-    expect(afterFirst?.canonical.map(spoken)).toEqual(["one", "first"]);
-    const firstIds = afterFirst?.canonical.map((item) => item.id);
+    const afterFirst = await conversation(client, session.sessionId);
+    expect(afterFirst.map(spoken)).toEqual(["one", "first"]);
+    const firstIds = afterFirst.map((item) => item.id);
 
     await runToTerminal(client, session.sessionId, "two");
-    const afterSecond = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session;
+    const afterSecond = await conversation(client, session.sessionId);
 
-    expect(afterSecond?.canonical).toHaveLength(4);
-    expect(afterSecond?.canonical.slice(0, 2).map((item) => item.id)).toEqual(firstIds);
-    expect(afterSecond?.canonical.map(spoken)).toEqual(["one", "first", "two", "second"]);
+    expect(afterSecond).toHaveLength(4);
+    expect(afterSecond.slice(0, 2).map((item) => item.id)).toEqual(firstIds);
+    expect(afterSecond.map(spoken)).toEqual(["one", "first", "two", "second"]);
   });
 });

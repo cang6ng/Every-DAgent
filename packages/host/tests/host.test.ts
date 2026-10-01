@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import type { CanonicalItem } from "@every-dagent/protocol";
+
 import {
   awaitRunTerminal,
   connect,
@@ -20,7 +22,7 @@ describe("host description", () => {
 
     expect(response.result).toBeDefined();
     expect(response.result).toMatchObject({
-      protocolVersion: "1",
+      protocolVersion: "2",
       capabilities: {
         sessions: true,
         runs: true,
@@ -31,10 +33,19 @@ describe("host description", () => {
         // against a profile, and every scope end clears what it owns. The
         // business registry is still empty — no shipped method exists.
         reverseRequests: true,
+        // Fixed-fence history paging and the CAS session mutations are real.
+        historyPages: true,
+        sessionMutations: true,
+        // In the frozen v2 inventory but not implemented by this milestone,
+        // reported as `false` rather than left out.
+        settings: false,
+        approvals: false,
       },
       clientCapabilities: { reverseRequests: false },
       limits: { maxActiveRuns: 1 },
-      retention: "host-lifetime",
+      // An in-memory test host says so: a durable backend never reports
+      // `ephemeral` instead of itself.
+      storage: { retention: "ephemeral" },
       host: { name: expect.any(String), version: expect.any(String) },
     });
     expect(response.result?.hostInstanceId).toEqual(expect.any(String));
@@ -64,12 +75,12 @@ describe("host description", () => {
     expect(second.result).toEqual(first.result);
   });
 
-  it("refuses a client that cannot speak generation 1", async () => {
+  it("refuses a client that cannot speak generation 2", async () => {
     const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
 
     const response = await client.call("host.describe", {
-      supportedProtocolVersions: ["2"],
+      supportedProtocolVersions: ["1"],
       client: { name: "old-client", version: "0.0.1" },
       capabilities: { reverseRequests: false },
     });
@@ -80,18 +91,22 @@ describe("host description", () => {
 });
 
 describe("session directory", () => {
-  it("starts empty and lists what it created, in creation order", async () => {
+  it("starts empty and lists the summaries it created", async () => {
     const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
-    expect((await client.call("sessions.list", {})).result?.sessions).toEqual([]);
+    expect((await client.call("sessions.list", {})).result?.sessions.items).toEqual([]);
 
     const first = await createSessionThrough(client);
     const second = await createSessionThrough(client);
 
-    const listed = (await client.call("sessions.list", {})).result?.sessions ?? [];
-    expect(listed.map((session) => session.sessionId)).toEqual([first.sessionId, second.sessionId]);
+    // v2 hands the directory out as a page of summaries, in the store's own
+    // order; what a page promises is which sessions it holds, and each item is
+    // the summary create published.
+    const listed = (await client.call("sessions.list", {})).result?.sessions.items ?? [];
+    expect(listed).toHaveLength(2);
+    expect(listed).toEqual(expect.arrayContaining([first, second]));
   });
 
   it("creates an empty, ready session with a host clock timestamp", async () => {
@@ -104,7 +119,10 @@ describe("session directory", () => {
 
     expect(session.status).toBe("ready");
     expect(session.activeRunId).toBeNull();
-    expect(session.canonical).toEqual([]);
+    // A new session's history is empty, and it says so through its high-water
+    // as well as through the page it serves.
+    expect(session.committedSeq).toBe(0);
+    expect((await client.call("sessions.history", { sessionId: session.sessionId })).result?.page.items).toEqual([]);
     expect(typeof session.createdAt).toBe("number");
     expect(session.createdAt).toBeGreaterThanOrEqual(before);
   });
@@ -144,30 +162,39 @@ describe("session directory", () => {
     expect(announced.sequence).toBe(1);
   });
 
-  it("lists summaries without the conversation, and a full snapshot on get", async () => {
+  it("lists summaries without the conversation, and never carries a canonical array", async () => {
     const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
     await createSessionThrough(client);
-    const summaries = (await client.call("sessions.list", {})).result?.sessions ?? [];
+    const summaries = (await client.call("sessions.list", {})).result?.sessions.items ?? [];
 
     expect(summaries).toHaveLength(1);
     expect(summaries[0]).not.toHaveProperty("canonical");
+    // `get` is the same summary, not a fuller read: the conversation is only
+    // ever reachable through a history page.
+    const fetched = (await client.call("sessions.get", { sessionId: summaries[0]?.sessionId as string })).result?.session;
+    expect(fetched).not.toHaveProperty("canonical");
   });
 
-  it("does not let a caller mutate host state through a returned snapshot", async () => {
+  it("does not let a caller mutate host state through a returned read", async () => {
     const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
     const created = await createSessionThrough(client);
     (created as { status: string }).status = "blocked";
-    (created.canonical as unknown[]).push({ kind: "user", id: "x", turnId: "t", text: "injected" });
+    // v2 has no canonical array to inject into; the history page is the surface
+    // a caller could try instead, and mutating what it returned must not reach
+    // the host either.
+    const page = (await client.call("sessions.history", { sessionId: created.sessionId })).result?.page;
+    (page?.items as CanonicalItem[]).push({ kind: "user", id: "x", turnId: "t", seq: 0, text: "injected" });
 
     const fetched = await client.call("sessions.get", { sessionId: created.sessionId });
     expect(fetched.result?.session.status).toBe("ready");
-    expect(fetched.result?.session.canonical).toEqual([]);
+    const reRead = (await client.call("sessions.history", { sessionId: created.sessionId })).result?.page;
+    expect(reRead?.items).toEqual([]);
   });
 });
 
@@ -180,7 +207,7 @@ describe("host lifetime", () => {
 
     const second = connect(host);
     await second.describe();
-    const listed = (await second.call("sessions.list", {})).result?.sessions ?? [];
+    const listed = (await second.call("sessions.list", {})).result?.sessions.items ?? [];
 
     expect(listed.map((entry) => entry.sessionId)).toEqual([session.sessionId]);
   });

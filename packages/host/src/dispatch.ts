@@ -1,22 +1,21 @@
 /**
- * The protocol dispatcher: every frame a client sends, and the twelve
- * operations behind them.
+ * The protocol dispatcher: every frame a client sends, and the operations behind them.
  *
  * The shape is deliberately a closed switch over the frozen operation names —
  * not a method registry, not a generic RPC front end. Each case builds the
  * response the protocol's own encoder expects for that method, so a result
  * cannot be sent under the wrong method's schema by accident.
  *
- * Two rules run through the whole module. Reads never touch the registry gate:
- * listing, fetching, cancelling and subscription traffic answer while a run or
- * a plugin lifecycle owns the registry, because the contract says an occupied
- * host still lets a client look and still lets it cancel. And a frame is
- * handled from a microtask, never from inside the channel's own callback, so a
- * transport that delivers synchronously cannot re-enter a host transaction
- * through `send`.
+ * Three rules run through the whole module. Reads never touch the registry
+ * gate: listing, fetching, cancelling and subscription traffic answer while a
+ * run or a plugin lifecycle owns the registry, because the contract says an
+ * occupied host still lets a client look and still lets it cancel. A write is
+ * refused the moment the store cannot be trusted, because an unconfirmed write
+ * is exactly what a client must not read as done. And a frame is handled from a
+ * microtask, never from inside the channel's own callback, so a transport that
+ * delivers synchronously cannot re-enter a host transaction through `send`.
  */
 
-import { createSession } from "@every-dagent/agent-core";
 import type {
   ClientCapabilities,
   ClientRequestFor,
@@ -25,7 +24,6 @@ import type {
   OperationMap,
   ProtocolError,
   ProtocolErrorCode,
-  SessionSnapshot,
   ValidationFailureReason,
 } from "@every-dagent/protocol";
 import { PROTOCOL_VERSION, decodeFrame, encodeFrame, validateMessage } from "@every-dagent/protocol";
@@ -37,24 +35,30 @@ import {
   publishEvent,
   sendFrame,
   sessionCreatedEvent,
+  sessionDeletedEvent,
 } from "./connection.js";
-import { codeForPluginFailure, protocolError, shuttingDownError } from "./errors.js";
+import {
+  codeForPluginFailure,
+  protocolError,
+  revisionConflictError,
+  shuttingDownError,
+  staleCursorError,
+  storageUnavailableError,
+} from "./errors.js";
+import { HOST_LIMITS } from "./limits.js";
+import { defaultTitle, readHistoryPage, readRunPage, readSessionPage, sessionSummaryOf } from "./history.js";
 import { answerReversePending, dropReverseForStream } from "./reverse.js";
-import { cancelRun, startRun } from "./run.js";
+import { cancelRun, readRun, startRun } from "./run.js";
 import {
   captureHostSnapshot,
   newId,
   operationFailed,
   operationSucceeded,
   pluginSummaryOf,
-  runSnapshotOf,
-  sessionEntryOf,
-  sessionSummaryOf,
   trackTask,
   type ConnectionState,
   type HostState,
   type OperationOutcome,
-  type RunEntry,
 } from "./state.js";
 
 type EncodedFrame = ReturnType<typeof encodeFrame>;
@@ -76,6 +80,12 @@ const HOST_CAPABILITIES: HostCapabilities = Object.freeze({
   // empty — no shipped method exists — but the mechanism itself is real and
   // tested, which is exactly what this flag claims.
   reverseRequests: true,
+  historyPages: true,
+  sessionMutations: true,
+  // Not implemented by this milestone, and said so rather than left out: a
+  // client can tell "not supported" from "not asked".
+  settings: false,
+  approvals: false,
 });
 
 /**
@@ -93,6 +103,7 @@ const VALIDATION_ERROR_CODES: Readonly<Record<ValidationFailureReason, ProtocolE
   UNKNOWN_EVENT: "INVALID_REQUEST",
   INVALID_MESSAGE: "INVALID_REQUEST",
   INVALID_TARGET: "INTERNAL_ERROR",
+  FRAME_TOO_LARGE: "LIMIT_EXCEEDED",
 });
 
 /** One frame: bytes in, an operation, a response out. */
@@ -148,9 +159,9 @@ export function handleFrame(state: HostState, connection: ConnectionState, frame
  * Reads one client response.
  *
  * Two kinds arrive here: an answer to a reverse request this host is still
- * waiting for, and a frame that is associated with nothing — v1 ships no
- * business method, so an unassociated response is validated and dropped without
- * answering it or touching the run it may have been meant for.
+ * waiting for, and a frame that is associated with nothing — v2 ships no
+ * business reverse method, so an unassociated response is validated and dropped
+ * without answering it or touching the run it may have been meant for.
  *
  * An associated answer has to match this connection's context before it can
  * settle anything: the instance, the stream the request was sent on, and the
@@ -236,16 +247,18 @@ function dispatchClientRequest(
 
   switch (request.method) {
     case "sessions.list": {
-      const result: OperationMap["sessions.list"]["result"] = {
-        sessions: state.sessionOrder.map((sessionId) => sessionSummaryOf(sessionEntryOf(state, sessionId).published)),
-      };
+      const page = readSessionPage(state.repository, request.params.cursor, request.params.limit);
+      if ("failure" in page) {
+        replyError(state, connection, requestId, staleCursorError());
+        return;
+      }
       sendSuccess(
         state,
         connection,
         requestId,
         encodeFrame(
           { kind: "host-response", method: "sessions.list" },
-          hostResponse(state, requestId, result),
+          hostResponse(state, requestId, { sessions: page.page }),
         ),
       );
       return;
@@ -261,20 +274,71 @@ function dispatchClientRequest(
       return;
 
     case "sessions.get": {
-      const entry = state.sessions.get(request.params.sessionId);
-      if (entry === undefined) {
+      const record = state.repository.getSession(request.params.sessionId);
+      if (record === undefined) {
         replyError(state, connection, requestId, protocolError("SESSION_NOT_FOUND"));
         return;
       }
-      const result: OperationMap["sessions.get"]["result"] = { session: entry.published };
       sendSuccess(
         state,
         connection,
         requestId,
-        encodeFrame({ kind: "host-response", method: "sessions.get" }, hostResponse(state, requestId, result)),
+        encodeFrame(
+          { kind: "host-response", method: "sessions.get" },
+          hostResponse(state, requestId, { session: sessionSummaryOf(record) }),
+        ),
       );
       return;
     }
+
+    case "sessions.history": {
+      const outcome = readHistoryPage(state.repository, request.params.sessionId, request.params.cursor, request.params.limit);
+      if (outcome.kind === "session-not-found") {
+        replyError(state, connection, requestId, protocolError("SESSION_NOT_FOUND"));
+        return;
+      }
+      if (outcome.kind === "failure") {
+        replyError(
+          state,
+          connection,
+          requestId,
+          outcome.failure === "stale" ? staleCursorError() : protocolError("INVALID_REQUEST"),
+        );
+        return;
+      }
+      sendSuccess(
+        state,
+        connection,
+        requestId,
+        encodeFrame(
+          { kind: "host-response", method: "sessions.history" },
+          hostResponse(state, requestId, { page: outcome.result.page }),
+        ),
+      );
+      return;
+    }
+
+    case "sessions.rename":
+      respond(
+        state,
+        connection,
+        requestId,
+        renameSession(state, request.params.sessionId, request.params.expectedRevision, request.params.title),
+        (result) =>
+          encodeFrame({ kind: "host-response", method: "sessions.rename" }, hostResponse(state, requestId, result)),
+      );
+      return;
+
+    case "sessions.delete":
+      respond(
+        state,
+        connection,
+        requestId,
+        deleteSession(state, request.params.sessionId, request.params.expectedRevision),
+        (result) =>
+          encodeFrame({ kind: "host-response", method: "sessions.delete" }, hostResponse(state, requestId, result)),
+      );
+      return;
 
     case "runs.start":
       respond(state, connection, requestId, startRun(state, request.params), (result) =>
@@ -282,18 +346,30 @@ function dispatchClientRequest(
       );
       return;
 
-    case "runs.get": {
-      const run = findRun(state, request.params);
-      if (run === undefined) {
-        replyError(state, connection, requestId, protocolError("RUN_NOT_FOUND"));
+    case "runs.get":
+      respond(state, connection, requestId, readRun(state, request.params), (result) =>
+        encodeFrame({ kind: "host-response", method: "runs.get" }, hostResponse(state, requestId, result)),
+      );
+      return;
+
+    case "runs.list": {
+      if (state.repository.getSession(request.params.sessionId) === undefined) {
+        replyError(state, connection, requestId, protocolError("SESSION_NOT_FOUND"));
         return;
       }
-      const result: RunResult = { run: runSnapshotOf(run) };
+      const page = readRunPage(state.repository, request.params.sessionId, request.params.cursor, request.params.limit);
+      if ("failure" in page) {
+        replyError(state, connection, requestId, staleCursorError());
+        return;
+      }
       sendSuccess(
         state,
         connection,
         requestId,
-        encodeFrame({ kind: "host-response", method: "runs.get" }, hostResponse(state, requestId, result)),
+        encodeFrame(
+          { kind: "host-response", method: "runs.list" },
+          hostResponse(state, requestId, { runs: page.page }),
+        ),
       );
       return;
     }
@@ -441,10 +517,14 @@ function describe(
     protocolVersion: PROTOCOL_VERSION,
     hostInstanceId: state.hostInstanceId,
     host: { name: state.name, version: state.version },
+    storage: {
+      storageId: state.repository.storageId,
+      retention: state.repository.retention,
+      schemaVersion: state.repository.schemaVersion,
+    },
     capabilities: HOST_CAPABILITIES,
     clientCapabilities: { reverseRequests: clientCapabilities.reverseRequests },
-    limits: { maxActiveRuns: 1 },
-    retention: "host-lifetime",
+    limits: HOST_LIMITS,
   };
 
   sendSuccess(
@@ -456,7 +536,7 @@ function describe(
 }
 
 /**
- * A new, empty session.
+ * A new, empty session, committed before it is announced.
  *
  * Allowed while the host is occupied — creating an entry changes no registry
  * and can wait for nothing — but refused once the host is shutting down, like
@@ -464,29 +544,106 @@ function describe(
  */
 function createHostSession(state: HostState): OperationOutcome<SessionResult> {
   if (state.closing) return operationFailed(shuttingDownError());
+  if (state.storageFault) return operationFailed(storageUnavailableError());
 
   const sessionId = newId();
   const createdAt = Date.now();
-  const session = createSession(sessionId);
-  const snapshot: SessionSnapshot = Object.freeze({
-    sessionId,
-    createdAt,
-    status: "ready" as const,
-    activeRunId: null,
-    canonical: Object.freeze([]),
-  });
 
-  const build = sessionCreatedEvent(snapshot);
+  let record;
+  try {
+    record = state.repository.createSession({
+      sessionId,
+      title: defaultTitle(sessionId, new Date(createdAt)),
+      createdAt,
+    });
+  } catch {
+    return operationFailed(storageUnavailableError());
+  }
+
+  const summary = sessionSummaryOf(record);
+  const build = sessionCreatedEvent(summary, state.repository.revisions);
   try {
     assertEventBuilds(state, build);
   } catch {
     return operationFailed(protocolError("INTERNAL_ERROR"));
   }
 
-  state.sessions.set(sessionId, { session, createdAt, published: snapshot, publishedSeq: 0 });
-  state.sessionOrder.push(sessionId);
   publishEvent(state, build);
-  return operationSucceeded({ session: snapshot });
+  return operationSucceeded({ session: summary });
+}
+
+/**
+ * Renames one session, against the revision the caller read.
+ *
+ * The compare-and-set is the whole operation: a rename that expected a revision
+ * the session has since moved past is refused rather than applied on top of
+ * facts the caller never saw.
+ */
+function renameSession(
+  state: HostState,
+  sessionId: string,
+  expectedRevision: number,
+  title: string,
+): OperationOutcome<SessionResult> {
+  if (state.closing) return operationFailed(shuttingDownError());
+  if (state.storageFault) return operationFailed(storageUnavailableError());
+
+  let outcome;
+  try {
+    outcome = state.repository.renameSession({ sessionId, expectedRevision, title, at: Date.now() });
+  } catch {
+    return operationFailed(storageUnavailableError());
+  }
+
+  if (outcome.kind === "not-found") return operationFailed(protocolError("SESSION_NOT_FOUND"));
+  if (outcome.kind === "revision-conflict") return operationFailed(revisionConflictError());
+
+  const summary = sessionSummaryOf(outcome.session);
+  return operationSucceeded({ session: summary });
+}
+
+/**
+ * Deletes one session, its runs and its history, as one transaction.
+ *
+ * Refused while a run of this session is live on this host or the durable row
+ * still points at one, because an execution that owns work must not have its
+ * only record deleted out from under it. The deletion is not a cancel, and the
+ * confirmation says exactly what was removed.
+ */
+function deleteSession(
+  state: HostState,
+  sessionId: string,
+  expectedRevision: number,
+): OperationOutcome<OperationMap["sessions.delete"]["result"]> {
+  if (state.closing) return operationFailed(shuttingDownError());
+  if (state.storageFault) return operationFailed(storageUnavailableError());
+
+  for (const run of state.runs.values()) {
+    if (run.sessionId === sessionId && run.terminal === undefined) {
+      return operationFailed(protocolError("HOST_BUSY"));
+    }
+  }
+
+  let outcome;
+  try {
+    outcome = state.repository.deleteSession({ sessionId, expectedRevision, at: Date.now() });
+  } catch {
+    return operationFailed(storageUnavailableError());
+  }
+
+  if (outcome.kind === "not-found") return operationFailed(protocolError("SESSION_NOT_FOUND"));
+  if (outcome.kind === "revision-conflict") return operationFailed(revisionConflictError());
+  if (outcome.kind === "busy") return operationFailed(protocolError("HOST_BUSY"));
+
+  const build = sessionDeletedEvent(sessionId, outcome.generation, state.repository.revisions);
+  try {
+    assertEventBuilds(state, build);
+  } catch {
+    return operationFailed(protocolError("INTERNAL_ERROR"));
+  }
+  publishEvent(state, build);
+
+  return operationSucceeded({ sessionId, generation: outcome.generation, deleted: true as const });
 }
 
 /**
@@ -496,12 +653,6 @@ function createHostSession(state: HostState): OperationOutcome<SessionResult> {
  * called from a microtask: an activation runs synchronously up to its first
  * await, may hand out a storage view, and may run the plugin's own code — all
  * of which a shutdown that is already waiting has to be able to see.
- *
- * Once it is running, the manager is observed immediately: its status is
- * already `enabling`/`disabling` at that point, so a slow activation is visible
- * as one rather than being invented. Whatever the observation does, the
- * lifecycle's own promise is awaited to its end — a projection failure must not
- * release the registry while a plugin is still activating or cleaning up.
  */
 function operatePlugin(
   state: HostState,
@@ -587,18 +738,6 @@ function pluginOperationError(
   return protocolError("INTERNAL_ERROR");
 }
 
-function findRun(
-  state: HostState,
-  params: { readonly runId?: string; readonly submissionId?: string },
-): RunEntry | undefined {
-  if (params.runId !== undefined) return state.runs.get(params.runId);
-  if (params.submissionId !== undefined) {
-    const runId = state.submissions.get(params.submissionId);
-    return runId === undefined ? undefined : state.runs.get(runId);
-  }
-  return undefined;
-}
-
 /** The success envelope for one request, without the method-specific encoding. */
 function hostResponse<R>(
   state: HostState,
@@ -606,7 +745,7 @@ function hostResponse<R>(
   result: R,
 ): {
   readonly kind: "host-response";
-  readonly protocolVersion: "1";
+  readonly protocolVersion: "2";
   readonly hostInstanceId: string;
   readonly requestId: string;
   readonly result: R;
@@ -645,8 +784,14 @@ function sendSuccess(
     return;
   }
   // The host could not express its own successful result. The honest answer is
-  // the error response, which does not depend on the payload that failed.
-  replyError(state, connection, requestId, protocolError("INTERNAL_ERROR"));
+  // the error response, which does not depend on the payload that failed — and
+  // when the payload was simply too large, that is what the caller is told.
+  replyError(
+    state,
+    connection,
+    requestId,
+    protocolError(encoded.failure.reason === "FRAME_TOO_LARGE" ? "LIMIT_EXCEEDED" : "INTERNAL_ERROR"),
+  );
 }
 
 function replyError(

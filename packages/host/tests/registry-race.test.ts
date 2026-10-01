@@ -227,13 +227,13 @@ describe("run versus plugin lifecycle", () => {
     });
     const runId = started.result?.run.runId as string;
 
-    expect((await client.call("sessions.list", {})).result?.sessions).toHaveLength(1);
+    expect((await client.call("sessions.list", {})).result?.sessions.items).toHaveLength(1);
     expect((await client.call("sessions.get", { sessionId: session.sessionId })).result?.session.sessionId).toBe(
       session.sessionId,
     );
     expect((await client.call("plugins.list", {})).result?.plugins).toHaveLength(1);
     expect((await client.call("runs.get", { runId })).result?.run.runId).toBe(runId);
-    expect((await client.call("subscriptions.open", {})).result?.snapshot.sessions).toHaveLength(1);
+    expect((await client.call("subscriptions.open", {})).result?.snapshot.sessions.items).toHaveLength(1);
     expect((await client.call("subscriptions.close", { streamId: "unused-stream" })).result?.closed).toBe(false);
     expect((await client.call("runs.cancel", { runId })).result?.run.cancelRequested).toBe(true);
 

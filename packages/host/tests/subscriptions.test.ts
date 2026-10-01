@@ -30,8 +30,10 @@ describe("subscriptions", () => {
     expect(snapshot?.watermark.sequence).toBe(0);
     expect(typeof snapshot?.watermark.streamId).toBe("string");
     expect(snapshot?.hostInstanceId).toBeDefined();
-    expect(snapshot?.sessions).toEqual([]);
-    expect(snapshot?.runs).toEqual([]);
+    // The snapshot is a bounded cut: each collection is a page, never a whole
+    // directory, and this host's collections hold nothing yet.
+    expect(snapshot?.sessions.items).toEqual([]);
+    expect(snapshot?.runs.items).toEqual([]);
     expect(snapshot?.plugins).toEqual([]);
   });
 
@@ -77,7 +79,7 @@ describe("subscriptions", () => {
     await flush();
 
     // The snapshot is what the host held at the cut, not what it holds now.
-    expect(opened.result?.snapshot.sessions.map((session) => session.sessionId)).toEqual([before.sessionId]);
+    expect(opened.result?.snapshot.sessions.items.map((session) => session.sessionId)).toEqual([before.sessionId]);
     expect(client.events.map((event) => event.type)).toEqual(["session.created"]);
   });
 
@@ -119,7 +121,7 @@ describe("subscriptions", () => {
     // Closed means closed: nothing is delivered any more, and the directory
     // still shows the creation.
     expect(client.events).toHaveLength(0);
-    expect((await client.call("sessions.list", {})).result?.sessions).toHaveLength(1);
+    expect((await client.call("sessions.list", {})).result?.sessions.items).toHaveLength(1);
   });
 
   it("keeps a run draining with no subscriber at all", async () => {
@@ -189,7 +191,7 @@ describe("subscription cut under a racing mutation", () => {
 
     // The snapshot is the cut taken before the mutation, and the mutation
     // arrives as the new stream's first event: nothing falls between them.
-    expect(openResponse.result?.snapshot.sessions).toEqual([]);
+    expect(openResponse.result?.snapshot.sessions.items).toEqual([]);
     expect(createResponse.result?.session.sessionId).toBe(sessionId);
 
     const first = client.events[0];

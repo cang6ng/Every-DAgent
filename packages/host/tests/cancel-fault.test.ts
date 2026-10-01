@@ -111,7 +111,10 @@ describe("cancel with an unbuildable announcement", () => {
     const after = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session;
     expect(after?.status).toBe("blocked");
     expect(after?.activeRunId).toBeNull();
-    expect(after?.canonical).toEqual([]);
+    // History is read through its own page now, and it is untouched: the run
+    // that faulted published nothing into it.
+    const history = (await client.call("sessions.history", { sessionId: session.sessionId })).result?.page;
+    expect(history?.items).toEqual([]);
 
     // Nothing from the failure reached the wire, and nothing was invented
     // afterwards: the terminal is the last thing this run published.

@@ -1,6 +1,6 @@
 /**
- * The composition root: one host, owning its sessions, its runs, its registry
- * and its connections.
+ * The composition root: one host, owning its storage, its sessions, its runs,
+ * its registry and its connections.
  *
  * The host builds everything it needs and hands out nothing. Composition — the
  * model client, the plugins, the grants — comes in; a channel goes in and only
@@ -8,10 +8,18 @@
  * that could reach around the gate, and no registry, session or manager object
  * leaves this package.
  *
- * Shutdown is a sequence, not a signal: stop accepting work, drop the readers,
- * ask the run to stop, wait for everything already accepted to actually settle,
- * and only then release the plugins. A task that never settles keeps shutdown
- * pending — the alternative would be reporting a release that did not happen.
+ * Startup is a sequence with an owner, not a checklist. Storage is opened and
+ * its schema checked first, because nothing may run against a store this build
+ * does not understand; the instance identity is minted next; the execution
+ * dependencies are composed; and the previous instance's unfinished runs are
+ * reconciled *before* the first frame can be accepted. A host that cannot
+ * finish that sequence throws here — it does not come up in a degraded mode,
+ * and a durable store that fails never turns into an in-memory one.
+ *
+ * Shutdown is the same sequence backwards: stop accepting work, drop the
+ * readers, ask the run to stop, wait for everything already accepted to settle,
+ * release the plugins, and close the store last, after every execution that
+ * could still write to it has ended.
  */
 
 import {
@@ -28,14 +36,28 @@ import { PROTOCOL_VERSION, validateMessage } from "@every-dagent/protocol";
 
 import { closeConnection, createConnection, observePlugin } from "./connection.js";
 import { handleFrame } from "./dispatch.js";
+import { HOST_LIMITS } from "./limits.js";
 import { projectPluginInfo } from "./projection.js";
+import { openRepository } from "./repository.js";
+import type { Repository } from "./repository.js";
 import { createReverseTrigger } from "./reverse.js";
 import type { ReverseProfile, ReverseTrigger } from "./reverse.js";
 import { createRegistryGate } from "./registry-gate.js";
 import { captureHostSnapshot, newId, type ConnectionState, type HostState } from "./state.js";
 
 const HOST_NAME = "every-dagent-host";
-const HOST_VERSION = "0.1.0";
+const HOST_VERSION = "0.2.0";
+
+/**
+ * Where the host's durable truth lives.
+ *
+ * There is no default that pretends to be durable: a composition that wants a
+ * store that survives the process has to name one, and the host reports what it
+ * actually got through `host.describe`.
+ */
+export type PersistenceOptions =
+  | { readonly kind: "ephemeral" }
+  | { readonly kind: "sqlite"; readonly location: string };
 
 /**
  * What the composition injects.
@@ -52,6 +74,12 @@ export interface HostOptions {
   readonly plugins: readonly Plugin[];
   readonly grants?: Readonly<Record<string, readonly PluginPermission[]>>;
   readonly storage?: (pluginId: string) => PluginStorage;
+  /**
+   * Where sessions, runs and history are kept. Defaults to `ephemeral`, which
+   * keeps them for this process's lifetime and says so; a `sqlite` location
+   * that cannot be opened stops the host from existing rather than falling back.
+   */
+  readonly persistence?: PersistenceOptions;
 }
 
 export interface Host {
@@ -76,6 +104,8 @@ export interface HostInternals {
   readonly reverseProfiles?: readonly ReverseProfile[];
   /** Test-only observer: hands out each connection's reverse trigger as it is attached. */
   readonly onAttach?: (attached: AttachedConnection) => void;
+  /** Test-only: observes the repository the host actually opened. */
+  readonly onRepository?: (repository: Repository) => void;
 }
 
 /** One attached connection, seen by tests: the channel, the trigger, the disposer. */
@@ -87,6 +117,8 @@ export interface AttachedConnection {
 
 export interface ComposedHost {
   readonly host: Host;
+  /** The repository this host is serving, for tests that inspect durable facts directly. */
+  readonly repository: Repository;
   /** Attaches like `Host.attach` and hands back the connection's own trigger. */
   attach(channel: ProtocolChannel): AttachedConnection;
 }
@@ -97,54 +129,76 @@ export function createHost(options: HostOptions): Host {
 
 /** The real composition: `createHost` is this with no internals. */
 export function composeHost(options: HostOptions, internals: HostInternals): ComposedHost {
-  const registry = createToolRegistry();
-  const manager = createPluginManager({
-    tools: registry,
-    ...(options.grants === undefined ? {} : { grants: options.grants }),
-    ...(options.storage === undefined ? {} : { storage: options.storage }),
+  const persistence = options.persistence ?? { kind: "ephemeral" };
+  const repository = openRepository({
+    location: persistence.kind === "sqlite" ? persistence.location : ":memory:",
+    limits: { maxRecordBytes: HOST_LIMITS.maxRecordBytes },
   });
-  const contextBuilder = options.contextBuilder ?? createDefaultContextBuilder();
-  const loop = createAgentLoop({
-    modelClient: options.modelClient,
-    tools: registry,
-    contextBuilder,
-  });
-  const reverseProfiles = internals.reverseProfiles ?? [];
 
-  const state: HostState = {
-    hostInstanceId: newId(),
-    name: HOST_NAME,
-    version: HOST_VERSION,
-    runtime: createAgentRuntime({ loop }),
-    registry,
-    manager,
-    gate: createRegistryGate(),
-    plugins: new Map(),
-    pluginOrder: [],
-    sessions: new Map(),
-    sessionOrder: [],
-    runs: new Map(),
-    runOrder: [],
-    submissions: new Map(),
-    connections: new Set(),
-    pending: new Set(),
-    closing: false,
-    shutdown: undefined,
-  };
+  let state: HostState;
+  try {
+    const hostInstanceId = newId();
 
-  // Registration is configuration, and configuration mistakes stop the host
-  // from existing: a host that cannot list a plugin it was given has no honest
-  // way to announce itself as ready.
-  for (const plugin of options.plugins) manager.register(plugin);
-  for (const info of manager.list()) {
-    state.plugins.set(info.manifest.id, projectPluginInfo(info));
-    state.pluginOrder.push(info.manifest.id);
+    // Reconciliation is part of coming up, not something that happens later: a
+    // previous instance's unfinished runs are settled here, before any frame
+    // can be accepted, so no client ever sees a run this host cannot explain.
+    repository.reconcileInterrupted(hostInstanceId, Date.now());
+
+    const registry = createToolRegistry();
+    const manager = createPluginManager({
+      tools: registry,
+      ...(options.grants === undefined ? {} : { grants: options.grants }),
+      ...(options.storage === undefined ? {} : { storage: options.storage }),
+    });
+    const contextBuilder = options.contextBuilder ?? createDefaultContextBuilder();
+    const loop = createAgentLoop({
+      modelClient: options.modelClient,
+      tools: registry,
+      contextBuilder,
+    });
+    const reverseProfiles = internals.reverseProfiles ?? [];
+
+    state = {
+      hostInstanceId,
+      name: HOST_NAME,
+      version: HOST_VERSION,
+      runtime: createAgentRuntime({ loop }),
+      registry,
+      manager,
+      gate: createRegistryGate(),
+      repository,
+      limits: HOST_LIMITS,
+      plugins: new Map(),
+      pluginOrder: [],
+      runs: new Map(),
+      connections: new Set(),
+      pending: new Set(),
+      storageFault: false,
+      closing: false,
+      shutdown: undefined,
+    };
+
+    // Registration is configuration, and configuration mistakes stop the host
+    // from existing: a host that cannot list a plugin it was given has no honest
+    // way to announce itself as ready.
+    for (const plugin of options.plugins) manager.register(plugin);
+    for (const info of manager.list()) {
+      state.plugins.set(info.manifest.id, projectPluginInfo(info));
+      state.pluginOrder.push(info.manifest.id);
+    }
+
+    assertSelfDescription(state);
+  } catch (error) {
+    // Nothing exists yet, so nothing is left behind: the store is released and
+    // the failure is the caller's to see.
+    repository.close();
+    throw error;
   }
 
-  assertSelfDescription(state);
+  internals.onRepository?.(repository);
 
   const attach = (channel: ProtocolChannel): AttachedConnection => {
-    const connection = attachConnection(state, channel, reverseProfiles);
+    const connection = attachConnection(state, channel, internals.reverseProfiles ?? []);
     const attached: AttachedConnection = {
       channel,
       reverse: createReverseTrigger(state, connection),
@@ -157,6 +211,7 @@ export function composeHost(options: HostOptions, internals: HostInternals): Com
   };
 
   return {
+    repository,
     host: {
       attach: (channel: ProtocolChannel): (() => void) => attach(channel).detach,
       shutdown: (): Promise<void> => shutdownHost(state),
@@ -168,9 +223,9 @@ export function composeHost(options: HostOptions, internals: HostInternals): Com
 /**
  * Checks at construction that the host can describe the state it starts in.
  *
- * A cheap, honest gate: if the plugin summaries or the empty catalogues could
- * not be published as a snapshot, the host would fail on the first client
- * instead of failing here, where the composition can still see why.
+ * A cheap, honest gate: if the bounded snapshot could not be published as a
+ * frame, the host would fail on the first client instead of failing here, where
+ * the composition can still see why.
  */
 function assertSelfDescription(state: HostState): void {
   const result: OperationMap["subscriptions.open"]["result"] = {
@@ -298,6 +353,12 @@ async function executeShutdown(state: HostState): Promise<void> {
   await state.gate.idle();
 
   const unreleased = await releasePlugins(state);
+
+  // The store is released last, and it is released even when a plugin could not
+  // be: an execution that is over must not leave the file locked, and the
+  // plugin failure is reported rather than swallowed by the order.
+  state.repository.close();
+
   if (unreleased.length > 0) {
     throw new Error(`the host could not release: ${unreleased.join(", ")}`);
   }

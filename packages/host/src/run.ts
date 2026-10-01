@@ -1,27 +1,36 @@
 /**
  * Runs: who may start one, what happens while it is alive, and how it ends.
  *
- * Three rules shape everything in this module.
+ * Four rules shape everything in this module.
+ *
+ * Durable before live, always. A run is committed as accepted before it is
+ * announced, its start marker is committed before the Runtime is handed
+ * anything to execute, and its terminal is committed before any client is told
+ * the outcome. Each of those is a single synchronous transaction, so there is
+ * no window in which the host has said something it has not recorded.
  *
  * Ownership is taken before a run exists and released only after the Runtime's
  * iterator has settled — not when `turn/end` arrives, not when `abort()` is
  * called. The stream's own completion is the only event that means the Core is
  * done, and everything that must not overlap it waits on exactly that.
  *
+ * A window, not a session. Each run loads the bounded suffix of committed turns
+ * it needs and releases it when it settles; the rest of the log stays in
+ * storage. That is why a long conversation costs the same as a short one to
+ * continue, and why nothing here can accidentally read all of history.
+ *
  * Publication never gates work. The drain is owned by the host, so a run
  * finishes with no subscriber, no client, and no reading browser, or with a
  * connection that dies mid-flight.
- *
- * A fact is only announced once the host knows it can express it. The event is
- * built, checked, and only then applied to host state and sent, so a terminal
- * correction is either fully visible or not visible at all.
  */
 
+import { restoreSessionWindow } from "@every-dagent/agent-core";
 import type { AgentRuntime, RuntimeEvent, Session, TurnEndReason } from "@every-dagent/agent-core";
 import type {
   LiveToolItem,
   OperationMap,
-  SessionSnapshot,
+  ProtocolError,
+  SessionSummary,
   TerminalRunSnapshot,
 } from "@every-dagent/protocol";
 
@@ -34,61 +43,90 @@ import {
   runToolCallEvent,
   runToolResultEvent,
   runUpdatedEvent,
+  sessionUpdatedEvent,
   type EventBuilder,
 } from "./connection.js";
-import { protocolError, shuttingDownError } from "./errors.js";
+import {
+  limitExceededError,
+  protocolError,
+  shuttingDownError,
+  storageUnavailableError,
+  storedProtocolError,
+} from "./errors.js";
+import { sessionSummaryOf } from "./history.js";
 import { ProjectionError, projectDisplayInput, projectSettledTurn } from "./projection.js";
+import {
+  encodeStoredData,
+  RecordTooLargeError,
+  submissionHash,
+  toSessionEvent,
+  type CommitTurnResult,
+  type StoredRecord,
+} from "./repository.js";
 import {
   activeRunSnapshotOf,
   newId,
   operationFailed,
   operationSucceeded,
   runSnapshotOf,
-  sessionEntryOf,
+  runSnapshotOfRecord,
+  terminalSnapshotOfRecord,
   trackTask,
-  withActiveRun,
-  withCanonical,
   type HostState,
   type OperationOutcome,
   type RunEntry,
+  type TerminatedRun,
 } from "./state.js";
 
 type RunResult = OperationMap["runs.start"]["result"];
 
+/** How many turns and bytes one execution window may load. Not a history cap — a per-run read bound. */
+const WINDOW_MAX_TURNS = 16;
+const WINDOW_MAX_BYTES = 256 * 1024;
+
+/** How much live timeline one run may publish before the view is marked truncated. */
+const MAX_LIVE_ITEMS = 200;
+const MAX_LIVE_BYTES = 128 * 1024;
+
 /**
  * Accepts one submission, or reports why it was refused.
  *
- * The whole admission is one synchronous step, and it is the only place a run
- * begins: the registry token, the run record, the submission record, the
- * session's active-run pointer and the accepted event all land together. A
- * second submission arriving before this one returns finds the records already
- * in place, so "two runs from one submission" is not a race to be survived but
- * a state that cannot be reached.
+ * The durable admission is one transaction and it is the only place a run
+ * begins: the submission identity, the accepted run, the session's active-run
+ * pointer and its revision all land together, or none of them do. A second
+ * submission arriving before this one returns finds the records already in
+ * place, so "two runs from one submission" is not a race to be survived but a
+ * state that cannot be reached.
+ *
+ * The dedup read comes first, before the execution lease is taken, because a
+ * resubmitted request that was already accepted has to answer with its original
+ * run even while this host is busy with something else.
  */
 export function startRun(
   state: HostState,
   params: { readonly sessionId: string; readonly submissionId: string; readonly text: string },
 ): OperationOutcome<RunResult> {
-  // Dedup comes first, and it outranks busy: a resubmitted request that was
-  // already accepted returns its original run even while the host is occupied.
-  const claimed = state.submissions.get(params.submissionId);
-  if (claimed !== undefined) {
-    const previous = state.runs.get(claimed);
-    if (previous !== undefined) {
-      if (previous.sessionId === params.sessionId && previous.text === params.text) {
-        return operationSucceeded({ run: runSnapshotOf(previous) });
-      }
-      return operationFailed(protocolError("SUBMISSION_CONFLICT"));
-    }
+  const textBytes = Buffer.byteLength(params.text, "utf8");
+  if (textBytes > state.limits.maxInputBytes) {
+    // Refused before admission, so nothing is recorded that could not be
+    // answered later: the input bound is checked while it is still a request.
+    return operationFailed(limitExceededError());
   }
-
   if (state.closing) return operationFailed(shuttingDownError());
 
-  const entry = state.sessions.get(params.sessionId);
-  if (entry === undefined) return operationFailed(protocolError("SESSION_NOT_FOUND"));
-  if (entry.published.status === "blocked") {
-    return operationFailed(protocolError("SESSION_UNAVAILABLE"));
+  const inputHash = submissionHash(params.sessionId, params.text);
+  const known = state.repository.getSubmission(params.submissionId);
+  if (known !== undefined) {
+    if (known.state === "retired") return operationFailed(protocolError("SUBMISSION_RETIRED"));
+    if (known.sessionId !== params.sessionId || known.inputHash !== inputHash) {
+      return operationFailed(protocolError("SUBMISSION_CONFLICT"));
+    }
+    const previous = known.runId === null ? undefined : state.repository.getRun(known.runId);
+    if (previous !== undefined) return operationSucceeded({ run: runSnapshotOfRecord(previous, storedError(previous.errorCode)) });
+    return operationFailed(protocolError("SUBMISSION_CONFLICT"));
   }
+
+  if (state.storageFault) return operationFailed(storageUnavailableError());
 
   // Waiting is not an option the contract offers, so the decision is made by
   // execution order: either this call has the registry or it does not. A ready
@@ -98,32 +136,84 @@ export function startRun(
   const lease = state.gate.tryAcquire("execution");
   if (lease === undefined) return operationFailed(protocolError("HOST_BUSY"));
 
+  const runId = newId();
+  const acceptedAt = Date.now();
+
+  let admission;
+  try {
+    admission = state.repository.admitRun({
+      runId,
+      submissionId: params.submissionId,
+      sessionId: params.sessionId,
+      text: params.text,
+      inputHash,
+      hostInstanceId: state.hostInstanceId,
+      acceptedAt,
+    });
+  } catch {
+    markStorageFault(state);
+    lease.release();
+    return operationFailed(storageUnavailableError());
+  }
+
+  switch (admission.kind) {
+    case "conflict":
+      lease.release();
+      return operationFailed(protocolError("SUBMISSION_CONFLICT"));
+    case "retired":
+      lease.release();
+      return operationFailed(protocolError("SUBMISSION_RETIRED"));
+    case "session-not-found":
+      lease.release();
+      return operationFailed(protocolError("SESSION_NOT_FOUND"));
+    case "session-blocked":
+      lease.release();
+      return operationFailed(protocolError("SESSION_UNAVAILABLE"));
+    case "session-busy":
+      lease.release();
+      return operationFailed(protocolError("HOST_BUSY"));
+    case "existing":
+      // Another connection admitted this submission between the read above and
+      // this transaction. Its run is the answer, and this call executes nothing.
+      lease.release();
+      return operationSucceeded({
+        run: runSnapshotOfRecord(admission.run, storedError(admission.run.errorCode)),
+      });
+    case "admitted":
+      break;
+  }
+
   const run: RunEntry = {
-    runId: newId(),
+    runId,
     submissionId: params.submissionId,
     sessionId: params.sessionId,
     text: params.text,
     controller: new AbortController(),
     lease,
+    acceptedAt,
+    startedAt: null,
     turnId: null,
     cancelRequested: false,
     stage: "accepted",
     live: [],
+    liveBytes: 0,
+    liveTruncated: false,
     textItemIndex: undefined,
     posTool: undefined,
     nextLiveId: 0,
     observedEnd: undefined,
     faulted: false,
+    window: undefined,
     terminal: undefined,
   };
 
   const accepted = activeRunSnapshotOf(run);
   const build = runUpdatedEvent(run, accepted);
-  const session = withActiveRun(entry.published, run.runId);
-
   try {
     assertEventBuilds(state, build);
   } catch {
+    // The run is durable and will be reconciled at the next start; this host
+    // simply cannot describe it, so it may not execute it either.
     lease.release();
     return operationFailed(protocolError("INTERNAL_ERROR"));
   }
@@ -136,13 +226,7 @@ export function startRun(
   const task = Promise.resolve().then(() => drainRun(state, run));
   trackTask(state, task);
 
-  // The commit itself: dedup, run record, session pointer. Nothing external
-  // happens between these lines.
   state.runs.set(run.runId, run);
-  state.runOrder.push(run.runId);
-  state.submissions.set(params.submissionId, run.runId);
-  entry.published = session;
-
   publishEvent(state, build);
   return operationSucceeded({ run: accepted });
 }
@@ -150,45 +234,78 @@ export function startRun(
 /**
  * Requests cancellation of one run.
  *
- * The order is deliberate. The request becomes a fact first, the signal is
+ * The order is deliberate. The intent is recorded durably first, the signal is
  * aborted second — outside any state transaction, because abort listeners are
  * arbitrary code — and only then is the change expressed as an event. Nothing
  * waits for the turn to stop: the caller gets the current snapshot, and the
  * run's real outcome arrives when the Core settles.
  *
- * A failure to express the event is not a transport problem and not a reason to
- * pretend the cancel was never announced: it means the host cannot honestly
- * describe this run's state any more. The run is marked faulted, the abort still
- * happens, the stream is still drained to its end, and the settle reports
- * `host_error` with a blocked session instead of a clean cancellation.
+ * A store that cannot record the intent is reported as a failure rather than
+ * dressed up as a durable request — but it never stops the abort. Stopping work
+ * is the one thing a broken store must not prevent.
  */
 export function cancelRun(state: HostState, runId: string): OperationOutcome<RunResult> {
   const run = state.runs.get(runId);
-  if (run === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
-  if (run.terminal !== undefined) return operationSucceeded({ run: run.terminal });
+  if (run !== undefined) {
+    if (run.terminal !== undefined) return operationSucceeded({ run: run.terminal.snapshot });
+    if (run.cancelRequested) return operationSucceeded({ run: runSnapshotOf(run) });
 
-  if (!run.cancelRequested) {
-    // 1. The request, recorded synchronously and before anything can interrupt
-    //    the turn.
     run.cancelRequested = true;
-    // 2. The signal. Listeners may call back into the host; no state commit is
-    //    in progress at this point, and the snapshot below is built from state
-    //    that is already final.
+    let durable = true;
+    try {
+      state.repository.requestCancel(runId, Date.now());
+    } catch {
+      markStorageFault(state);
+      durable = false;
+    }
+
     run.controller.abort();
-    // 3. The announcement. Both steps happen in this order and in this single
-    //    synchronous block, so no settlement can slip in between and turn this
-    //    into an active-state event about a finished run.
     try {
       publishValidatedEvent(state, runUpdatedEvent(run, activeRunSnapshotOf(run)));
     } catch {
-      // Nothing about the failure is published: the exception may carry
-      // plugin- or provider-authored text, and the fault is expressed through
-      // the run's outcome instead.
       run.faulted = true;
     }
+
+    return durable
+      ? operationSucceeded({ run: runSnapshotOf(run) })
+      : operationFailed(storageUnavailableError());
   }
 
-  return operationSucceeded({ run: runSnapshotOf(run) });
+  const record = state.repository.getRun(runId);
+  if (record === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
+  if (record.status === "accepted" || record.status === "running") {
+    // Reconciliation runs before this host is ready, so an unfinished run with
+    // no live entry is not a state this host can act on.
+    return operationFailed(protocolError("HOST_BUSY"));
+  }
+  // A committed terminal is never re-opened, and cancelling one executes nothing.
+  return operationSucceeded({ run: runSnapshotOfRecord(record, storedError(record.errorCode)) });
+}
+
+/**
+ * Reads one run: the live one if this host is running it, otherwise the durable
+ * record. Never an execution.
+ */
+export function readRun(state: HostState, params: { readonly runId?: string; readonly submissionId?: string }): OperationOutcome<RunResult> {
+  if (params.runId !== undefined) {
+    const live = state.runs.get(params.runId);
+    if (live !== undefined) return operationSucceeded({ run: runSnapshotOf(live) });
+    const record = state.repository.getRun(params.runId);
+    if (record === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
+    return operationSucceeded({ run: runSnapshotOfRecord(record, storedError(record.errorCode)) });
+  }
+
+  const submissionId = params.submissionId;
+  if (submissionId === undefined) return operationFailed(protocolError("INVALID_REQUEST"));
+  const known = state.repository.getSubmission(submissionId);
+  if (known === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
+  if (known.state === "retired") return operationFailed(protocolError("SUBMISSION_RETIRED"));
+  if (known.runId === null) return operationFailed(protocolError("RUN_NOT_FOUND"));
+  const live = state.runs.get(known.runId);
+  if (live !== undefined) return operationSucceeded({ run: runSnapshotOf(live) });
+  const record = state.repository.getRun(known.runId);
+  if (record === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
+  return operationSucceeded({ run: runSnapshotOfRecord(record, storedError(record.errorCode)) });
 }
 
 /**
@@ -201,11 +318,7 @@ export function cancelRun(state: HostState, runId: string): OperationOutcome<Run
  */
 async function drainRun(state: HostState, run: RunEntry): Promise<void> {
   try {
-    attempt(run, () => {
-      if (run.stage === "running") return;
-      run.stage = "running";
-      publishValidatedEvent(state, runUpdatedEvent(run, activeRunSnapshotOf(run)));
-    });
+    if (!beginRun(state, run)) return;
 
     let completed = false;
     try {
@@ -220,14 +333,71 @@ async function drainRun(state: HostState, run: RunEntry): Promise<void> {
 
     finalizeRun(state, run, completed);
   } finally {
+    run.window = undefined;
     run.lease.release();
   }
 }
 
+/**
+ * The durable start marker, taken before the Runtime exists.
+ *
+ * Everything the run will do waits on this: a run whose start was never
+ * committed may not call a model or a tool, because the record would then
+ * disagree with what actually happened. A store that cannot record the start
+ * stops the run here, and the accepted record stays behind for the next start
+ * to reconcile as `not-started`.
+ */
+function beginRun(state: HostState, run: RunEntry): boolean {
+  try {
+    const record = state.repository.markRunStarted(run.runId, state.hostInstanceId, Date.now());
+    run.startedAt = record.startedAt ?? Date.now();
+    run.stage = "running";
+  } catch {
+    markStorageFault(state);
+    failRun(state, run);
+    return false;
+  }
+
+  attempt(run, () => {
+    publishValidatedEvent(state, runUpdatedEvent(run, activeRunSnapshotOf(run)));
+  });
+
+  const window = loadWindow(state, run);
+  if (window === undefined) {
+    run.faulted = true;
+    failRun(state, run);
+    return false;
+  }
+  run.window = window;
+  return true;
+}
+
+/**
+ * The bounded suffix of committed turns this run continues.
+ *
+ * The window is a read of storage, not a restore of the session: a long
+ * conversation costs the same here as a short one, and the part that is not
+ * loaded is never presented as if it were.
+ */
+function loadWindow(state: HostState, run: RunEntry): RunEntry["window"] {
+  try {
+    const read = state.repository.readTurnWindow(run.sessionId, WINDOW_MAX_TURNS, WINDOW_MAX_BYTES);
+    const session: Session = restoreSessionWindow(run.sessionId, {
+      baseSeq: read.baseSeq,
+      nextSeq: read.nextSeq,
+      events: read.records.map(toSessionEvent),
+    });
+    return { session, baseSeq: read.baseSeq, loadedSeq: read.records.length };
+  } catch {
+    return undefined;
+  }
+}
+
 function runtimeStream(state: HostState, run: RunEntry): AsyncIterable<RuntimeEvent> {
-  const session: Session = sessionEntryOf(state, run.sessionId).session;
+  const window = run.window;
+  if (window === undefined) throw new ProjectionError("the run has no loaded window");
   const runtime: AgentRuntime = state.runtime;
-  return runtime.stream({ session, text: run.text, signal: run.controller.signal });
+  return runtime.stream({ session: window.session, text: run.text, signal: run.controller.signal });
 }
 
 /**
@@ -275,7 +445,7 @@ function observeRuntimeEvent(state: HostState, run: RunEntry, event: RuntimeEven
       }
       // The reason is recorded, not published and not acted on: a turn end is
       // not a settled execution, and it becomes an outcome only once the
-      // iterator has finished and the log agrees with it.
+      // iterator has finished and the committed log agrees with it.
       run.observedEnd = event.reason;
       return;
   }
@@ -290,6 +460,17 @@ function bindTurnId(state: HostState, run: RunEntry, turnId: string): void {
   publishValidatedEvent(state, runUpdatedEvent(run, activeRunSnapshotOf(run)));
 }
 
+/** Whether the live timeline is still being published, and still within its bounds. */
+function liveHasRoom(run: RunEntry, cost: number): boolean {
+  if (run.liveTruncated) return false;
+  if (run.live.length >= MAX_LIVE_ITEMS || run.liveBytes + cost > MAX_LIVE_BYTES) {
+    // The run keeps going; only the view stops growing, and it says so.
+    run.liveTruncated = true;
+    return false;
+  }
+  return true;
+}
+
 /**
  * Appends one text chunk to the open text item, or opens one.
  *
@@ -297,6 +478,8 @@ function bindTurnId(state: HostState, run: RunEntry, turnId: string): void {
  * carry never becomes part of the run's published live view.
  */
 function appendLiveText(state: HostState, run: RunEntry, text: string): void {
+  if (!liveHasRoom(run, Buffer.byteLength(text, "utf8"))) return;
+
   const index = run.textItemIndex;
   let itemId: string;
 
@@ -307,6 +490,7 @@ function appendLiveText(state: HostState, run: RunEntry, text: string): void {
     commitLive(state, build, () => {
       run.textItemIndex = run.live.length;
       run.live.push(item);
+      run.liveBytes += Buffer.byteLength(text, "utf8");
     });
     return;
   }
@@ -319,6 +503,7 @@ function appendLiveText(state: HostState, run: RunEntry, text: string): void {
   const build = runOutputDeltaEvent(run, itemId, text);
   commitLive(state, build, () => {
     run.live[index] = Object.freeze({ kind: "text" as const, itemId, text: previous.text + text });
+    run.liveBytes += Buffer.byteLength(text, "utf8");
   });
 }
 
@@ -338,6 +523,7 @@ function openLiveToolCall(
   if (run.posTool !== undefined) {
     throw new ProjectionError("a tool call arrived while another call was still open");
   }
+  if (!liveHasRoom(run, 256)) return;
 
   const item: LiveToolItem = Object.freeze({
     kind: "tool" as const,
@@ -358,6 +544,7 @@ function openLiveToolCall(
       name: item.name,
     };
     run.live.push(item);
+    run.liveBytes += 256;
     // A tool call ends the current text item: the next chunk starts a new one.
     run.textItemIndex = undefined;
   });
@@ -381,6 +568,7 @@ function closeLiveToolCall(
   if (open.callId !== event.callId || open.name !== event.name) {
     throw new ProjectionError("a tool result did not match the open call");
   }
+  if (run.liveTruncated) return;
 
   const build = runToolResultEvent(run, open.invocationId, event.ok, event.content);
   commitLive(state, build, () => {
@@ -396,36 +584,37 @@ function closeLiveToolCall(
   });
 }
 
-interface TerminalCommit {
-  readonly run: TerminalRunSnapshot;
-  readonly session: SessionSnapshot;
-  /** The log cursor this commit publishes up to. */
-  readonly nextSeq: number;
-  readonly build: EventBuilder;
+/** The committed suffix one settled run is about to add. */
+interface TerminalBatch {
+  readonly turnId: string;
+  readonly reason: TurnEndReason;
+  readonly turnStartSeq: number;
+  readonly records: readonly StoredRecord[];
 }
 
 function finalizeRun(state: HostState, run: RunEntry, completed: boolean): void {
   if (completed && !run.faulted) {
-    const record = coreTerminal(state, run);
-    if (record !== undefined && applyTerminal(state, run, record)) return;
+    const batch = coreTerminal(state, run);
+    if (batch !== undefined && commitTerminal(state, run, batch)) return;
   }
-
-  const failure = hostFaultTerminal(state, run);
-  if (applyTerminal(state, run, failure)) return;
-
-  // Unreachable: the failure commit is built from state the protocol already
-  // accepted, so it cannot fail its own check. It is here so that a future
-  // change which breaks that assumption leaves the host's own directories
-  // consistent — a settled run and a session that no longer points at it —
-  // rather than a run that stays active forever.
-  applyTerminalLocally(state, run, failure);
+  failRun(state, run);
 }
 
-/** The Core's own outcome, read from the settled log — or `undefined` if the host cannot vouch for it. */
-function coreTerminal(state: HostState, run: RunEntry): TerminalCommit | undefined {
+/**
+ * The Core's own outcome, read from the settled window — or `undefined` if the
+ * host cannot vouch for it.
+ *
+ * This is where a run stops being tentative. The events the turn appended are
+ * the only source: not the live timeline, not the stream's own end event. A
+ * segment that is incomplete, misnumbered, or about a different turn than the
+ * one this run bound is refused, and the run ends as a host failure instead of
+ * becoming a plausible but wrong history.
+ */
+function coreTerminal(state: HostState, run: RunEntry): TerminalBatch | undefined {
   try {
-    const entry = sessionEntryOf(state, run.sessionId);
-    const events = entry.session.events().slice(entry.publishedSeq);
+    const window = run.window;
+    if (window === undefined) throw new ProjectionError("the run never loaded a window");
+    const events = window.session.events().slice(window.loadedSeq);
     if (events.length === 0) {
       throw new ProjectionError("the run settled without recording a turn");
     }
@@ -436,108 +625,169 @@ function coreTerminal(state: HostState, run: RunEntry): TerminalCommit | undefin
       throw new ProjectionError("the run recorded a turn it never bound");
     }
 
+    const turnStartSeq = window.baseSeq + window.loadedSeq;
     const turn = projectSettledTurn({
       sessionId: run.sessionId,
       events,
       expectedText: run.text,
       expectedTurnId: run.turnId,
-      startSeq: entry.publishedSeq,
+      startSeq: turnStartSeq,
     });
     if (run.observedEnd !== turn.reason) {
       throw new ProjectionError("the stream outcome disagrees with the recorded turn");
     }
 
-    const terminal = terminalSnapshotOf(run, turn.reason);
-    const session = withCanonical(entry.published, [...entry.published.canonical, ...turn.items]);
-    return {
-      run: terminal,
-      session,
-      nextSeq: entry.publishedSeq + events.length,
-      build: runEndedEvent(run, terminal, session),
-    };
+    const records: StoredRecord[] = events.map((event) =>
+      Object.freeze({
+        seq: event.seq,
+        turnId: event.turnId,
+        type: event.type,
+        time: event.time,
+        data: encodeStoredData(event),
+      }),
+    );
+    return { turnId: run.turnId, reason: turn.reason, turnStartSeq, records };
   } catch {
     return undefined;
   }
 }
 
 /**
- * The host's own failure outcome.
+ * The terminal commit: the turn's events, the run's outcome and the session's
+ * new summary, in one transaction.
  *
- * The previously published canonical is kept exactly as it is and the session
- * is blocked: a turn the host could not validate is not repaired, not
- * completed, and not turned into history.
+ * Nothing is published before this returns. A commit that fails leaves the
+ * durable record exactly as it was — an unfinished run the next start will
+ * reconcile — and this host then says what it honestly can, which is not the
+ * same as claiming the outcome was recorded.
  */
-function hostFaultTerminal(state: HostState, run: RunEntry): TerminalCommit {
-  const entry = sessionEntryOf(state, run.sessionId);
-  const terminal: TerminalRunSnapshot = Object.freeze({
-    runId: run.runId,
-    submissionId: run.submissionId,
-    sessionId: run.sessionId,
-    text: run.text,
-    turnId: run.turnId,
-    cancelRequested: run.cancelRequested,
-    status: "failed" as const,
-    endReason: "host_error" as const,
-    error: protocolError("INTERNAL_ERROR"),
-    live: null,
-  });
-  const session: SessionSnapshot = Object.freeze({
-    ...entry.published,
-    status: "blocked" as const,
-    activeRunId: null,
-  });
+function commitTerminal(state: HostState, run: RunEntry, batch: TerminalBatch): boolean {
+  let result: CommitTurnResult;
+  try {
+    result = state.repository.commitTurn({
+      runId: run.runId,
+      sessionId: run.sessionId,
+      turnId: batch.turnId,
+      reason: batch.reason,
+      turnStartSeq: batch.turnStartSeq,
+      records: batch.records,
+      endedAt: Date.now(),
+    });
+  } catch (error) {
+    if (error instanceof RecordTooLargeError) {
+      // A settled turn the store cannot keep whole. Truncating it would make a
+      // different conversation, so the turn is refused and the session is
+      // blocked with the old canonical untouched.
+      markSessionBlocked(state, run.sessionId);
+      return false;
+    }
+    markStorageFault(state);
+    return false;
+  }
 
-  return {
-    run: terminal,
-    session,
-    nextSeq: entry.publishedSeq,
-    build: runEndedEvent(run, terminal, session),
-  };
+  const snapshot = terminalSnapshotOfRecord(result.run, null);
+  const summary = sessionSummaryOf(result.session);
+  applyTerminal(state, run, { snapshot, summary, revisions: result.revisions });
+  return true;
 }
 
-function terminalSnapshotOf(run: RunEntry, reason: TurnEndReason): TerminalRunSnapshot {
-  const base = {
+/**
+ * The host's own failure outcome.
+ *
+ * The previously committed canonical is kept exactly as it is and the session
+ * is blocked: a turn the host could not validate or could not keep whole is not
+ * repaired, not completed, and not turned into history. When the store cannot
+ * record even this, the in-memory outcome is published and the durable record
+ * deliberately stays unfinished — the next start will reconcile it to
+ * `interrupted`, which is what the store actually knows.
+ */
+function failRun(state: HostState, run: RunEntry): void {
+  const at = Date.now();
+  const failure = protocolError("INTERNAL_ERROR");
+
+  if (!state.storageFault) {
+    try {
+      const result = state.repository.failRun({
+        runId: run.runId,
+        sessionId: run.sessionId,
+        blockedReason: "host-fault",
+        errorCode: failure.code,
+        endedAt: at,
+        turnId: run.turnId,
+      });
+      applyTerminal(state, run, {
+        snapshot: terminalSnapshotOfRecord(result.run, failure),
+        summary: sessionSummaryOf(result.session),
+        revisions: result.revisions,
+      });
+      return;
+    } catch {
+      markStorageFault(state);
+    }
+  }
+
+  const summary = readSummary(state, run.sessionId);
+  if (summary === null) {
+    // Even the session cannot be read. The run is marked terminal for this
+    // host's own readers and nothing is published, because there is no honest
+    // session summary to publish it with.
+    run.terminal = {
+      snapshot: localFailureSnapshot(run, failure),
+      summary: localBlockedSummary(run.sessionId),
+      revisions: state.repository.revisions,
+    };
+    return;
+  }
+  applyTerminal(state, run, {
+    snapshot: localFailureSnapshot(run, failure),
+    summary: Object.freeze({ ...summary, status: "blocked" as const, blockedReason: "host-fault" as const, activeRunId: null }),
+    revisions: state.repository.revisions,
+  });
+}
+
+function localFailureSnapshot(run: RunEntry, error: ProtocolError): TerminalRunSnapshot {
+  return Object.freeze({
     runId: run.runId,
     submissionId: run.submissionId,
     sessionId: run.sessionId,
     text: run.text,
     turnId: run.turnId,
     cancelRequested: run.cancelRequested,
-  };
+    acceptedAt: run.acceptedAt,
+    startedAt: run.startedAt,
+    endedAt: Date.now(),
+    status: "failed" as const,
+    endReason: "host_error" as const,
+    error,
+    executionKnowledge: null,
+    live: null,
+  });
+}
 
-  switch (reason) {
-    case "completed":
-      return Object.freeze({
-        ...base,
-        status: "completed" as const,
-        endReason: "completed" as const,
-        error: null,
-        live: null,
-      });
-    case "max_steps":
-      return Object.freeze({
-        ...base,
-        status: "limited" as const,
-        endReason: "max_steps" as const,
-        error: null,
-        live: null,
-      });
-    case "cancelled":
-      return Object.freeze({
-        ...base,
-        status: "cancelled" as const,
-        endReason: "cancelled" as const,
-        error: null,
-        live: null,
-      });
-    case "error":
-      return Object.freeze({
-        ...base,
-        status: "failed" as const,
-        endReason: "error" as const,
-        error: protocolError("INTERNAL_ERROR"),
-        live: null,
-      });
+function localBlockedSummary(sessionId: string): SessionSummary {
+  // Only reached when the session row itself cannot be read; the fields are the
+  // minimum a blocked session has to state, and none of them is invented.
+  return Object.freeze({
+    sessionId,
+    generation: 1,
+    title: "会话",
+    createdAt: 0,
+    updatedAt: 0,
+    status: "blocked" as const,
+    blockedReason: "host-fault" as const,
+    metadataRevision: 0,
+    historyRevision: 0,
+    committedSeq: 0,
+    activeRunId: null,
+  });
+}
+
+function readSummary(state: HostState, sessionId: string): SessionSummary | null {
+  try {
+    const record = state.repository.getSession(sessionId);
+    return record === undefined ? null : sessionSummaryOf(record);
+  } catch {
+    return null;
   }
 }
 
@@ -545,35 +795,57 @@ function terminalSnapshotOf(run: RunEntry, reason: TurnEndReason): TerminalRunSn
  * The terminal correction, as one indivisible step.
  *
  * Everything a reader could ask about moves here and nowhere else: the run
- * becomes terminal with no live timeline, the session loses its active-run
- * pointer and gains the newly settled items, and the single event that carries
- * both is queued. There is no `await` and no call into the channel between
- * these lines, so a read or a snapshot cannot land in the middle of it.
+ * becomes terminal with no live timeline, the session's summary is replaced
+ * with the one the commit produced, and the single event that carries both is
+ * queued. There is no `await` and no call into the channel between these lines,
+ * so a read or a snapshot cannot land in the middle of it.
  */
-function applyTerminal(state: HostState, run: RunEntry, record: TerminalCommit): boolean {
+function applyTerminal(state: HostState, run: RunEntry, record: TerminatedRun): void {
+  const build = runEndedEvent(run, record.snapshot, record.summary, record.revisions);
   try {
-    assertEventBuilds(state, record.build);
+    assertEventBuilds(state, build);
   } catch {
-    return false;
+    applyTerminalLocally(state, run, record);
+    return;
   }
 
-  run.terminal = record.run;
-  const entry = sessionEntryOf(state, run.sessionId);
-  entry.published = record.session;
-  entry.publishedSeq = record.nextSeq;
-  publishEvent(state, record.build);
-  return true;
+  run.terminal = record;
+  publishEvent(state, build);
 }
 
-/** The same commit without an announcement. See the note in `finalizeRun`. */
-function applyTerminalLocally(state: HostState, run: RunEntry, record: TerminalCommit): void {
-  run.terminal = record.run;
-  const entry = sessionEntryOf(state, run.sessionId);
-  entry.published = record.session;
-  entry.publishedSeq = record.nextSeq;
+/** The same commit without an announcement. */
+function applyTerminalLocally(state: HostState, run: RunEntry, record: TerminatedRun): void {
+  run.terminal = record;
 }
 
 function newLiveId(run: RunEntry, kind: string): string {
   run.nextLiveId += 1;
   return `${run.runId}:${kind}${run.nextLiveId}`;
+}
+
+function storedError(code: string | null): ProtocolError | null {
+  return code === null ? null : storedProtocolError(code);
+}
+
+/** Marks the host unable to confirm writes, and says so once. */
+export function markStorageFault(state: HostState): void {
+  state.storageFault = true;
+}
+
+/** Blocks one session without a run outcome: the store refused a record it could not keep whole. */
+function markSessionBlocked(state: HostState, sessionId: string): void {
+  try {
+    const summary = readSummary(state, sessionId);
+    if (summary === null) return;
+    const blocked = Object.freeze({
+      ...summary,
+      status: "blocked" as const,
+      blockedReason: "host-fault" as const,
+      activeRunId: null,
+    });
+    publishEvent(state, sessionUpdatedEvent(blocked, state.repository.revisions));
+  } catch {
+    // A session that cannot be read cannot be announced; the run's own failure
+    // still reports what happened.
+  }
 }

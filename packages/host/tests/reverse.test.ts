@@ -99,7 +99,7 @@ describe("reverse capability", () => {
   it("declares the capability only because the mechanism exists", async () => {
     const { client } = await subscribed();
     const response = await client.call("host.describe", {
-      supportedProtocolVersions: ["1"],
+      supportedProtocolVersions: ["2"],
       client: { name: "fixture", version: "0.1.0" },
       capabilities: { reverseRequests: true },
     });
@@ -208,7 +208,7 @@ describe("answers", () => {
         client.sendRaw(
           JSON.stringify({
             kind: "client-response",
-            protocolVersion: "1",
+            protocolVersion: "2",
             hostInstanceId: "somewhere-else",
             streamId: request.streamId,
             requestId: request.requestId,
@@ -239,7 +239,7 @@ describe("answers", () => {
         client.sendRaw(
           JSON.stringify({
             kind: "client-response",
-            protocolVersion: "1",
+            protocolVersion: "2",
             hostInstanceId: request.hostInstanceId,
             streamId: "not-the-stream",
             requestId: request.requestId,
@@ -424,7 +424,8 @@ describe("addressing", () => {
     // fresh id rather than a duplicate.
     const response = await client.call("sessions.list", {}, { requestId: "host-request-1" });
 
-    expect(response.result).toEqual({ sessions: [] });
+    expect(response.result?.sessions.items).toEqual([]);
+    expect(response.result?.sessions.hasMore).toBe(false);
     expect(client.isClosed).toBe(false);
   });
 });

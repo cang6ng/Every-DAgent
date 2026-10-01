@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import type { ModelEvent } from "@every-dagent/agent-core";
+import type { CanonicalItem } from "@every-dagent/protocol";
+import { MAX_PAGE_ITEMS } from "@every-dagent/protocol";
 
 import {
   awaitRunTerminal,
@@ -19,6 +21,7 @@ import {
   testPlugin,
   textReply,
   toolReply,
+  type TestClient,
 } from "./helpers/harness.js";
 
 /** A model step whose text is not a string — a value the wire cannot carry. */
@@ -27,6 +30,36 @@ function brokenTextReply(): readonly ModelEvent[] {
     { type: "text-delta", text: { not: "a string" } as unknown as string },
     { type: "done" },
   ];
+}
+
+/**
+ * One session's committed conversation, as one list.
+ *
+ * v2 keeps history out of the session summary and hands it out in bounded
+ * pages, so reading "the whole conversation" is a traversal: each page is the
+ * newest window not read yet, in log order, and the pages that follow are
+ * older — so a later page is placed in front of what is already collected.
+ * The largest legal page is asked for, so a conversation this size costs one
+ * round trip; the traversal still follows whatever cursor comes back.
+ */
+async function conversation(client: TestClient, sessionId: string): Promise<readonly CanonicalItem[]> {
+  const items: CanonicalItem[] = [];
+  let cursor: string | undefined;
+
+  for (;;) {
+    const response = await client.call(
+      "sessions.history",
+      cursor === undefined ? { sessionId, limit: MAX_PAGE_ITEMS } : { sessionId, limit: MAX_PAGE_ITEMS, cursor },
+    );
+    if (response.result === undefined) {
+      throw new Error(`sessions.history failed: ${response.error.code}`);
+    }
+
+    const page = response.result.page;
+    items.unshift(...page.items);
+    if (page.nextCursor === null) return items;
+    cursor = page.nextCursor;
+  }
 }
 
 describe("display input", () => {
@@ -60,8 +93,8 @@ describe("display input", () => {
     const call = client.events.find((event) => event.type === "run.tool.call");
     expect(call?.payload.item.input).toEqual({ kind: "unavailable", reason: "not-json-safe" });
 
-    const canonical = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session.canonical;
-    const projected = canonical?.find((item) => item.kind === "tool-call");
+    const canonical = await conversation(client, session.sessionId);
+    const projected = canonical.find((item) => item.kind === "tool-call");
     expect(projected).toMatchObject({ input: { kind: "unavailable", reason: "not-json-safe" } });
   });
 
@@ -100,8 +133,8 @@ describe("display input", () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]).toBe(input);
 
-    const canonical = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session.canonical;
-    expect(canonical?.find((item) => item.kind === "tool-call")?.input).toEqual({
+    const canonical = await conversation(client, session.sessionId);
+    expect(canonical.find((item) => item.kind === "tool-call")?.input).toEqual({
       kind: "unavailable",
       reason: "not-json-safe",
     });
@@ -209,7 +242,7 @@ describe("canonical occurrences", () => {
       })).result?.run.runId as string,
     );
 
-    const canonical = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session.canonical ?? [];
+    const canonical = await conversation(client, session.sessionId);
     expect(canonical.map((item) => item.kind)).toEqual([
       "user",
       "assistant",
@@ -249,7 +282,7 @@ describe("canonical occurrences", () => {
       })).result?.run.runId as string,
     );
 
-    const canonical = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session.canonical ?? [];
+    const canonical = await conversation(client, session.sessionId);
     const result = canonical.find((item) => item.kind === "tool-result");
     expect(result?.ok).toBe(false);
     expect(typeof result?.content).toBe("string");
@@ -361,7 +394,7 @@ describe("safe failure projection", () => {
     await client.call("subscriptions.open", {});
     const session = await createSessionThrough(client);
 
-    const before = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session;
+    const before = await conversation(client, session.sessionId);
 
     const terminal = await awaitRunTerminal(
       client,
@@ -380,7 +413,8 @@ describe("safe failure projection", () => {
     const after = (await client.call("sessions.get", { sessionId: session.sessionId })).result?.session;
     expect(after?.status).toBe("blocked");
     expect(after?.activeRunId).toBeNull();
-    expect(after?.canonical).toEqual(before?.canonical);
+    // The fault settled nothing: history is exactly what it was before the run.
+    expect(await conversation(client, session.sessionId)).toEqual(before);
 
     // A blocked session is readable but cannot take a new run.
     const refused = await client.call("runs.start", {

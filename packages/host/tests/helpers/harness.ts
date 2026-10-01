@@ -30,6 +30,7 @@ import type {
 } from "@every-dagent/protocol";
 import { decodeFrame, encodeFrame, validateMessage } from "@every-dagent/protocol";
 
+import { composeHost, type ComposedHost } from "../../src/host.js";
 import { createHost, type Host } from "../../src/index.js";
 import { createMemoryChannelPair } from "./memory-channel.js";
 
@@ -75,15 +76,40 @@ export interface TestHostOptions {
   readonly plugins?: readonly Plugin[];
   readonly contextBuilder?: ContextBuilder;
   readonly grants?: Readonly<Record<string, readonly PluginPermission[]>>;
+  /** A sqlite file to keep sessions and runs in; absent means this process's memory. */
+  readonly location?: string;
 }
 
 export function testHost(options: TestHostOptions): Host {
-  return createHost({
-    modelClient: options.modelClient,
-    plugins: options.plugins ?? [],
-    ...(options.contextBuilder === undefined ? {} : { contextBuilder: options.contextBuilder }),
-    ...(options.grants === undefined ? {} : { grants: options.grants }),
-  });
+  return composeTestHost(options).host;
+}
+
+/**
+ * The same host, with the repository it actually opened.
+ *
+ * Durable tests inspect what storage holds after the fact — that is the only way
+ * to tell a committed fact from a published one — so the composition seam hands
+ * the repository out here rather than making a test reach into the store by path.
+ */
+export function composeTestHost(options: TestHostOptions): ComposedHost {
+  return composeHost(
+    {
+      modelClient: options.modelClient,
+      plugins: options.plugins ?? [],
+      ...(options.contextBuilder === undefined ? {} : { contextBuilder: options.contextBuilder }),
+      ...(options.grants === undefined ? {} : { grants: options.grants }),
+      persistence:
+        options.location === undefined
+          ? { kind: "ephemeral" }
+          : { kind: "sqlite", location: options.location },
+    },
+    {},
+  );
+}
+
+/** A second host over the same file: the shape a restart takes in a test. */
+export function restartTestHost(options: TestHostOptions): ComposedHost {
+  return composeTestHost(options);
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +201,7 @@ export function connect(host: Host, options: ConnectOptions = {}): TestClient {
       "result" in body
         ? {
             kind: "client-response",
-            protocolVersion: "1",
+            protocolVersion: "2",
             hostInstanceId: request.hostInstanceId,
             streamId: request.streamId,
             requestId: request.requestId,
@@ -183,7 +209,7 @@ export function connect(host: Host, options: ConnectOptions = {}): TestClient {
           }
         : {
             kind: "client-response",
-            protocolVersion: "1",
+            protocolVersion: "2",
             hostInstanceId: request.hostInstanceId,
             streamId: request.streamId,
             requestId: request.requestId,
@@ -252,7 +278,7 @@ export function connect(host: Host, options: ConnectOptions = {}): TestClient {
     const requestId = options?.requestId ?? nextId("req");
     const input: Record<string, unknown> = {
       kind: "client-request",
-      protocolVersion: "1",
+      protocolVersion: "2",
       requestId,
       method,
       params,
@@ -318,7 +344,7 @@ export function connect(host: Host, options: ConnectOptions = {}): TestClient {
 
     async describe(options?: CallOptions): Promise<HostResponse<"host.describe">> {
       const response = await call("host.describe", {
-        supportedProtocolVersions: ["1"],
+        supportedProtocolVersions: ["2"],
         client: { name: "test-client", version: "0.1.0" },
         capabilities: declaredCapabilities,
       }, options);

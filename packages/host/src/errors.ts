@@ -29,6 +29,12 @@ const MESSAGES: Readonly<Record<ProtocolErrorCode, string>> = Object.freeze({
   PLUGIN_PERMISSION_DENIED: "the plugin activation was refused by host policy",
   PLUGIN_OPERATION_FAILED: "the plugin lifecycle operation failed",
   SUBMISSION_CONFLICT: "this submission id was already used with a different payload",
+  SUBMISSION_RETIRED: "this submission's session was deleted; it cannot be reused",
+  STALE_CURSOR: "the page cursor was issued for a version of this collection that has changed",
+  REVISION_CONFLICT: "the session changed since the revision this request expected",
+  LIMIT_EXCEEDED: "the request exceeded a size or budget limit this host enforces",
+  SETTINGS_INVALID: "the settings did not match the schema this host accepts",
+  STORAGE_UNAVAILABLE: "the durable store is not available; no write was confirmed",
   REQUEST_CANCELLED: "the request was cancelled",
   INTERNAL_ERROR: "the host failed while handling this request",
 });
@@ -46,6 +52,18 @@ export function protocolError(code: ProtocolErrorCode): ProtocolError {
 }
 
 /**
+ * The error a stored failure code means, or null when the code is not one this
+ * host writes.
+ *
+ * A persisted code is read back through the same fixed table that produced it,
+ * so a record whose code this build does not recognize reports no error rather
+ * than an invented one.
+ */
+export function storedProtocolError(code: string): ProtocolError | null {
+  return Object.hasOwn(MESSAGES, code) ? protocolError(code as ProtocolErrorCode) : null;
+}
+
+/**
  * The one error that is not a failure of the request but of the host's life:
  * `HOST_BUSY` is the closest honest code, because the host is occupied — by its
  * own shutdown — and will never become available again.
@@ -55,6 +73,32 @@ export function shuttingDownError(): ProtocolError {
     code: "HOST_BUSY" as const,
     message: "the host is shutting down and accepts no new work",
   });
+}
+
+/**
+ * The store failed in a way the host cannot see through.
+ *
+ * Deliberately not translated into "the write did not happen": a failure to
+ * commit is a failure to know, and the caller has to be told the outcome is
+ * unconfirmed rather than that nothing was recorded.
+ */
+export function storageUnavailableError(): ProtocolError {
+  return protocolError("STORAGE_UNAVAILABLE");
+}
+
+/** A request that asked for more than this host will do at once. */
+export function limitExceededError(): ProtocolError {
+  return protocolError("LIMIT_EXCEEDED");
+}
+
+/** A page cursor that was issued under a collection version that has moved on. */
+export function staleCursorError(): ProtocolError {
+  return protocolError("STALE_CURSOR");
+}
+
+/** A CAS write whose expected revision is no longer current. */
+export function revisionConflictError(): ProtocolError {
+  return protocolError("REVISION_CONFLICT");
 }
 
 /** The code a manager-recorded failure is reported under: phase decides, not wording. */

@@ -14,6 +14,13 @@ import type { CanonicalItem, DisplayInput, PluginSummary } from "@every-dagent/p
 import { validateJsonValue } from "@every-dagent/protocol";
 
 import { pluginFailureSummary } from "./errors.js";
+import {
+  encodeStoredData,
+  invocationOf,
+  parsePayload,
+  storedDisplay,
+  type StoredRecord,
+} from "./repository.js";
 
 /**
  * Raised when a Core fact cannot be projected into a valid, honest DTO — an
@@ -26,6 +33,79 @@ export class ProjectionError extends Error {
     super(`the host could not project this run: ${detail}`);
     this.name = "ProjectionError";
   }
+}
+
+/** A projection refusal, built where it happens and thrown where it is noticed. */
+export function projectionError(detail: string): ProjectionError {
+  return new ProjectionError(detail);
+}
+
+/**
+ * One canonical item from one stored record, or `undefined` when the event
+ * projects to no item.
+ *
+ * Both paths that publish conversation items — the terminal commit and a
+ * history page — come through here, so a page and the turn it came from can
+ * never disagree about an item's identity or its fields. `openInvocation` is
+ * the invocation of the tool call this record answers, which the caller tracks
+ * because a result's id is derived from its call's position in the log.
+ */
+export function storedItem(
+  record: StoredRecord,
+  sessionId: string,
+  openInvocation: string | undefined,
+): CanonicalItem | undefined {
+  const parsed = parsePayload(record.data) ?? {};
+
+  switch (record.type) {
+    case "message/user":
+      return Object.freeze({
+        id: `${sessionId}:${record.seq}`,
+        turnId: record.turnId,
+        seq: record.seq,
+        kind: "user" as const,
+        text: String(parsed["text"] ?? ""),
+      });
+    case "message/assistant":
+      return Object.freeze({
+        id: `${sessionId}:${record.seq}`,
+        turnId: record.turnId,
+        seq: record.seq,
+        kind: "assistant" as const,
+        text: String(parsed["text"] ?? ""),
+      });
+    case "tool/call":
+      return Object.freeze({
+        id: `${sessionId}:${record.seq}`,
+        turnId: record.turnId,
+        seq: record.seq,
+        kind: "tool-call" as const,
+        invocationId: invocationOf(sessionId, record.seq),
+        callId: String(parsed["callId"] ?? ""),
+        name: String(parsed["name"] ?? ""),
+        input: storedDisplay(record.data) ?? unavailableInput(),
+      });
+    case "tool/result": {
+      if (openInvocation === undefined) return undefined;
+      return Object.freeze({
+        id: `${sessionId}:${record.seq}`,
+        turnId: record.turnId,
+        seq: record.seq,
+        kind: "tool-result" as const,
+        invocationId: openInvocation,
+        callId: String(parsed["callId"] ?? ""),
+        name: String(parsed["name"] ?? ""),
+        ok: parsed["ok"] === true,
+        content: String(parsed["content"] ?? ""),
+      });
+    }
+    default:
+      return undefined;
+  }
+}
+
+function unavailableInput(): DisplayInput {
+  return Object.freeze({ kind: "unavailable" as const, reason: "not-json-safe" as const });
 }
 
 /**
@@ -188,7 +268,6 @@ export function projectSettledTurn(input: SettledTurnInput): SettledTurn {
     }
   }
 
-  const items: CanonicalItem[] = [];
   let index = 1;
 
   const user = events[index];
@@ -198,14 +277,6 @@ export function projectSettledTurn(input: SettledTurnInput): SettledTurn {
   if (user.data.text !== expectedText) {
     throw new ProjectionError("the recorded user input is not the text this run accepted");
   }
-  items.push(
-    Object.freeze({
-      id: `${sessionId}:${user.seq}`,
-      turnId,
-      kind: "user" as const,
-      text: user.data.text,
-    }),
-  );
   index++;
 
   for (;;) {
@@ -224,14 +295,6 @@ export function projectSettledTurn(input: SettledTurnInput): SettledTurn {
       throw new ProjectionError(`the settled segment has an unexpected ${event.type} event`);
     }
 
-    items.push(
-      Object.freeze({
-        id: `${sessionId}:${event.seq}`,
-        turnId,
-        kind: "assistant" as const,
-        text: event.data.text,
-      }),
-    );
     index++;
 
     for (const declared of event.data.toolCalls) {
@@ -242,18 +305,6 @@ export function projectSettledTurn(input: SettledTurnInput): SettledTurn {
       if (call.data.callId !== declared.callId || call.data.name !== declared.name) {
         throw new ProjectionError("a recorded tool call does not match the one declared");
       }
-      const invocationId = `${sessionId}:${call.seq}:call`;
-      items.push(
-        Object.freeze({
-          id: `${sessionId}:${call.seq}`,
-          turnId,
-          kind: "tool-call" as const,
-          invocationId,
-          callId: call.data.callId,
-          name: call.data.name,
-          input: projectDisplayInput(call.data.input),
-        }),
-      );
       index++;
 
       const result = events[index];
@@ -263,18 +314,6 @@ export function projectSettledTurn(input: SettledTurnInput): SettledTurn {
       if (result.data.callId !== declared.callId || result.data.name !== declared.name) {
         throw new ProjectionError("a recorded tool result does not belong to its call");
       }
-      items.push(
-        Object.freeze({
-          id: `${sessionId}:${result.seq}`,
-          turnId,
-          kind: "tool-result" as const,
-          invocationId,
-          callId: result.data.callId,
-          name: result.data.name,
-          ok: result.data.ok,
-          content: result.data.content,
-        }),
-      );
       index++;
     }
   }
@@ -285,7 +324,38 @@ export function projectSettledTurn(input: SettledTurnInput): SettledTurn {
 
   assertOutcomeShape(events, closed.data.reason);
 
-  return { turnId, items: Object.freeze(items), reason: closed.data.reason };
+  return { turnId, items: itemsOf(events, sessionId), reason: closed.data.reason };
+}
+
+/**
+ * The published items one settled segment produces.
+ *
+ * The segment is encoded exactly the way the store will keep it and then
+ * projected from those stored records, so the items published now and the items
+ * a later history page reads back are the same items — not two projections that
+ * agree, but one projection applied twice.
+ */
+function itemsOf(events: readonly SessionEvent[], sessionId: string): readonly CanonicalItem[] {
+  const items: CanonicalItem[] = [];
+  let openInvocation: string | undefined;
+
+  for (const event of events) {
+    const record: StoredRecord = Object.freeze({
+      seq: event.seq,
+      turnId: event.turnId,
+      type: event.type,
+      time: event.time,
+      data: encodeStoredData(event),
+    });
+    if (record.type === "tool/call") openInvocation = invocationOf(sessionId, record.seq);
+    const item = storedItem(record, sessionId, openInvocation);
+    if (record.type === "tool/result" && item === undefined) {
+      throw new ProjectionError("a recorded tool result has no call to belong to");
+    }
+    if (item !== undefined) items.push(item);
+  }
+
+  return Object.freeze(items);
 }
 
 /**

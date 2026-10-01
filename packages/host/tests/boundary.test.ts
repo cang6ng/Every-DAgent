@@ -42,6 +42,16 @@ const WORKSPACE_IMPORTS = [
   "@every-dagent/protocol",
 ];
 
+/**
+ * The Node builtins this host is composed of.
+ *
+ * The host is the Node side of the boundary: `node:sqlite` is its durable store
+ * and `node:crypto` derives stable ids for the records it commits. Everything
+ * else still has to be one of its own modules or a declared workspace package —
+ * this is an allow-list of exactly what it uses, not a general permission.
+ */
+const NODE_IMPORTS = ["node:crypto", "node:sqlite"];
+
 describe("dependency boundary", () => {
   it("keeps the source tree to the planned modules", () => {
     expect([...srcRelative].sort()).toEqual(
@@ -49,10 +59,13 @@ describe("dependency boundary", () => {
         "connection.ts",
         "dispatch.ts",
         "errors.ts",
+        "history.ts",
         "host.ts",
         "index.ts",
+        "limits.ts",
         "projection.ts",
         "registry-gate.ts",
+        "repository.ts",
         "reverse.ts",
         "run.ts",
         "state.ts",
@@ -60,11 +73,14 @@ describe("dependency boundary", () => {
     );
   });
 
-  it("imports only its own modules and the three workspace packages it declares", () => {
+  it("imports only its own modules, the three workspace packages and the Node builtins it declares", () => {
     const offenders: string[] = [];
     for (const file of srcFiles) {
       for (const specifier of importSpecifiers(readFileSync(file, "utf8"))) {
-        const allowed = specifier.startsWith("./") || WORKSPACE_IMPORTS.includes(specifier);
+        const allowed =
+          specifier.startsWith("./") ||
+          WORKSPACE_IMPORTS.includes(specifier) ||
+          NODE_IMPORTS.includes(specifier);
         if (!allowed) offenders.push(`${file}: ${specifier}`);
       }
     }
@@ -73,8 +89,16 @@ describe("dependency boundary", () => {
 
   it("carries no provider, UI, network or process-level dependency anywhere in src", () => {
     // The import check above already rules out every package that is not one of
-    // the three declared ones; what remains are the globals and shorthands that
-    // would let the host reach a browser, a socket or a process anyway.
+    // the three declared ones plus this host's own Node builtins; what remains
+    // are the globals and shorthands that would let the host reach a browser, a
+    // socket or a process anyway.
+    //
+    // Two v2 facts shape this list. `Buffer` is not on it: the host measures
+    // UTF-8 bytes and encodes opaque cursors, which is what Buffer is for on
+    // the Node side, and `node:crypto`/`node:sqlite` above are the same kind of
+    // admission. And `window` is not a bare pattern: the run loader names its
+    // own bounded read of turns `window` (run.ts), so what stays forbidden is a
+    // reach into the *DOM* under that name.
     const forbidden = [
       /\bpi-ai\b/,
       /\bReact\b/,
@@ -83,10 +107,9 @@ describe("dependency boundary", () => {
       /\bEventSource\b/,
       /\bXMLHttpRequest\b/,
       /\bdocument\s*\./,
-      /\bwindow\s*\./,
+      /\bwindow\s*\.\s*(?:document|navigator|location|localStorage|sessionStorage)\b/,
       /\bfetch\s*\(/,
       /\bprocess\s*\./,
-      /\bBuffer\b/,
       /\brequire\s*\(/,
       /\bas\s+never\b/,
       /@ts-(ignore|expect-error|nocheck)/,

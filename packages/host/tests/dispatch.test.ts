@@ -50,7 +50,7 @@ describe("connection initialization", () => {
     expect(first.result?.clientCapabilities.reverseRequests).toBe(false);
 
     const changed = await client.call("host.describe", {
-      supportedProtocolVersions: ["1"],
+      supportedProtocolVersions: ["2"],
       client: { name: "test-client", version: "0.1.0" },
       capabilities: { reverseRequests: true },
     });
@@ -88,7 +88,7 @@ describe("frame-level faults", () => {
     client.sendRaw(
       JSON.stringify({
         kind: "client-request",
-        protocolVersion: "1",
+        protocolVersion: "2",
         requestId,
         method: "sessions.list",
         params: {},
@@ -110,7 +110,7 @@ describe("frame-level faults", () => {
       { kind: "host-event" },
       {
         kind: "host-event",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: "whatever",
         streamId: "whatever",
         sequence: 1,
@@ -135,7 +135,7 @@ describe("frame-level faults", () => {
     client.sendRaw(
       JSON.stringify({
         kind: "client-request",
-        protocolVersion: "1",
+        protocolVersion: "2",
         requestId: "unknown-method",
         method: "tools.execute",
         params: {},
@@ -148,7 +148,7 @@ describe("frame-level faults", () => {
     const response = client.frames.at(-1) ?? "";
     expect(response).toContain("METHOD_NOT_FOUND");
     expect(
-      (await client.call("sessions.list", {}, { requestId: "still-alive" })).result?.sessions,
+      (await client.call("sessions.list", {}, { requestId: "still-alive" })).result?.sessions.items,
     ).toEqual([]);
   });
 
@@ -161,7 +161,7 @@ describe("frame-level faults", () => {
     client.sendRaw(
       JSON.stringify({
         kind: "client-request",
-        protocolVersion: "1",
+        protocolVersion: "2",
         requestId: "bad-params",
         method: "runs.start",
         params: { sessionId: "s", submissionId: "sub", text: "   " },
@@ -182,7 +182,7 @@ describe("frame-level faults", () => {
     client.sendRaw(
       JSON.stringify({
         kind: "client-request",
-        protocolVersion: "2",
+        protocolVersion: "1",
         requestId: "future-request",
         method: "sessions.list",
         params: {},
@@ -204,7 +204,7 @@ describe("frame-level faults", () => {
     client.sendRaw(
       JSON.stringify({
         kind: "client-response",
-        protocolVersion: "1",
+        protocolVersion: "2",
         hostInstanceId: "irrelevant",
         streamId: "stream",
         requestId: "never-asked",
@@ -213,7 +213,7 @@ describe("frame-level faults", () => {
     );
     await flush();
 
-    // v1 has no production reverse request: the response is read, validated and
+    // v2 has no production reverse request: the response is read, validated and
     // dropped, and nothing is sent back for it.
     expect(client.isClosed).toBe(false);
     expect(client.frames.length).toBe(before);
@@ -235,7 +235,7 @@ describe("frame-level faults", () => {
       burst.sendRaw(
         JSON.stringify({
           kind: "client-request",
-          protocolVersion: "1",
+          protocolVersion: "2",
           requestId: `burst-${index}`,
           method: "sessions.create",
           params: {},
@@ -247,7 +247,7 @@ describe("frame-level faults", () => {
 
     // The reader that cannot keep up is closed; the work it caused stands.
     expect(burst.isClosed).toBe(true);
-    expect((await observer.call("sessions.list", {})).result?.sessions.length).toBeGreaterThan(0);
+    expect((await observer.call("sessions.list", {})).result?.sessions.items.length).toBeGreaterThan(0);
   });
 });
 
@@ -268,10 +268,13 @@ describe("run versus reader loss", () => {
     const runId = started.result?.run.runId as string;
 
     const replaced = await client.call("subscriptions.open", {});
-    expect(replaced.result?.snapshot.runs.map((run) => run.runId)).toEqual([runId]);
-    // The live prefix is part of the snapshot, so a reconnect does not need a
-    // replay of the events it missed.
-    expect(replaced.result?.snapshot.runs[0]?.live).not.toBeNull();
+    const window = replaced.result?.snapshot.runs.items ?? [];
+    expect(window.map((run) => run.runId)).toEqual([runId]);
+    // The window carries the run's durable facts; the timeline itself is one
+    // `runs.get` away, so a reconnect still does not need a replay of the
+    // events it missed.
+    expect(window[0]?.endedAt).toBeNull();
+    expect((await client.call("runs.get", { runId })).result?.run.live).not.toBeNull();
 
     hold.open();
     await client.waitForEvent("run.ended", (event) => event.payload.run.runId === runId);
@@ -291,7 +294,7 @@ describe("request id identity", () => {
     client.sendRaw(
       JSON.stringify({
         kind: "client-request",
-        protocolVersion: "1",
+        protocolVersion: "2",
         requestId: "spent-invalid-id",
         method: "sessions.list",
         hostInstanceId: instanceId,
@@ -306,7 +309,7 @@ describe("request id identity", () => {
     client.sendRaw(
       JSON.stringify({
         kind: "client-request",
-        protocolVersion: "1",
+        protocolVersion: "2",
         requestId: "spent-invalid-id",
         method: "sessions.list",
         params: {},
@@ -328,7 +331,7 @@ describe("request id identity", () => {
     client.sendRaw(
       JSON.stringify({
         kind: "client-request",
-        protocolVersion: "1",
+        protocolVersion: "2",
         requestId: "spent-params-id",
         method: "runs.start",
         params: { sessionId: "s", submissionId: "sub", text: "   " },
@@ -343,7 +346,7 @@ describe("request id identity", () => {
     client.sendRaw(
       JSON.stringify({
         kind: "client-request",
-        protocolVersion: "1",
+        protocolVersion: "2",
         requestId: "spent-params-id",
         method: "sessions.list",
         params: {},
@@ -368,7 +371,7 @@ describe("request id identity", () => {
     client.sendRaw(
       JSON.stringify({
         kind: "client-request",
-        protocolVersion: "1",
+        protocolVersion: "2",
         requestId: "used-id",
         method: "sessions.list",
         hostInstanceId: instanceId,
@@ -389,7 +392,7 @@ describe("request id identity", () => {
     client.sendRaw(
       JSON.stringify({
         kind: "client-request",
-        protocolVersion: "1",
+        protocolVersion: "2",
         requestId: "used-invalid-id",
         method: "sessions.list",
         hostInstanceId: instanceId,
@@ -403,7 +406,7 @@ describe("request id identity", () => {
     client.sendRaw(
       JSON.stringify({
         kind: "client-request",
-        protocolVersion: "1",
+        protocolVersion: "2",
         requestId: "used-invalid-id",
         method: "sessions.list",
         params: {},

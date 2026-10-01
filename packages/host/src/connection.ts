@@ -11,16 +11,18 @@
 
 import type {
   ActiveRunSnapshot,
+  CollectionRevisions,
   EventScope,
   HostEvent,
   LiveToolItem,
   PluginSummary,
   ProtocolChannel,
-  SessionSnapshot,
+  SessionSummary,
   TerminalRunSnapshot,
 } from "@every-dagent/protocol";
 import { encodeFrame, validateMessage } from "@every-dagent/protocol";
 
+import { HOST_LIMITS, OUTBOX_LIMIT_FRAMES } from "./limits.js";
 import { ProjectionError, projectPluginInfo, samePluginSummary } from "./projection.js";
 import { createReverseConnectionState, dropAllReverse } from "./reverse.js";
 import type { ReverseProfile } from "./reverse.js";
@@ -35,15 +37,15 @@ import type { ConnectionState, HostState, RunEntry } from "./state.js";
  * resync — the alternative, dropping frames silently, would leave it believing
  * a state it no longer has.
  */
-const MAX_OUTBOX_FRAMES = 256;
-const MAX_OUTBOX_BYTES = 1024 * 1024;
+const MAX_OUTBOX_FRAMES = OUTBOX_LIMIT_FRAMES;
+const MAX_OUTBOX_BYTES = HOST_LIMITS.maxOutboxBytes;
 
 /** A stream id used only to check that an event can be built at all. */
 const PREPARE_STREAM_ID = "prepare:stream";
 
 export interface EventBase {
   readonly kind: "host-event";
-  readonly protocolVersion: "1";
+  readonly protocolVersion: "2";
   readonly hostInstanceId: string;
   readonly streamId: string;
   readonly sequence: number;
@@ -187,7 +189,7 @@ function pump(state: HostState, connection: ConnectionState): void {
 export function assertEventBuilds(state: HostState, build: EventBuilder): void {
   const candidate = build({
     kind: "host-event",
-    protocolVersion: "1",
+    protocolVersion: "2",
     hostInstanceId: state.hostInstanceId,
     streamId: PREPARE_STREAM_ID,
     sequence: 1,
@@ -218,7 +220,7 @@ export function publishEventTo(
     { kind: "host-event" },
     build({
       kind: "host-event",
-      protocolVersion: "1",
+      protocolVersion: "2",
       hostInstanceId: state.hostInstanceId,
       streamId: subscription.streamId,
       sequence,
@@ -304,17 +306,50 @@ export function runToolResultEvent(
 export function runEndedEvent(
   run: RunEntry,
   snapshot: TerminalRunSnapshot,
-  session: SessionSnapshot,
+  session: SessionSummary,
+  collections: CollectionRevisions,
 ): EventBuilder {
   const scope = runScope(run);
-  const payload = Object.freeze({ run: snapshot, session });
+  const payload = Object.freeze({ run: snapshot, session, collections });
   return (base) => ({ ...base, scope, type: "run.ended", payload });
 }
 
-export function sessionCreatedEvent(session: SessionSnapshot): EventBuilder {
+/**
+ * A session's summary, announced as brand new.
+ *
+ * Creating and updating travel as two events because they mean different
+ * things to a reader: `created` adds an entry to the directory, `updated`
+ * changes one that is already there. Both carry the catalogue revisions the
+ * change produced, so a client holding a page from before it knows the page is
+ * no longer the current directory.
+ */
+export function sessionCreatedEvent(session: SessionSummary, collections: CollectionRevisions): EventBuilder {
   const scope: SessionScope = Object.freeze({ kind: "session" as const, sessionId: session.sessionId });
-  const payload = Object.freeze({ session });
+  const payload = Object.freeze({ session, collections });
   return (base) => ({ ...base, scope, type: "session.created", payload });
+}
+
+export function sessionUpdatedEvent(session: SessionSummary, collections: CollectionRevisions): EventBuilder {
+  const scope: SessionScope = Object.freeze({ kind: "session" as const, sessionId: session.sessionId });
+  const payload = Object.freeze({ session, collections });
+  return (base) => ({ ...base, scope, type: "session.updated", payload });
+}
+
+export function sessionDeletedEvent(
+  sessionId: string,
+  generation: number,
+  collections: CollectionRevisions,
+): EventBuilder {
+  const scope: SessionScope = Object.freeze({ kind: "session" as const, sessionId });
+  const payload = Object.freeze({ sessionId, generation, collections });
+  return (base) => ({ ...base, scope, type: "session.deleted", payload });
+}
+
+/** A catalogue revision that moved without a summary of its own to carry it. */
+export function collectionInvalidatedEvent(collections: CollectionRevisions): EventBuilder {
+  const scope: EventScope = Object.freeze({ kind: "host" as const });
+  const payload = Object.freeze({ collections });
+  return (base) => ({ ...base, scope, type: "collection.invalidated", payload });
 }
 
 export function pluginUpdatedEvent(pluginId: string, plugin: PluginSummary): EventBuilder {
