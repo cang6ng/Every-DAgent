@@ -59,8 +59,20 @@ type WriteVerdict<T> =
  */
 type TransactionState = "ended" | "open" | "unknown";
 
-/** The schema generation this build writes and reads. */
-export const SCHEMA_VERSION = 1;
+/**
+ * The schema generation this build writes and reads.
+ *
+ * Version 2 adds the terminal commit's ownership binding: the turn index row
+ * names the run that committed it (`turns.run_id`), written in the same
+ * transaction as the run's own pointer. It exists because a run's pointer and
+ * the turn it names are two copies of one claim, and two self-consistent
+ * copies cannot prove they belong together — exchanging them between two runs
+ * leaves both looking valid. The turn's own row is the independent half. A
+ * store written before version 2 has no such half, and nothing here invents
+ * one: a turn without an owner reads exactly like a turn with the wrong one,
+ * and both are refused.
+ */
+export const SCHEMA_VERSION = 2;
 
 /** A committed session event, in the shape the store keeps it. */
 export interface StoredRecord {
@@ -165,6 +177,16 @@ export interface TurnWindowRead {
   readonly records: readonly StoredRecord[];
   readonly baseSeq: number;
   readonly nextSeq: number;
+}
+
+/** One turn index row's own ownership claim: who committed it, and with what. */
+interface TurnOwnerRow {
+  readonly turnId: string;
+  readonly startSeq: number;
+  readonly endSeq: number;
+  readonly reason: string;
+  /** The run the commit transaction recorded as this turn's owner; `null` in stores written before the binding. */
+  readonly runId: string | null;
 }
 
 export interface CreateSessionInput {
@@ -958,6 +980,19 @@ const MIGRATIONS: readonly Migration[] = [
       `INSERT INTO collections (name, revision) VALUES ('sessions', 0), ('runs', 0), ('plugins', 0)`,
     ],
   },
+  {
+    version: 2,
+    statements: [
+      // The owner binding, and nothing else. Existing turn rows keep a NULL
+      // owner on purpose: copying a run's current pointer into it would be
+      // manufacturing the very proof the column exists to carry, and a
+      // pre-version-2 store has no evidence a swap did not happen. Such a
+      // turn is refused when it is read, like any record that is not what it
+      // claims to be.
+      `ALTER TABLE turns ADD COLUMN run_id TEXT`,
+      `CREATE UNIQUE INDEX turns_by_owner ON turns (run_id) WHERE run_id IS NOT NULL`,
+    ],
+  },
 ];
 
 /**
@@ -1577,15 +1612,21 @@ class SqliteRepository implements Repository {
    * Two further facts, because "this turn is mine" is not implied by the turn
    * merely existing:
    *
-   * - The turn is this run's own. Every terminal commit writes the run's range
-   *   and its turn in one transaction, so a committed turn has exactly one run.
-   *   A turn two runs both claim is a state this store cannot have produced,
-   *   and neither claim is served from it.
+   * - The turn is this run's own, and the turn's own row says so. Every
+   *   terminal commit writes the run's range, its turn and the turn's owner
+   *   binding in one transaction, so the two sides are one relation recorded
+   *   twice — and the turn's side is the one a swap cannot keep coherent. A
+   *   run whose claimed turn is owned by another run, a turn two runs both
+   *   claim, and a turn with no owner at all (a store written before the
+   *   binding existed) are each a state this store cannot have produced, and
+   *   none of them is served from here.
    * - The range holds the canonical facts it claims — the same sequence, turn
    *   closure and tool-pairing rules a history page and an execution window
    *   apply, applied here to the run's own committed range instead of to a cut
-   *   out of it. That is what makes one authority: whichever way a client asks
-   *   about a settled run, the same records are held to the same rules.
+   *   out of it — and its first user fact is the input this run accepted,
+   *   compared as decoded text, verbatim. That is what makes one authority:
+   *   whichever way a client asks about a settled run, the same records are
+   *   held to the same rules.
    */
   verifyRunHistory(run: RunRecord): boolean {
     this.assertTrusted();
@@ -1614,13 +1655,13 @@ class SqliteRepository implements Repository {
     if (expected === undefined || run.endReason !== expected) return false;
     if (to <= from) return false;
 
-    const turn = this.database
-      .prepare("SELECT start_seq, end_seq, reason FROM turns WHERE session_id = ? AND turn_id = ?")
-      .get(run.sessionId, run.turnId) as
-      | { readonly start_seq?: number; readonly end_seq?: number; readonly reason?: string }
-      | undefined;
+    const turn = this.turnOwnerRow(run.sessionId, run.turnId);
     if (turn === undefined) return false;
-    if (turn.start_seq !== from || turn.end_seq !== to || turn.reason !== expected) return false;
+    if (turn.startSeq !== from || turn.endSeq !== to || turn.reason !== expected) return false;
+    // The independent half of the proof: the turn's own row names the run
+    // that committed it. Without this line a pair of exchanged pointers is
+    // self-consistent on both sides and unprovable from either.
+    if (turn.runId !== run.runId) return false;
 
     // History is never shortened, so the committed log this turn belongs to has
     // to reach at least its end; a session that does not hold the turn is a run
@@ -1633,6 +1674,12 @@ class SqliteRepository implements Repository {
       .get(run.sessionId, run.turnId) as { readonly count?: number } | undefined;
     if (claimants?.count !== 1) return false;
 
+    // The canonical turn's first user fact is the input this run accepted,
+    // compared as the decoded text it was recorded as — never trimmed, never
+    // normalized, never re-serialized. A record whose user text is not the
+    // text its run accepted is a fact this host did not write.
+    if (this.userFactTextAt(run.sessionId, from + 1) !== run.text) return false;
+
     try {
       const rows = this.database
         .prepare("SELECT * FROM session_events WHERE session_id = ? AND seq >= ? AND seq < ? ORDER BY seq")
@@ -1644,6 +1691,90 @@ class SqliteRepository implements Repository {
     return true;
   }
 
+  /**
+   * One turn index row's own ownership claim, as it is stored.
+   *
+   * `runId` is `null` exactly when the row predates the ownership binding —
+   * a claim that no run can be held to, which is refused wherever a claim is
+   * required rather than repaired into one.
+   */
+  private turnOwnerRow(sessionId: string, turnId: string): TurnOwnerRow | undefined {
+    const row = this.database
+      .prepare("SELECT turn_id, start_seq, end_seq, reason, run_id FROM turns WHERE session_id = ? AND turn_id = ?")
+      .get(sessionId, turnId) as Row | undefined;
+    return row === undefined ? undefined : this.ownerRowOf(row);
+  }
+
+  /** The one place a turn index row becomes the ownership row the checks work on. */
+  private ownerRowOf(row: Row): TurnOwnerRow {
+    const startSeq = row["start_seq"];
+    const endSeq = row["end_seq"];
+    const reason = row["reason"];
+    if (typeof startSeq !== "number" || typeof endSeq !== "number" || typeof reason !== "string") {
+      throw new CorruptRecordError("the turn index holds a range that is not a range");
+    }
+    return Object.freeze({
+      turnId: String(row["turn_id"]),
+      startSeq,
+      endSeq,
+      reason,
+      runId: typeof row["run_id"] === "string" ? row["run_id"] : null,
+    });
+  }
+
+  /**
+   * The decoded text of the user fact committed at one position, or
+   * `undefined` when the record there is not one.
+   *
+   * The one reader both bindings use — the run-side read checks a run's own
+   * range, the window-side read checks a turn the model is about to be handed
+   * — so "the first user fact is the accepted input" is one rule applied in
+   * one place, and a record that cannot be parsed is a refusal rather than a
+   * substituted value.
+   */
+  private userFactTextAt(sessionId: string, seq: number): string | undefined {
+    const row = this.database
+      .prepare("SELECT seq, turn_id, type, time, data FROM session_events WHERE session_id = ? AND seq = ?")
+      .get(sessionId, seq) as Row | undefined;
+    if (row === undefined) return undefined;
+    const record = storedOf(row);
+    if (record.type !== "message/user") return undefined;
+    try {
+      return parseStoredRecord(record)["text"] as string;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Whether one turn index row's owner binding holds, checked from the turn's
+   * side against the run's own row.
+   *
+   * This is the direction an execution window needs: the turn names a run, and
+   * that run — read from its own row, not from the pointer under test — must
+   * name this turn, this session, this exact half-open range and this reason,
+   * in the terminal status the reason implies. It also holds the turn's first
+   * user fact to the accepted input the owner run recorded. A turn with no
+   * owner, an owner that claims something else, and an owner whose accepted
+   * input is not the canonical fact are all the same answer here: the turn is
+   * not one this host can vouch for.
+   */
+  private turnOwnershipHolds(sessionId: string, turn: TurnOwnerRow): boolean {
+    if (turn.runId === null) return false;
+    const row = this.database
+      .prepare(
+        "SELECT session_id, turn_id, status, end_reason, committed_from_seq, committed_to_seq, text FROM runs WHERE run_id = ?",
+      )
+      .get(turn.runId) as Row | undefined;
+    if (row === undefined) return false;
+    if (String(row["session_id"]) !== sessionId) return false;
+    if (row["turn_id"] !== turn.turnId) return false;
+    if (row["committed_from_seq"] !== turn.startSeq || row["committed_to_seq"] !== turn.endSeq) return false;
+    if (row["end_reason"] !== turn.reason) return false;
+    if (endReasonFor(String(row["status"]) as RunStatus) !== turn.reason) return false;
+    return this.userFactTextAt(sessionId, turn.startSeq + 1) === String(row["text"]);
+  }
+
   verifyTurnCommit(input: CommitTurnInput): "committed" | "absent" | "indeterminate" {
     this.assertTrusted();
     try {
@@ -1653,11 +1784,7 @@ class SqliteRepository implements Repository {
       const run = this.getRun(input.runId);
       if (run === undefined) return "indeterminate";
 
-      const turn = this.database
-        .prepare("SELECT start_seq, end_seq, reason FROM turns WHERE session_id = ? AND turn_id = ?")
-        .get(input.sessionId, input.turnId) as
-        | { readonly start_seq?: number; readonly end_seq?: number; readonly reason?: string }
-        | undefined;
+      const turn = this.turnOwnerRow(input.sessionId, input.turnId);
       const events = this.database
         .prepare("SELECT COUNT(*) AS count FROM session_events WHERE session_id = ? AND seq >= ? AND seq < ?")
         .get(input.sessionId, input.turnStartSeq, endSeq) as { readonly count?: number } | undefined;
@@ -1666,9 +1793,15 @@ class SqliteRepository implements Repository {
       const fullyThere =
         session.committedSeq === endSeq &&
         turn !== undefined &&
-        turn.start_seq === input.turnStartSeq &&
-        turn.end_seq === endSeq &&
+        turn.startSeq === input.turnStartSeq &&
+        turn.endSeq === endSeq &&
         turn.reason === input.reason &&
+        // The same ownership and input constraints the read side applies: a
+        // batch whose turn index row does not name this run, or whose user
+        // fact is not the accepted text, is not this batch as far as the
+        // store's own evidence goes.
+        turn.runId === input.runId &&
+        this.userFactTextAt(input.sessionId, input.turnStartSeq + 1) === run.text &&
         events?.count === input.records.length &&
         terminal &&
         run.turnId === input.turnId;
@@ -1712,33 +1845,47 @@ class SqliteRepository implements Repository {
    * judged and then not used, a turn that does not fit ends the window there —
    * the newest one included — and no older turn is skipped in the hope that it
    * fits where the newer one did not.
+   *
+   * Ownership is checked before a turn can be handed to anything. The window
+   * is the history a model will see, and E2's rule for it is the same rule the
+   * published terminal obeys: history whose owning run cannot be proven is not
+   * history this host may use. The check is per turn and bounded by the same
+   * limit that bounds the read, and it is deliberately *not* a scan of the
+   * whole log — only the suffix that could become a window is held to it.
    */
   readTurnWindow(sessionId: string, maxTurns: number, maxBytes: number): TurnWindowRead {
     this.assertTrusted();
     const session = this.getSession(sessionId);
     const nextSeq = session?.committedSeq ?? 0;
     const turns = this.database
-      .prepare("SELECT start_seq, end_seq FROM turns WHERE session_id = ? ORDER BY start_seq DESC LIMIT ?")
-      .all(sessionId, maxTurns) as { readonly start_seq?: number; readonly end_seq?: number }[];
+      .prepare(
+        "SELECT turn_id, start_seq, end_seq, reason, run_id FROM turns WHERE session_id = ? ORDER BY start_seq DESC LIMIT ?",
+      )
+      .all(sessionId, maxTurns) as Row[];
 
     const taken: StoredRecord[] = [];
     let baseSeq = nextSeq;
-    for (const turn of turns) {
-      const start = turn.start_seq;
-      const end = turn.end_seq;
-      if (typeof start !== "number" || typeof end !== "number") {
-        throw new CorruptRecordError("the turn index holds a range that is not a range");
+    for (const row of turns) {
+      const turn = this.ownerRowOf(row);
+      // The history a model is handed must be the history this session's own
+      // runs committed: every turn the window considers carries its owner
+      // binding and its accepted input, checked from the run's own row before
+      // any of it can become a window. An unprovable turn is refused here
+      // exactly like an unreadable one — the run faults and the session stops
+      // rather than the model being fed history nobody can vouch for.
+      if (!this.turnOwnershipHolds(sessionId, turn)) {
+        throw new CorruptRecordError(`turn "${turn.turnId}" is not owned by the run its index names`);
       }
 
       const rows = this.database
         .prepare("SELECT * FROM session_events WHERE session_id = ? AND seq >= ? AND seq < ? ORDER BY seq")
-        .all(sessionId, start, end) as Row[];
+        .all(sessionId, turn.startSeq, turn.endSeq) as Row[];
       const candidate = [...rows.map(storedOf), ...taken];
       const events = candidate.map(toSessionEvent);
       if (encodedBytes(events) > maxBytes) break;
 
       taken.splice(0, taken.length, ...candidate);
-      baseSeq = start;
+      baseSeq = turn.startSeq;
     }
 
     return { records: Object.freeze(taken), baseSeq, nextSeq };
@@ -1905,8 +2052,10 @@ class SqliteRepository implements Repository {
         }
 
         this.database
-          .prepare("INSERT INTO turns (session_id, turn_id, start_seq, end_seq, reason) VALUES (?, ?, ?, ?, ?)")
-          .run(input.sessionId, input.turnId, input.turnStartSeq, seq, input.reason);
+          .prepare(
+            "INSERT INTO turns (session_id, turn_id, start_seq, end_seq, reason, run_id) VALUES (?, ?, ?, ?, ?, ?)",
+          )
+          .run(input.sessionId, input.turnId, input.turnStartSeq, seq, input.reason, input.runId);
         this.database
           .prepare(
             `UPDATE sessions SET
