@@ -546,6 +546,30 @@ export function captureHostSnapshot(
   let runs = items;
   let hasMoreRuns = recent.hasMore || dropped > 0;
 
+  // An executing run and the session that points at it travel as a pair. The
+  // directory window is the newest page, so a session can fall off it while its
+  // run keeps executing — and a cut carrying that run without its session is
+  // unexpressible: the schema refuses the pointer, and the client could place
+  // neither the run's live content nor the session it belongs to. The owning
+  // session is therefore pinned into the window, exactly like the run is; one
+  // host executes one run at a time, so this adds at most one entry, and the
+  // window says `hasMore` rather than pretending to be the whole directory.
+  const pinned: SessionSummary[] = [];
+  for (const run of state.runs.values()) {
+    if (run.terminal !== undefined) continue;
+    if (sessions.items.some((session) => session.sessionId === run.sessionId)) continue;
+    const record = state.repository.getSession(run.sessionId);
+    if (record !== undefined) pinned.push(sessionSummaryOf(record));
+  }
+  if (pinned.length > 0) {
+    sessions = Object.freeze({
+      items: Object.freeze([...pinned, ...sessions.items]),
+      collectionRevision: sessions.collectionRevision,
+      nextCursor: sessions.nextCursor,
+      hasMore: true,
+    });
+  }
+
   const compose = (): HostSnapshot =>
     Object.freeze({
       hostInstanceId: state.hostInstanceId,

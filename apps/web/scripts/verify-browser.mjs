@@ -59,6 +59,7 @@ const REQUIRED = [
   {
     file: "apps/web/tests/shell-reconnect.browser.test.ts",
     titles: [
+      "follows a still-running stream across a reconnect",
       "survives a dropped connection and resyncs the same host",
       "shows an unconfirmed submission instead of resending it",
       "treats a restarted host as a different host",

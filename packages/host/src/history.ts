@@ -31,6 +31,8 @@ import type {
 import { MAX_PAGE_BYTES, MAX_PAGE_ITEMS, MAX_TITLE_CHARS } from "@every-dagent/protocol";
 
 import { projectionError, storedItem, type OpenCall } from "./projection.js";
+import { storedProtocolError } from "./errors.js";
+import { runSummaryOfRecord } from "./state.js";
 import {
   assertStoredRange,
   CorruptRecordError,
@@ -249,24 +251,6 @@ export function sessionSummaryOf(record: SessionRecord): SessionSummary {
   });
 }
 
-export function runSummaryOf(record: RunRecord): RunSummary {
-  return Object.freeze({
-    runId: record.runId,
-    submissionId: record.submissionId,
-    sessionId: record.sessionId,
-    text: record.text,
-    turnId: record.turnId,
-    cancelRequested: record.cancelRequested,
-    acceptedAt: record.acceptedAt,
-    startedAt: record.startedAt,
-    endedAt: record.endedAt,
-    status: record.status,
-    endReason: record.endReason,
-    error: null,
-    executionKnowledge: record.executionKnowledge,
-  });
-}
-
 // ---------------------------------------------------------------------------
 // Page readers.
 // ---------------------------------------------------------------------------
@@ -351,10 +335,14 @@ export function readRunPage(
   // measured as they will be encoded and the page ends at whichever bound it
   // reaches first — and the cursor names the last item actually returned, so the
   // next page starts exactly where this one stopped.
+  //
+  // One authority projects a durable run into the wire DTO: every terminal that
+  // reaches a page — `failed` above all, whose error a listing may not invent —
+  // is the same summary `runs.get` and the published cut serve.
   const items: RunSummary[] = [];
   let bytes = 0;
   for (const record of result.records) {
-    const summary = runSummaryOf(record);
+    const summary = runSummaryOfRecord(record, storedProtocolError(record.errorCode ?? ""));
     const cost = encodedBytes(summary) + 64;
     if (items.length > 0 && bytes + cost > PAGE_ITEM_BUDGET_BYTES) break;
     bytes += cost;

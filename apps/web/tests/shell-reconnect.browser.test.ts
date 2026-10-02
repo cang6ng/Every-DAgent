@@ -72,6 +72,56 @@ const runStatus = 'document.querySelector("[data-testid=run-status]")?.textConte
 
 describe("the shell across reconnects, in a real browser", () => {
   it.skipIf(browser === undefined)(
+    "follows a still-running stream across a reconnect",
+    async () => {
+      const { acceptance, session } = await openShell();
+
+      await createSession(session);
+      await sendText(session, "慢慢来 你好");
+      await session.waitFor(
+        textOf('[data-testid="live-text"]'),
+        (value) => value.includes("正在思考"),
+        15000,
+        "the run to start streaming",
+      );
+
+      // The connection dies while the run is still executing — the gate stays
+      // shut, so what the page had was a live prefix, not a finished turn.
+      acceptance.controls.closeConnections();
+      await session.waitFor(connectionStatus, (value) => value.includes("连接已断开"), 15000, "the lost connection");
+      expect(await session.evaluate<string>(runStatus)).not.toContain("已完成");
+
+      await session.waitFor(
+        'String(document.querySelector("[data-testid=reconnect-button]").disabled)',
+        (value) => value === "false",
+        15000,
+        "reconnect to become available",
+      );
+      await session.click('[data-testid="reconnect-button"]');
+      await session.waitFor(connectionStatus, (value) => value.includes("已就绪"), 20000, "the reconnected shell");
+
+      // The cut names the active run and the client re-reads its timeline: the
+      // prefix the page had is back, still live, and the run is still running.
+      await session.waitFor(
+        textOf('[data-testid="live-text"]'),
+        (value) => value.includes("正在思考"),
+        15000,
+        "the live prefix to come back after the reconnect",
+      );
+      expect(await session.evaluate<string>(runStatus)).not.toContain("已完成");
+
+      // Content that follows the placement lands on the same draft, and the run
+      // settles into ordinary history.
+      acceptance.model.openGate();
+      await session.waitFor(runStatus, (value) => value.includes("已完成"), 20000, "the run to finish");
+      expect(await session.evaluate<boolean>(`${textOf('[data-testid="msg-assistant"]')}.includes("收到：慢慢来 你好")`)).toBe(true);
+      expect(await session.evaluate<string>(countOf('[data-testid="msg-user"]'))).toBe("1");
+      expect(session.uncaughtExceptions()).toEqual([]);
+    },
+    90000,
+  );
+
+  it.skipIf(browser === undefined)(
     "survives a dropped connection and resyncs the same host",
     async () => {
       const { acceptance, session } = await openShell();
