@@ -407,17 +407,17 @@ export interface Repository {
    */
   ownedTurnRange(sessionId: string, turnId: string): TurnOwnerRange | undefined;
   /**
-   * The exact range one turn may be *published* at, proven the way the run
-   * read proves it.
+   * The exact range one turn may be *published* at, proven under both proofs
+   * a committed turn carries.
    *
-   * A history page is the one reader that may publish fragments, and the
-   * fragment's proof must not stop at the turn index: a turn row and its owner
-   * run's row moved together — a forged pair — satisfy the turn-side binding
-   * by construction while `verifyRunHistory` refuses the same run on every
-   * other path. A page may publish a fragment of a turn, so it asks for the
-   * range under the strongest proof this store has: the owner run's whole
-   * committed range, held to `verifyRunHistory` — the same authority
-   * `runs.get` serves by. `undefined` is the refusal.
+   * A history page is the one reader that may publish fragments, and neither
+   * proof alone is enough for it. The turn-side binding alone is satisfied by
+   * a forged pair of rows moved together; the run read alone answers the
+   * vacuous `true` for a run that never committed a turn. So a page asks for
+   * the range only under both: the owner run's row must hold this exact
+   * committed range, *and* that range must pass `verifyRunHistory` — the
+   * authority `runs.get` serves by. A turn that fails either is a turn no page
+   * may publish, and the answer is `undefined` rather than a range.
    */
   publishableTurnRange(sessionId: string, turnId: string): TurnOwnerRange | undefined;
   /**
@@ -1772,22 +1772,25 @@ class SqliteRepository implements Repository {
   }
 
   /**
-   * The same range, asked under the run read's own authority — the proof a
-   * page needs so it can never become the one reader a forged pair of index
-   * rows still satisfies.
+   * The same range, asked under both proofs a committed turn carries — the
+   * turn-side binding and the run read's whole committed range — so a page can
+   * never be the one reader a forged pair of index rows, or an owner run that
+   * never committed anything, still satisfies.
    *
-   * The turn-side binding alone is a fact about two rows agreeing, and two
-   * rows moved together agree by construction. The run read is the stronger
-   * question — the owner's whole committed range against the canonical facts
-   * it claims, the same authority `runs.get` serves by — so a page asks it,
-   * once per distinct turn, before it publishes a fragment of that turn. The
-   * proof is bounded by the turn itself: one run record and one range read,
-   * never the session's history.
+   * `verifyRunHistory` alone is not enough here: for a run that never
+   * committed a turn it deliberately answers `true` — a read has nothing to
+   * check on such a run — and a page must not accept that vacuous proof for a
+   * turn it is about to publish. The turn-side binding rules that branch out
+   * (the owner's own row must hold this exact committed range), and the run
+   * read then holds that range to the canonical facts it claims. The proof is
+   * bounded by the turn itself: one turn row, one run record and one range
+   * read, never the session's history.
    */
   publishableTurnRange(sessionId: string, turnId: string): TurnOwnerRange | undefined {
     this.assertTrusted();
     const turn = this.turnOwnerRow(sessionId, turnId);
     if (turn === undefined || turn.runId === null) return undefined;
+    if (!this.turnOwnershipHolds(sessionId, turn)) return undefined;
     const run = this.getRun(turn.runId);
     if (run === undefined || run.sessionId !== sessionId || run.turnId !== turn.turnId) return undefined;
     if (!this.verifyRunHistory(run)) return undefined;

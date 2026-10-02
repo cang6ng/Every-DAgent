@@ -202,6 +202,51 @@ describe("N1 a page is proven by the run read, not by a turn-side pair", () => {
     });
   });
 
+  it("refuses a page whose turn names an owner run that never committed a range", async () => {
+    await withTempDir(async (dir) => {
+      const path = join(dir, "vacuous.db");
+      const seeded = await seed(path);
+
+      // The records and the turn row move to cover the second half, and the
+      // owner run's committed range is erased while its status reads as
+      // unfinished. The run read's answer for such a run is the vacuous `true`
+      // — there is nothing on it to disagree with — so the turn-side binding
+      // is what has to hold the page here: a page that took the vacuous branch
+      // would publish a fragment of a turn no run ever committed.
+      const erase = new DatabaseSync(path);
+      erase
+        .prepare("UPDATE session_events SET turn_id = ? WHERE session_id = ? AND seq >= 6")
+        .run(seeded.firstTurn, seeded.session);
+      erase.prepare("UPDATE turns SET end_seq = 8 WHERE session_id = ? AND turn_id = ?").run(seeded.session, seeded.firstTurn);
+      erase
+        .prepare(
+          `UPDATE runs SET committed_from_seq = NULL, committed_to_seq = NULL, status = 'running',
+             end_reason = NULL, ended_at = NULL WHERE run_id = ?`,
+        )
+        .run(seeded.first);
+      erase.close();
+
+      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const client = connect(composed.host);
+      await client.describe();
+
+      // The vacuous branch, observed side by side: the run read accepts the
+      // unfinished run, the turn-side binding does not hold, and the page is
+      // refused — neither proof alone would have been enough.
+      const runRecord = composed.repository.getRun(seeded.first);
+      expect(runRecord !== undefined && composed.repository.verifyRunHistory(runRecord)).toBe(true);
+      expect(composed.repository.ownedTurnRange(seeded.session, seeded.firstTurn)).toBeUndefined();
+      expect(composed.repository.publishableTurnRange(seeded.session, seeded.firstTurn)).toBeUndefined();
+
+      const page = await client.call("sessions.history", { sessionId: seeded.session, limit: 1 });
+      expect(page.error?.code).toBe("INTERNAL_ERROR");
+      expect(page.result).toBeUndefined();
+
+      client.detach();
+      await composed.host.shutdown();
+    });
+  });
+
   it("still serves every legal fragment of a proven turn", async () => {
     await withTempDir(async (dir) => {
       const path = join(dir, "valid.db");

@@ -477,17 +477,17 @@ export function readHistoryPage(
 
   // And each turn the kept records belong to has to be a turn this store can
   // prove, and each record has to be a position that turn actually holds: the
-  // turn is held to the *run read's* own proof — its owner run's whole
-  // committed range, verified the way `runs.get` verifies it — and the range
-  // that proof returns is then what each record's own seq is measured against.
-  // The turn-side binding alone is not enough here: a turn row and its owner
-  // run's row moved together satisfy it by construction, and a page must not
-  // be the one reader a forged pair still satisfies. A page may be a fragment
-  // of a turn; it may never publish a fragment of a fact nobody can vouch for,
-  // nor a position the turn it names never committed. The check is bounded
-  // like the page itself: one proof per distinct turn id the kept records
-  // already carry, and one range comparison per record, so nothing is loaded
-  // that the page does not serve.
+  // turn is held to *both* proofs a committed turn carries — the turn-side
+  // binding, and its owner run's whole committed range verified the way
+  // `runs.get` verifies it — and the range those proofs return is then what
+  // each record's own seq is measured against. Neither proof alone is enough
+  // for a page: a turn row and its owner run's row moved together satisfy the
+  // binding by construction, and the run read vacantly accepts a run that
+  // never committed a turn. A page may be a fragment of a turn; it may never
+  // publish a fragment of a fact nobody can vouch for, nor a position the turn
+  // it names never committed. The check is bounded like the page itself: one
+  // proof per distinct turn id the kept records already carry, and one range
+  // comparison per record, so nothing is loaded that the page does not serve.
   const involvedTurns = new Map<string, TurnOwnerRange>();
   for (const record of kept.records) {
     let range = involvedTurns.get(record.turnId);
