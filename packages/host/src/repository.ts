@@ -407,6 +407,20 @@ export interface Repository {
    */
   ownedTurnRange(sessionId: string, turnId: string): TurnOwnerRange | undefined;
   /**
+   * The exact range one turn may be *published* at, proven the way the run
+   * read proves it.
+   *
+   * A history page is the one reader that may publish fragments, and the
+   * fragment's proof must not stop at the turn index: a turn row and its owner
+   * run's row moved together — a forged pair — satisfy the turn-side binding
+   * by construction while `verifyRunHistory` refuses the same run on every
+   * other path. A page may publish a fragment of a turn, so it asks for the
+   * range under the strongest proof this store has: the owner run's whole
+   * committed range, held to `verifyRunHistory` — the same authority
+   * `runs.get` serves by. `undefined` is the refusal.
+   */
+  publishableTurnRange(sessionId: string, turnId: string): TurnOwnerRange | undefined;
+  /**
    * The durable evidence for one terminal batch.
    *
    * `committed` means every part of the batch — the events of the range, the
@@ -1754,6 +1768,29 @@ class SqliteRepository implements Repository {
     this.assertTrusted();
     const turn = this.turnOwnerRow(sessionId, turnId);
     if (turn === undefined || !this.turnOwnershipHolds(sessionId, turn)) return undefined;
+    return { startSeq: turn.startSeq, endSeq: turn.endSeq };
+  }
+
+  /**
+   * The same range, asked under the run read's own authority — the proof a
+   * page needs so it can never become the one reader a forged pair of index
+   * rows still satisfies.
+   *
+   * The turn-side binding alone is a fact about two rows agreeing, and two
+   * rows moved together agree by construction. The run read is the stronger
+   * question — the owner's whole committed range against the canonical facts
+   * it claims, the same authority `runs.get` serves by — so a page asks it,
+   * once per distinct turn, before it publishes a fragment of that turn. The
+   * proof is bounded by the turn itself: one run record and one range read,
+   * never the session's history.
+   */
+  publishableTurnRange(sessionId: string, turnId: string): TurnOwnerRange | undefined {
+    this.assertTrusted();
+    const turn = this.turnOwnerRow(sessionId, turnId);
+    if (turn === undefined || turn.runId === null) return undefined;
+    const run = this.getRun(turn.runId);
+    if (run === undefined || run.sessionId !== sessionId || run.turnId !== turn.turnId) return undefined;
+    if (!this.verifyRunHistory(run)) return undefined;
     return { startSeq: turn.startSeq, endSeq: turn.endSeq };
   }
 

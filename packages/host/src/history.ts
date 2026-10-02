@@ -415,16 +415,18 @@ export type HistoryPageOutcome =
  * hard maximum: a page never answers with more items than were asked for.
  *
  * Fragment is not the same as unprovable. Every turn a served record belongs
- * to is held to the ownership proof the run read and the execution window
- * apply — its owner binding, its exact range, its reason, its accepted input
- * — and every record is held to the positions that proof returned: a record
- * whose own sequence lies outside the range of the turn its id names is a fact
- * this store cannot have written, because a page publishes durable history and
- * durable history is only ever history some run committed, at the positions
- * that run committed it. A turn that cannot be proven, or a record outside its
- * turn's range, makes the page a refusal, exactly like a record that is not
- * shaped the way a committed fact must be: the session is blocked and never
- * repaired.
+ * to is held to the run read's own proof — its owner run's whole committed
+ * range, verified the way `runs.get` verifies it — and every record is held to
+ * the positions that proof returned: a record whose own sequence lies outside
+ * the range of the turn its id names is a fact this store cannot have written,
+ * because a page publishes durable history and durable history is only ever
+ * history some run committed, at the positions that run committed it. The
+ * turn-side binding alone is deliberately not the standard here: a turn row
+ * and its owner run's row moved together agree by construction, and a page
+ * must not be the one reader such a pair still satisfies. A turn that cannot
+ * be proven, or a record outside its turn's range, makes the page a refusal,
+ * exactly like a record that is not shaped the way a committed fact must be:
+ * the session is blocked and never repaired.
  */
 export function readHistoryPage(
   repository: Repository,
@@ -475,22 +477,24 @@ export function readHistoryPage(
 
   // And each turn the kept records belong to has to be a turn this store can
   // prove, and each record has to be a position that turn actually holds: the
-  // ownership binding, the exact range, the reason and the accepted input are
-  // checked from the turn's own side against its owner run's own row — the
-  // same proof the run read and the execution window apply — and the range
+  // turn is held to the *run read's* own proof — its owner run's whole
+  // committed range, verified the way `runs.get` verifies it — and the range
   // that proof returns is then what each record's own seq is measured against.
-  // A page may be a fragment of a turn; it may never publish a fragment of a
-  // fact nobody can vouch for, nor a position the turn it names never
-  // committed. The check is bounded like the page itself: one proof per
-  // distinct turn id the kept records already carry, and one range comparison
-  // per record, so nothing is loaded that the page does not serve.
+  // The turn-side binding alone is not enough here: a turn row and its owner
+  // run's row moved together satisfy it by construction, and a page must not
+  // be the one reader a forged pair still satisfies. A page may be a fragment
+  // of a turn; it may never publish a fragment of a fact nobody can vouch for,
+  // nor a position the turn it names never committed. The check is bounded
+  // like the page itself: one proof per distinct turn id the kept records
+  // already carry, and one range comparison per record, so nothing is loaded
+  // that the page does not serve.
   const involvedTurns = new Map<string, TurnOwnerRange>();
   for (const record of kept.records) {
     let range = involvedTurns.get(record.turnId);
     if (range === undefined) {
-      range = repository.ownedTurnRange(sessionId, record.turnId);
+      range = repository.publishableTurnRange(sessionId, record.turnId);
       if (range === undefined) {
-        throw new CorruptRecordError(`turn "${record.turnId}" is not owned by the run its index names`);
+        throw new CorruptRecordError(`turn "${record.turnId}" is not provable as the turn its owner run committed`);
       }
       involvedTurns.set(record.turnId, range);
     }
