@@ -2084,7 +2084,8 @@ class SqliteRepository implements Repository {
           .run(input.submissionId, input.sessionId, input.inputHash, input.runId, input.acceptedAt);
         this.database
           .prepare(
-            `UPDATE sessions SET active_run_id = ?, metadata_revision = metadata_revision + 1, updated_at = ?
+            `UPDATE sessions SET active_run_id = ?, metadata_revision = metadata_revision + 1,
+               updated_at = MAX(updated_at, ?)
              WHERE session_id = ?`,
           )
           .run(input.runId, input.acceptedAt, input.sessionId);
@@ -2122,7 +2123,7 @@ class SqliteRepository implements Repository {
       () => {
         const changed = this.database
           .prepare(
-            `UPDATE runs SET status = 'running', started_at = ?, host_instance_id = ?
+            `UPDATE runs SET status = 'running', started_at = MAX(accepted_at, ?), host_instance_id = ?
              WHERE run_id = ? AND status = 'accepted'`,
           )
           .run(at, hostInstanceId, runId);
@@ -2177,14 +2178,14 @@ class SqliteRepository implements Repository {
           .prepare(
             `UPDATE sessions SET
                committed_seq = ?, history_revision = history_revision + 1,
-               metadata_revision = metadata_revision + 1, updated_at = ?, active_run_id = NULL
+               metadata_revision = metadata_revision + 1, updated_at = MAX(updated_at, ?), active_run_id = NULL
              WHERE session_id = ?`,
           )
           .run(seq, input.endedAt, input.sessionId);
         this.database
           .prepare(
             `UPDATE runs SET
-               status = ?, end_reason = ?, ended_at = ?, turn_id = ?,
+               status = ?, end_reason = ?, ended_at = MAX(COALESCE(started_at, accepted_at), ?), turn_id = ?,
                committed_from_seq = ?, committed_to_seq = ?
              WHERE run_id = ?`,
           )
@@ -2210,7 +2211,8 @@ class SqliteRepository implements Repository {
         if (session === undefined) throw new StorageOpenError("the session is gone");
         this.database
           .prepare(
-            `UPDATE runs SET status = 'failed', end_reason = 'host_error', error_code = ?, ended_at = ?, turn_id = ?
+            `UPDATE runs SET status = 'failed', end_reason = 'host_error', error_code = ?,
+               ended_at = MAX(COALESCE(started_at, accepted_at), ?), turn_id = ?
              WHERE run_id = ?`,
           )
           .run(input.errorCode, input.endedAt, input.turnId, input.runId);
@@ -2218,7 +2220,7 @@ class SqliteRepository implements Repository {
           .prepare(
             `UPDATE sessions SET
                status = 'blocked', blocked_reason = ?, metadata_revision = metadata_revision + 1,
-               updated_at = ?, active_run_id = NULL
+               updated_at = MAX(updated_at, ?), active_run_id = NULL
              WHERE session_id = ?`,
           )
           .run(input.blockedReason, input.endedAt, input.sessionId);
@@ -2300,7 +2302,7 @@ class SqliteRepository implements Repository {
           .prepare(
             `UPDATE sessions SET
                status = 'blocked', blocked_reason = 'host-fault',
-               metadata_revision = metadata_revision + 1, updated_at = ?
+               metadata_revision = metadata_revision + 1, updated_at = MAX(updated_at, ?)
              WHERE session_id = ?`,
           )
           .run(at, sessionId);
@@ -2329,7 +2331,7 @@ class SqliteRepository implements Repository {
         }
         this.database
           .prepare(
-            `UPDATE sessions SET title = ?, metadata_revision = metadata_revision + 1, updated_at = ?
+            `UPDATE sessions SET title = ?, metadata_revision = metadata_revision + 1, updated_at = MAX(updated_at, ?)
              WHERE session_id = ? AND metadata_revision = ?`,
           )
           .run(input.title, input.at, input.sessionId, input.expectedRevision);
@@ -2435,7 +2437,7 @@ class SqliteRepository implements Repository {
             .prepare(
               `UPDATE sessions SET
                  active_run_id = NULL, status = ?, blocked_reason = ?,
-                 metadata_revision = metadata_revision + 1, updated_at = ?
+                 metadata_revision = metadata_revision + 1, updated_at = MAX(updated_at, ?)
                WHERE session_id = ?`,
             )
             .run(blocked ? "blocked" : "ready", blocked ? "unknown-execution" : null, at, run.sessionId);
