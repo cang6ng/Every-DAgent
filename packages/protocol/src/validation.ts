@@ -33,9 +33,11 @@ import {
 import { eventSchemas, hostEventSchema, type HostEvent } from "./events.js";
 import {
   idSchema,
+  isLegalRequestId,
   JsonValueSchema,
   positiveSafeIntegerSchema,
   protocolErrorSchema,
+  requestIdSchema,
 } from "./schemas.js";
 import { PROTOCOL_VERSION } from "./contracts.js";
 
@@ -103,7 +105,7 @@ const GENERATION_PATTERN = /^[1-9][0-9]*$/;
 const hostRequestSchema = v.object({
   kind: v.literal("host-request"),
   protocolVersion: v.literal("2"),
-  requestId: idSchema,
+  requestId: requestIdSchema,
   method: v.string(),
   params: JsonValueSchema,
   hostInstanceId: idSchema,
@@ -118,7 +120,7 @@ const clientResponseSchema = v.pipe(
     protocolVersion: v.literal("2"),
     hostInstanceId: idSchema,
     streamId: idSchema,
-    requestId: idSchema,
+    requestId: requestIdSchema,
     result: v.optional(JsonValueSchema),
     error: v.optional(protocolErrorSchema),
   }),
@@ -136,9 +138,14 @@ function guardedSnapshot(input: unknown): { ok: true; snapshot: JsonValue } | { 
 }
 
 /**
- * The smallest safely-readable request correlation: kind plus non-empty
+ * The smallest safely-readable request correlation: kind plus a legal
  * requestId, both read from the isolated snapshot's own data properties.
  * Nothing else (no method, no params) ever travels in a failure.
+ *
+ * An over-long request id is not one: it cannot be answered, because the
+ * association itself would echo an id this protocol does not accept. Such a
+ * frame carries no correlation, which is what makes the upper layer end the
+ * connection instead of sending a response signed with an illegal identity.
  */
 function correlationOf(snapshot: JsonValue): RequestCorrelation | undefined {
   if (typeof snapshot !== "object" || snapshot === null || Array.isArray(snapshot)) return undefined;
@@ -146,7 +153,7 @@ function correlationOf(snapshot: JsonValue): RequestCorrelation | undefined {
   const kind = record["kind"];
   if (kind !== "client-request" && kind !== "host-request") return undefined;
   const requestId = record["requestId"];
-  if (typeof requestId !== "string" || requestId.length === 0) return undefined;
+  if (typeof requestId !== "string" || !isLegalRequestId(requestId)) return undefined;
   return { kind, requestId };
 }
 

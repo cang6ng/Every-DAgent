@@ -25,6 +25,7 @@
 import * as v from "valibot";
 
 import {
+  MAX_REQUEST_ID_BYTES,
   MAX_TITLE_CHARS,
   type ActiveRunSnapshot,
   type CanonicalItem,
@@ -46,6 +47,7 @@ import {
   type StorageIdentity,
   type TerminalRunSnapshot,
 } from "./contracts.js";
+import { utf8Bytes } from "./bytes.js";
 import { isStrictJsonValue } from "./json-value.js";
 
 // ---------------------------------------------------------------------------
@@ -59,6 +61,24 @@ const plainStringSchema = v.string();
 const nonEmptyStringSchema = v.pipe(v.string(), v.minLength(1));
 
 const idSchema = nonEmptyStringSchema;
+
+/**
+ * A request id: non-empty, and inside the one byte bound every envelope
+ * position shares.
+ *
+ * Deliberately not applied to the other identities the wire carries — session,
+ * run, submission, item and invocation ids are host-generated and are bounded
+ * by the frame they travel in, not by this. A request id is different: it is
+ * the correlation a prospective frame check has to reserve room for, and the
+ * one identity a peer chooses freely, so its bound has to be a published,
+ * enforceable one. Measured as the UTF-8 bytes of the raw string, because a
+ * character count is not what a frame pays for.
+ */
+export function isLegalRequestId(text: string): boolean {
+  return text.length > 0 && utf8Bytes(text) <= MAX_REQUEST_ID_BYTES;
+}
+
+const requestIdSchema = v.pipe(v.string(), v.check(isLegalRequestId));
 
 /** A wire generation: a positive integer in plain decimal, never parsed numerically. */
 const generationStringSchema = v.pipe(v.string(), v.regex(/^[1-9][0-9]*$/));
@@ -279,18 +299,29 @@ const canonicalItemSchema = v.variant("kind", [
 ]);
 
 /**
- * Occurrence-level consistency of one published canonical array, checked on
- * the whole array because pair correctness is not a per-item property.
+ * Occurrence-level consistency of one published canonical array.
  *
- * Pairing is by `invocationId` — never by `callId`, which may be empty and
- * may repeat across invocations. One invocation is one call plus at most one
- * result: a call may occur once, a result consumes exactly one preceding,
- * still-open call, and a pair whose turnId/callId/name disagree is a broken
- * projection, not bad luck to strip away.
+ * A published array is either a settled turn's items or one page of a
+ * traversal, and the rules are the same for both *within the array*: pairing is
+ * by `invocationId` — never by `callId`, which may be empty and may repeat
+ * across invocations — one invocation carries at most one call and at most one
+ * result, and when both halves are present they must agree on turnId, callId
+ * and name. A call that is not here is not a fault; it is the fragment case.
+ *
+ * A history page is explicitly a fragment: it may begin or end inside a turn,
+ * and it may carry one half of an occurrence whose other half sits on the next
+ * page — the result here, its call on the page below. So pairing is checked
+ * *within* the array and never demanded *of* it: a result whose call is not in
+ * the same array is legal, while two items claiming one identity, one position,
+ * or one occurrence twice are contradictions no projection could produce. The
+ * whole-turn rules — every declaration recorded, every call answered, no turn
+ * left open — belong to the execution window and the commit, where the host
+ * applies them to complete ranges (see the host's `assertStoredRange` and
+ * `projectSettledTurn`), not to a bounded cut.
  *
  * Positions are checked here too, because "these are log-ordered facts" is a
  * property of the sequence, not of any one item: `id`, `seq` and position in
- * the array must agree, and a call may not precede the turn it belongs to.
+ * the array must agree.
  */
 function canonicalItemsConsistent(items: readonly CanonicalItem[]): boolean {
   const itemIds = new Set<string>();
@@ -316,13 +347,16 @@ function canonicalItemsConsistent(items: readonly CanonicalItem[]): boolean {
       openCalls.set(item.invocationId, { turnId: item.turnId, callId: item.callId, name: item.name });
     } else if (item.kind === "tool-result") {
       if (results.has(item.invocationId)) return false;
-      const call = openCalls.get(item.invocationId);
-      if (call === undefined) return false;
-      if (call.turnId !== item.turnId || call.callId !== item.callId || call.name !== item.name) {
-        return false;
-      }
       results.add(item.invocationId);
-      openCalls.delete(item.invocationId);
+      const call = openCalls.get(item.invocationId);
+      if (call !== undefined) {
+        if (call.turnId !== item.turnId || call.callId !== item.callId || call.name !== item.name) {
+          return false;
+        }
+        openCalls.delete(item.invocationId);
+      }
+      // No call in this array: the fragment case. The other half is on the
+      // page below, and the occurrence's own identity is what ties the two.
     }
   }
   return true;
@@ -711,6 +745,7 @@ export {
   pluginSummarySchema,
   positiveSafeIntegerSchema,
   protocolErrorSchema,
+  requestIdSchema,
   revisionSchema,
   runPageSchema,
   runSnapshotSchema,

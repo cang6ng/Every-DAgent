@@ -44,6 +44,7 @@ describe("dependency boundary", () => {
   it("keeps the source tree to the planned modules", () => {
     expect([...srcRelative].sort()).toEqual(
       [
+        "bytes.ts",
         "channel.ts",
         "codec.ts",
         "contracts.ts",

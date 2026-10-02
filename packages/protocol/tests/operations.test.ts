@@ -454,12 +454,37 @@ describe("canonical occurrence validation (array-level)", () => {
     }
   });
 
-  it("rejects a tool-result with no preceding matching tool-call", () => {
-    const orphan = validateMessage(
-      { kind: "host-response", method: "sessions.history" },
-      hostResponseSuccess(historyPageOf([result("inv-1", "call-1")])),
-    );
-    expect(orphan).toMatchObject({ success: false });
+  it("accepts a fragment page carrying one half of an occurrence", () => {
+    // A history page is a bounded cut of a traversal, not a turn: the result
+    // may be on this page while its call sits on the one below, and the
+    // occurrence's own `invocationId` is what pairs them across pages.
+    // Refusing either half here would make a legal `limit=1` traversal
+    // unreadable — the fragment is a page's shape, not a fault.
+    for (const half of [[result("inv-1", "call-1")], [call("inv-1", "call-1")]]) {
+      const fragment = validateMessage(
+        { kind: "host-response", method: "sessions.history" },
+        hostResponseSuccess(historyPageOf(half)),
+      );
+      expect(fragment.success).toBe(true);
+    }
+  });
+
+  it("rejects a page whose half-claims contradict each other", () => {
+    // Absence is the fragment case; disagreement is not. Two results for one
+    // invocation, or a result answering a call that is present and different,
+    // is a contradiction no projection could produce.
+    const doubleResult = historyPageOf([result("inv-1", "call-1"), result("inv-1", "call-1")]);
+    const wrongName = historyPageOf([
+      call("inv-1", "call-1"),
+      { ...result("inv-1", "call-1"), name: "other-tool" },
+    ]);
+    for (const page of [doubleResult, wrongName]) {
+      const response = validateMessage(
+        { kind: "host-response", method: "sessions.history" },
+        hostResponseSuccess(page),
+      );
+      expect(response).toMatchObject({ success: false });
+    }
   });
 
   it("rejects a pair whose turnId, callId or name disagrees", () => {

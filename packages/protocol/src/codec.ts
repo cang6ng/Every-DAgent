@@ -14,9 +14,10 @@
 
 import * as v from "valibot";
 
+import { utf8Bytes } from "./bytes.js";
 import { MAX_FRAME_BYTES, type Id, type JsonValue } from "./contracts.js";
 import { guardJsonSnapshot, isStrictJsonValue } from "./json-value.js";
-import { idSchema } from "./schemas.js";
+import { idSchema, isLegalRequestId, requestIdSchema } from "./schemas.js";
 import {
   validateMessageCore,
   type RequestCorrelation,
@@ -92,41 +93,12 @@ export type DecodedEnvelope =
 
 const failure = (reason: ValidationFailureReason) => ({ success: false as const, failure: { reason } });
 
-/**
- * The UTF-8 byte length of a string, counted rather than allocated.
- *
- * Encoded size is the only size the wire has: a frame measured in code units
- * can be four times larger once its non-ASCII characters are encoded, and an
- * escaped control character in JSON costs six. Lone surrogates count as the
- * three bytes their replacement character takes, which is what every encoder
- * on the path will actually write.
- */
-function utf8Length(text: string): number {
-  let bytes = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    const code = text.charCodeAt(index);
-    if (code < 0x80) {
-      bytes += 1;
-    } else if (code < 0x800) {
-      bytes += 2;
-    } else if (code >= 0xd800 && code <= 0xdbff) {
-      const next = index + 1 < text.length ? text.charCodeAt(index + 1) : 0;
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        bytes += 4;
-        index += 1;
-      } else {
-        bytes += 3;
-      }
-    } else {
-      bytes += 3;
-    }
-  }
-  return bytes;
-}
-
-// Base envelope schemas. `protocolVersion` must be a well-formed generation
-// string so an unknown-but-legal generation survives to the version gate;
-// events keep their sequence unclamped (0 is rejected in v2 validation).
+// Base envelope schemas. The byte counting this file does — the frame bound
+// below and the request-id bound the schemas carry — is `bytes.ts`'s single
+// definition, so the decoder and the encoder cannot disagree about a size.
+// `protocolVersion` must be a well-formed generation string so an
+// unknown-but-legal generation survives to the version gate; events keep
+// their sequence unclamped (0 is rejected in v2 validation).
 const generationStringSchema = v.pipe(v.string(), v.regex(/^[1-9][0-9]*$/));
 const baseEntries = { protocolVersion: generationStringSchema } as const;
 
@@ -138,7 +110,7 @@ const decodeSchemas = {
   "client-request": v.object({
     kind: v.literal("client-request"),
     ...baseEntries,
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.string(),
     params: JsonValueLoose,
     hostInstanceId: v.optional(idSchema),
@@ -147,7 +119,7 @@ const decodeSchemas = {
     v.object({
       kind: v.literal("host-response"),
       ...baseEntries,
-      requestId: idSchema,
+      requestId: requestIdSchema,
       hostInstanceId: idSchema,
       result: v.optional(JsonValueLoose),
       error: v.optional(looseErrorSchema),
@@ -158,7 +130,7 @@ const decodeSchemas = {
     v.object({
       kind: v.literal("client-response"),
       ...baseEntries,
-      requestId: idSchema,
+      requestId: requestIdSchema,
       hostInstanceId: idSchema,
       streamId: idSchema,
       result: v.optional(JsonValueLoose),
@@ -179,7 +151,7 @@ const decodeSchemas = {
   "host-request": v.object({
     kind: v.literal("host-request"),
     ...baseEntries,
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.string(),
     params: JsonValueLoose,
     hostInstanceId: idSchema,
@@ -204,7 +176,7 @@ export function decodeFrame(frame: string): { success: true; output: DecodedEnve
   // The bound is checked on the encoded bytes before anything is parsed: a
   // frame this protocol would never send is not one it will read either, and
   // parsing it first would spend the memory the bound exists to protect.
-  if (utf8Length(frame) > MAX_FRAME_BYTES) return failure("FRAME_TOO_LARGE");
+  if (utf8Bytes(frame) > MAX_FRAME_BYTES) return failure("FRAME_TOO_LARGE");
 
   let parsed: unknown;
   try {
@@ -245,8 +217,13 @@ export function decodeFrame(frame: string): { success: true; output: DecodedEnve
 
 /**
  * The smallest safely-readable request correlation, shared with
- * `validateMessage`: kind plus non-empty requestId from own data properties
- * of the isolated snapshot.
+ * `validateMessage`: kind plus a legal requestId from own data properties of
+ * the isolated snapshot.
+ *
+ * The legality bound is part of the correlation itself, not a later check: an
+ * over-long id cannot be answered — echoing it would put an id the protocol
+ * does not accept back on the wire — so such a frame carries no correlation
+ * and the upper layer ends the connection instead of replying.
  */
 function correlationOf(
   kind: string,
@@ -255,7 +232,7 @@ function correlationOf(
   if (kind !== "client-request" && kind !== "host-request") return undefined;
   if (typeof snapshot !== "object" || snapshot === null) return undefined;
   const requestId = (snapshot as Record<string, JsonValue>)["requestId"];
-  if (typeof requestId !== "string" || requestId.length === 0) return undefined;
+  if (typeof requestId !== "string" || !isLegalRequestId(requestId)) return undefined;
   return { kind, requestId };
 }
 
@@ -318,6 +295,6 @@ export function encodeFrame(target: ValidationTarget, message: unknown): EncodeF
   }
   // Checked last, on the bytes that would actually travel: the bound is about
   // what the wire carries, and no earlier check can see the escaping.
-  if (utf8Length(output) > MAX_FRAME_BYTES) return failure("FRAME_TOO_LARGE");
+  if (utf8Bytes(output) > MAX_FRAME_BYTES) return failure("FRAME_TOO_LARGE");
   return { success: true, output };
 }

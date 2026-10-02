@@ -33,6 +33,7 @@ import {
   liveToolItemSchema,
   plainStringSchema,
   pluginSummarySchema,
+  requestIdSchema,
   sessionSummarySchema,
   terminalRunSchema,
 } from "./schemas.js";
@@ -277,7 +278,10 @@ const eventSchemas = {
     type: v.literal("host.request.cancelled"),
     scope: v.object({ kind: v.literal("host") }),
     payload: v.object({
-      requestId: idSchema,
+      // The host's own request id, held to the same bound as every other
+      // request-id position: this notice names a request, and a name this
+      // protocol does not mint is not one a client can be asked to match.
+      requestId: requestIdSchema,
       reason: v.union([v.literal("cancelled"), v.literal("timeout")]),
     }),
   }),

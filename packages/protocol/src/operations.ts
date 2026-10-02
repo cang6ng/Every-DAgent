@@ -47,6 +47,7 @@ import {
   pluginIdSchema,
   pluginSummarySchema,
   protocolErrorSchema,
+  requestIdSchema,
   revisionSchema,
   runPageSchema,
   runSnapshotSchema,
@@ -368,7 +369,7 @@ function responseSchemaFor<const M extends OperationName>(method: M) {
       kind: v.literal("host-response"),
       protocolVersion: v.literal("2"),
       hostInstanceId: idSchema,
-      requestId: idSchema,
+      requestId: requestIdSchema,
       result: v.optional(resultSchemas[method]),
       error: v.optional(protocolErrorSchema),
     }),
@@ -381,7 +382,7 @@ const hostErrorResponseSchema = v.object({
   kind: v.literal("host-response"),
   protocolVersion: v.literal("2"),
   hostInstanceId: idSchema,
-  requestId: idSchema,
+  requestId: requestIdSchema,
   error: protocolErrorSchema,
   // A success result has no way to travel on this target.
   result: v.optional(v.never()),
@@ -391,7 +392,7 @@ const requestSchemas = {
   "host.describe": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("host.describe"),
     params: paramsSchemas["host.describe"],
     hostInstanceId: v.optional(v.never()),
@@ -399,7 +400,7 @@ const requestSchemas = {
   "sessions.list": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("sessions.list"),
     params: paramsSchemas["sessions.list"],
     hostInstanceId: idSchema,
@@ -407,7 +408,7 @@ const requestSchemas = {
   "sessions.create": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("sessions.create"),
     params: paramsSchemas["sessions.create"],
     hostInstanceId: idSchema,
@@ -415,7 +416,7 @@ const requestSchemas = {
   "sessions.get": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("sessions.get"),
     params: paramsSchemas["sessions.get"],
     hostInstanceId: idSchema,
@@ -423,7 +424,7 @@ const requestSchemas = {
   "sessions.history": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("sessions.history"),
     params: paramsSchemas["sessions.history"],
     hostInstanceId: idSchema,
@@ -431,7 +432,7 @@ const requestSchemas = {
   "sessions.rename": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("sessions.rename"),
     params: paramsSchemas["sessions.rename"],
     hostInstanceId: idSchema,
@@ -439,7 +440,7 @@ const requestSchemas = {
   "sessions.delete": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("sessions.delete"),
     params: paramsSchemas["sessions.delete"],
     hostInstanceId: idSchema,
@@ -447,7 +448,7 @@ const requestSchemas = {
   "runs.start": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("runs.start"),
     params: paramsSchemas["runs.start"],
     hostInstanceId: idSchema,
@@ -455,7 +456,7 @@ const requestSchemas = {
   "runs.get": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("runs.get"),
     params: paramsSchemas["runs.get"],
     hostInstanceId: idSchema,
@@ -463,7 +464,7 @@ const requestSchemas = {
   "runs.list": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("runs.list"),
     params: paramsSchemas["runs.list"],
     hostInstanceId: idSchema,
@@ -471,7 +472,7 @@ const requestSchemas = {
   "runs.cancel": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("runs.cancel"),
     params: paramsSchemas["runs.cancel"],
     hostInstanceId: idSchema,
@@ -479,7 +480,7 @@ const requestSchemas = {
   "plugins.list": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("plugins.list"),
     params: paramsSchemas["plugins.list"],
     hostInstanceId: idSchema,
@@ -487,7 +488,7 @@ const requestSchemas = {
   "plugins.enable": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("plugins.enable"),
     params: paramsSchemas["plugins.enable"],
     hostInstanceId: idSchema,
@@ -495,7 +496,7 @@ const requestSchemas = {
   "plugins.disable": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("plugins.disable"),
     params: paramsSchemas["plugins.disable"],
     hostInstanceId: idSchema,
@@ -503,7 +504,7 @@ const requestSchemas = {
   "subscriptions.open": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("subscriptions.open"),
     params: paramsSchemas["subscriptions.open"],
     hostInstanceId: idSchema,
@@ -511,7 +512,7 @@ const requestSchemas = {
   "subscriptions.close": v.object({
     kind: v.literal("client-request"),
     protocolVersion: v.literal("2"),
-    requestId: idSchema,
+    requestId: requestIdSchema,
     method: v.literal("subscriptions.close"),
     params: paramsSchemas["subscriptions.close"],
     hostInstanceId: idSchema,

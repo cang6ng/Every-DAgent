@@ -29,6 +29,21 @@ export type ProtocolVersion = typeof PROTOCOL_VERSION;
  */
 export const MAX_FRAME_BYTES = 256 * 1024;
 
+/**
+ * The most bytes one request id may occupy, counted as the UTF-8 bytes of the
+ * raw string — not its character count, not its UTF-16 code units and not the
+ * bytes of its JSON encoding.
+ *
+ * It exists so a prospective frame check can reserve a request id's worst legal
+ * cost instead of guessing: an empty budget would let the 256 KiB frame bound
+ * be spent by the id itself, leaving no provable room for the answer. 128 bytes
+ * is comfortable for a UUID and for prefixed correlation ids, and small enough
+ * that the worst JSON string token a legal id can produce — two bytes of quotes
+ * plus six per escaped byte, all of them NUL — stays a small fraction of one
+ * frame.
+ */
+export const MAX_REQUEST_ID_BYTES = 128;
+
 /** The most items one page may carry. Whichever of `MAX_PAGE_ITEMS` / `MAX_PAGE_BYTES` is reached first ends the page. */
 export const MAX_PAGE_ITEMS = 50;
 /** The most encoded bytes one page payload may occupy. */

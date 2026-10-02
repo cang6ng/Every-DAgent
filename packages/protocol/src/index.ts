@@ -12,6 +12,7 @@ export {
   MAX_FRAME_BYTES,
   MAX_PAGE_BYTES,
   MAX_PAGE_ITEMS,
+  MAX_REQUEST_ID_BYTES,
   MAX_TITLE_CHARS,
   PROTOCOL_VERSION,
 } from "./contracts.js";
