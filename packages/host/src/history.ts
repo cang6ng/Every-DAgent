@@ -43,6 +43,7 @@ import {
   type SessionCursorKey,
   type SessionRecord,
   type StoredRecord,
+  type TurnOwnerRange,
 } from "./repository.js";
 
 /** Whether a listed run's committed range is the turn the store's index holds. */
@@ -416,10 +417,14 @@ export type HistoryPageOutcome =
  * Fragment is not the same as unprovable. Every turn a served record belongs
  * to is held to the ownership proof the run read and the execution window
  * apply — its owner binding, its exact range, its reason, its accepted input
- * — because a page publishes durable history and durable history is only ever
- * history some run committed. A turn that cannot be proven makes the page a
- * refusal, exactly like a record that is not shaped the way a committed fact
- * must be: the session is blocked and never repaired.
+ * — and every record is held to the positions that proof returned: a record
+ * whose own sequence lies outside the range of the turn its id names is a fact
+ * this store cannot have written, because a page publishes durable history and
+ * durable history is only ever history some run committed, at the positions
+ * that run committed it. A turn that cannot be proven, or a record outside its
+ * turn's range, makes the page a refusal, exactly like a record that is not
+ * shaped the way a committed fact must be: the session is blocked and never
+ * repaired.
  */
 export function readHistoryPage(
   repository: Repository,
@@ -469,19 +474,30 @@ export function readHistoryPage(
   assertStoredRange(kept.records, { partialPrefix: true, baseSeq: kept.fromSeq });
 
   // And each turn the kept records belong to has to be a turn this store can
-  // prove: the ownership binding, the exact range, the reason and the accepted
-  // input, checked from the turn's own side against its owner run's own row —
-  // the same proof the run read and the execution window apply. A page may be
-  // a fragment of a turn; it may never publish a fragment of a fact nobody can
-  // vouch for. The check is bounded like the page itself: only the distinct
-  // turn ids the kept records already carry are asked about, so nothing is
-  // loaded that the page does not serve.
-  const involvedTurns = new Set<string>();
+  // prove, and each record has to be a position that turn actually holds: the
+  // ownership binding, the exact range, the reason and the accepted input are
+  // checked from the turn's own side against its owner run's own row — the
+  // same proof the run read and the execution window apply — and the range
+  // that proof returns is then what each record's own seq is measured against.
+  // A page may be a fragment of a turn; it may never publish a fragment of a
+  // fact nobody can vouch for, nor a position the turn it names never
+  // committed. The check is bounded like the page itself: one proof per
+  // distinct turn id the kept records already carry, and one range comparison
+  // per record, so nothing is loaded that the page does not serve.
+  const involvedTurns = new Map<string, TurnOwnerRange>();
   for (const record of kept.records) {
-    if (involvedTurns.has(record.turnId)) continue;
-    involvedTurns.add(record.turnId);
-    if (!repository.verifyTurnOwnership(sessionId, record.turnId)) {
-      throw new CorruptRecordError(`turn "${record.turnId}" is not owned by the run its index names`);
+    let range = involvedTurns.get(record.turnId);
+    if (range === undefined) {
+      range = repository.ownedTurnRange(sessionId, record.turnId);
+      if (range === undefined) {
+        throw new CorruptRecordError(`turn "${record.turnId}" is not owned by the run its index names`);
+      }
+      involvedTurns.set(record.turnId, range);
+    }
+    if (record.seq < range.startSeq || record.seq >= range.endSeq) {
+      throw new CorruptRecordError(
+        `seq ${record.seq} claims turn "${record.turnId}", whose committed range is [${range.startSeq}, ${range.endSeq})`,
+      );
     }
   }
 

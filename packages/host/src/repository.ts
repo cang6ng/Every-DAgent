@@ -189,6 +189,12 @@ interface TurnOwnerRow {
   readonly runId: string | null;
 }
 
+/** The exact half-open range one proven turn holds, as its index row records it. */
+export interface TurnOwnerRange {
+  readonly startSeq: number;
+  readonly endSeq: number;
+}
+
 export interface CreateSessionInput {
   readonly sessionId: string;
   readonly title: string;
@@ -388,6 +394,18 @@ export interface Repository {
    * and each of them is refused, never repaired.
    */
   verifyTurnOwnership(sessionId: string, turnId: string): boolean;
+  /**
+   * The exact half-open range one turn is proven to hold, or `undefined` when
+   * that turn cannot be proven at all.
+   *
+   * The proof and the range are one answer, never two steps: a caller that has
+   * to know *which positions* a turn may publish — a history page binding a
+   * record to the turn its own id names — must not be able to hold a range
+   * from a turn the store cannot vouch for, because then the range would carry
+   * authority the turn itself never earned. `undefined` is exactly the answer
+   * `verifyTurnOwnership` gives `false` for, and the two are one lookup.
+   */
+  ownedTurnRange(sessionId: string, turnId: string): TurnOwnerRange | undefined;
   /**
    * The durable evidence for one terminal batch.
    *
@@ -1716,9 +1734,27 @@ class SqliteRepository implements Repository {
    * before a fragment of that turn can be published.
    */
   verifyTurnOwnership(sessionId: string, turnId: string): boolean {
+    return this.ownedTurnRange(sessionId, turnId) !== undefined;
+  }
+
+  /**
+   * The same one lookup, in the form a caller needs when the answer is not
+   * merely yes but *where*: the exact half-open range the turn index row holds,
+   * returned only once `turnOwnershipHolds` has proven the turn it belongs to.
+   *
+   * A caller that binds facts to positions — a history page binding each record
+   * to the turn its own id names — gets the range and the proof as one value,
+   * so it can never measure a record against a range from a turn this store
+   * cannot vouch for. `undefined` is the same refusal `verifyTurnOwnership`
+   * answers `false` for: no index row, no owner binding, a legacy NULL owner,
+   * an owner that names another turn, session, range or reason, or a canonical
+   * first user fact that is not the accepted input.
+   */
+  ownedTurnRange(sessionId: string, turnId: string): TurnOwnerRange | undefined {
     this.assertTrusted();
     const turn = this.turnOwnerRow(sessionId, turnId);
-    return turn !== undefined && this.turnOwnershipHolds(sessionId, turn);
+    if (turn === undefined || !this.turnOwnershipHolds(sessionId, turn)) return undefined;
+    return { startSeq: turn.startSeq, endSeq: turn.endSeq };
   }
 
   /**
