@@ -37,7 +37,8 @@ import { MAX_TITLE_CHARS, PROTOCOL_VERSION, encodeFrame } from "@every-dagent/pr
 import { storedProtocolError } from "./errors.js";
 import { encodeCursor, readSessionPage, sessionSummaryOf } from "./history.js";
 import type { Lease, RegistryGate } from "./registry-gate.js";
-import { encodedBytes, heaviestAcceptedText, type Repository, type RunRecord, type SessionRecord } from "./repository.js";
+import { refuseCorruptRun, servesRun } from "./run.js";
+import { heaviestAcceptedText, type Repository, type RunRecord, type SessionRecord } from "./repository.js";
 import type { ReverseOutcome, ReverseProfile, ReverseTimer } from "./reverse.js";
 
 /**
@@ -447,8 +448,21 @@ const SNAPSHOT_SESSION_ITEMS = 20;
 const SNAPSHOT_RUN_ITEMS = 20;
 /** How much accepted input the snapshot's run window may carry in total. */
 const SNAPSHOT_RUN_TEXT_BYTES = 48 * 1024;
-/** What the frame envelope adds on top of the snapshot it carries. */
-const SNAPSHOT_FRAME_MARGIN = 1024;
+
+/** The shape of every identity this host or the Core mints: a UUID's 36 bytes. */
+const MINTED_ID = "00000000-0000-4000-8000-000000000000";
+
+/**
+ * The request identity a snapshot is measured with when no request exists yet.
+ *
+ * Startup and admission judge a frame that has not been asked for, so they
+ * measure it with an id of this host's own shape — the same 36 bytes as any
+ * session, run or stream id it mints. A real subscriber's request id is echoed
+ * verbatim, and the capture measures the frame it will really send; this
+ * placeholder exists only so the checks made *before* a state exists are the
+ * same measurement as the ones made after, not a second budget beside it.
+ */
+export const PREPARED_REQUEST_ID = MINTED_ID;
 
 /**
  * One atomic cut of the published state.
@@ -459,22 +473,47 @@ const SNAPSHOT_FRAME_MARGIN = 1024;
  * repository inside this synchronous step, so the snapshot is exactly what
  * storage held when it was taken.
  *
- * The whole composition is then held to the frame it has to travel in: the
- * windows are the part that can honestly shrink, so a snapshot that would not
- * encode is reduced — run window first, then the directory — with `hasMore`
- * telling the truth about what was left out. What it never does is publish a
- * cut that claims completeness it does not have, or fail a subscriber whose
- * state could have been shown in a smaller window.
+ * The whole composition is then held to the frame it has to travel in — the
+ * protocol's own encoder, on the response this very request will be answered
+ * with — and a snapshot that would not encode is reduced: run window first,
+ * then the directory, with `hasMore` telling the truth about what was left out.
+ * There is no second budget beside that one: what is measured is the frame the
+ * client would receive, so a state this accepts is a state that can be sent.
+ * What it never does is publish a cut that claims completeness it does not
+ * have, or fail a subscriber whose state could have been shown in a smaller
+ * window.
  *
  * The run window is built here rather than by a page reader because it spans
  * sessions: it is the bounded view a subscriber gets for free, not a client's
  * paginated read of one session's runs. The live run, if there is one, is
  * always inside it — a session pointing at a run the client cannot see would be
  * a pointer to nothing.
+ *
+ * Every durable terminal it carries first passes the same validation every other
+ * read of a settled run passes. A record that fails is not projected: the
+ * session it belongs to is blocked — durably, and announced — and the record is
+ * left out of the cut with `hasMore` saying so, because one corrupted
+ * conversation must not cost a client every other session it could still read.
  */
-export function captureHostSnapshot(state: HostState, streamId: string): HostSnapshot {
-  const directory = readSessionPage(state.repository, undefined, SNAPSHOT_SESSION_ITEMS);
-  if ("failure" in directory) throw new Error("the session directory could not be read");
+export function captureHostSnapshot(
+  state: HostState,
+  streamId: string,
+  requestId: string = PREPARED_REQUEST_ID,
+): HostSnapshot {
+  // The durable window is validated first: a session this cut has to stop is
+  // blocked before anything else is read, so the revisions and the summaries
+  // composed below are the ones that block produced.
+  const recent = state.repository.listRecentRuns(SNAPSHOT_RUN_ITEMS, SNAPSHOT_RUN_TEXT_BYTES);
+  const usable: RunRecord[] = [];
+  let dropped = 0;
+  for (const record of recent.records) {
+    if (!servesRun(state, record)) {
+      refuseCorruptRun(state, record);
+      dropped += 1;
+      continue;
+    }
+    usable.push(record);
+  }
 
   const revisions = state.repository.revisions;
   const items: RunSummary[] = [];
@@ -492,13 +531,14 @@ export function captureHostSnapshot(state: HostState, streamId: string): HostSna
     if (run.terminal !== undefined) continue;
     include(liveRecordOf(run));
   }
+  for (const record of usable) include(record);
 
-  const recent = state.repository.listRecentRuns(SNAPSHOT_RUN_ITEMS, SNAPSHOT_RUN_TEXT_BYTES);
-  for (const record of recent.records) include(record);
+  const directory = readSessionPage(state.repository, undefined, SNAPSHOT_SESSION_ITEMS);
+  if ("failure" in directory) throw new Error("the session directory could not be read");
 
   let sessions = directory.page;
   let runs = items;
-  let hasMoreRuns = recent.hasMore;
+  let hasMoreRuns = recent.hasMore || dropped > 0;
 
   const compose = (): HostSnapshot =>
     Object.freeze({
@@ -521,13 +561,13 @@ export function captureHostSnapshot(state: HostState, streamId: string): HostSna
     });
 
   let snapshot = compose();
-  const budget = state.limits.maxFrameBytes - SNAPSHOT_FRAME_MARGIN;
-
   // Shrink honestly, and only in the ways the snapshot can account for: a
   // terminal run leaves the window first, then a session that points at no
   // run. The executing run and the session pointing at it are never dropped —
-  // they are the pair the cut exists for.
-  while (encodedBytes(snapshot) > budget) {
+  // they are the pair the cut exists for. The bound is the encoded frame the
+  // caller will be sent, decided by the protocol's own encoder: there is one
+  // frame authority in this host, and this is a call into it.
+  while (!snapshotFrameFits(state, snapshot, requestId)) {
     const droppable = lastIndexWhere(runs, (run) => run.status !== "accepted" && run.status !== "running");
     if (droppable >= 0) {
       runs = [...runs.slice(0, droppable), ...runs.slice(droppable + 1)];
@@ -570,9 +610,6 @@ export function captureHostSnapshot(state: HostState, streamId: string): HostSna
 // ---------------------------------------------------------------------------
 // What a cut can never shrink away.
 // ---------------------------------------------------------------------------
-
-/** The shape of every identity this host or the Core mints: a UUID's 36 bytes. */
-const MINTED_ID = "00000000-0000-4000-8000-000000000000";
 
 /**
  * The unshrinkable core of one published cut.
@@ -722,17 +759,23 @@ export function snapshotOfProspectiveRun(
  * Whether one composed cut fits the frame it has to travel in.
  *
  * The protocol's own encoder decides it, on the frame a subscriber would really
- * be sent — so a check made before a state exists and the response a client
- * later receives are never two different questions.
+ * be sent — with the request id that frame will carry, when there is one. That
+ * is the same question the response path asks at send time, asked while the
+ * answer can still change something: a check made before a state exists and the
+ * response a client later receives are never two different questions.
  */
-export function snapshotFrameFits(state: HostState, snapshot: HostSnapshot): boolean {
+export function snapshotFrameFits(
+  state: HostState,
+  snapshot: HostSnapshot,
+  requestId: string = PREPARED_REQUEST_ID,
+): boolean {
   return encodeFrame(
     { kind: "host-response", method: "subscriptions.open" },
     {
       kind: "host-response",
       protocolVersion: PROTOCOL_VERSION,
       hostInstanceId: state.hostInstanceId,
-      requestId: "prepare",
+      requestId,
       result: { snapshot },
     },
   ).success;

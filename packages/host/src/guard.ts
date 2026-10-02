@@ -89,23 +89,62 @@ export function openTurnOf(session: Session): string | undefined {
 }
 
 /**
+ * One field of a provider's value, read only if reading it cannot run code.
+ *
+ * The value comes from the property's own data descriptor, so no `[[Get]]`
+ * ever happens: an accessor would have to execute to be read, and a value that
+ * cannot be read without running something is not one this host may hand to a
+ * tool or write down as fact. Enumerability is required for the same reason the
+ * JSON guard requires it — a property the wire's own copy would not see is not
+ * part of the value. A provider is free to hand over a Proxy; a trap that
+ * throws is a refusal, not a crash.
+ */
+function ownField(owner: unknown, name: string, what: string): unknown {
+  if (owner === null || (typeof owner !== "object" && typeof owner !== "function")) {
+    throw new StepRefusedError(`${what} is not an object this host can read`);
+  }
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(owner, name);
+  } catch {
+    throw new StepRefusedError(`${what} is not an object this host can read`);
+  }
+  if (
+    descriptor === undefined ||
+    descriptor.get !== undefined ||
+    descriptor.set !== undefined ||
+    descriptor.enumerable !== true
+  ) {
+    throw new StepRefusedError(`${what} has no plain ${name}`);
+  }
+  return descriptor.value;
+}
+
+/**
  * Takes ownership of one tool call, or refuses it.
  *
- * The call's identity must be text and its arguments must be exactly what the
- * durable JSON profile accepts; on success the returned call carries an
- * isolated deep snapshot, so the provider cannot reach the value that will be
- * logged, executed and stored. On failure nothing is owned, because nothing
- * that could not be given back as fact may run.
+ * Every field is read through its own data descriptor *before* anything is read
+ * from it, so a call whose `input` (or `callId`, or `name`) is an accessor is
+ * refused without ever running the accessor — the validation and ownership
+ * below happen to a value the provider cannot hand out twice. The call's
+ * identity must be text and its arguments must be exactly what the durable JSON
+ * profile accepts; on success the returned call carries an isolated deep
+ * snapshot, so the provider cannot reach the value that will be logged,
+ * executed and stored. On failure nothing is owned, because nothing that could
+ * not be given back as fact may run.
  */
-function ownedToolCall(call: ToolCall): ToolCall {
-  if (typeof call.callId !== "string" || typeof call.name !== "string") {
+function ownedToolCall(call: unknown): ToolCall {
+  const callId = ownField(call, "callId", "a tool call");
+  const name = ownField(call, "name", "a tool call");
+  const input = ownField(call, "input", "a tool call");
+  if (typeof callId !== "string" || typeof name !== "string") {
     throw new StepRefusedError("a tool call has no call identity");
   }
-  const validated = validateJsonValue(call.input);
+  const validated = validateJsonValue(input);
   if (!validated.success) {
     throw new StepRefusedError("a tool call's arguments are not something JSON can carry");
   }
-  return Object.freeze({ callId: call.callId, name: call.name, input: validated.output });
+  return Object.freeze({ callId, name, input: validated.output });
 }
 
 /**
@@ -154,23 +193,33 @@ async function* guardStream(
   let completed = false;
 
   for await (const event of source) {
-    if (event.type === "tool-call") {
+    // The event's own shape is read the same way the call's fields are: an
+    // accessor is a shape this host refuses to execute, wherever it sits.
+    const type = ownField(event, "type", "a model event");
+
+    if (type === "tool-call") {
       // Owned here, at the moment it arrives: from this point on the step's
       // call is this host's snapshot, and the provider's object is out of the
       // picture for validation, execution and storage alike.
-      const owned = ownedToolCall(event.call);
+      const owned = ownedToolCall(ownField(event, "call", "a tool call event"));
       toolCalls.push(owned);
       yield { type: "tool-call" as const, call: owned };
       continue;
     }
 
-    if (event.type === "done") {
+    if (type === "done") {
       // Checked before the loop sees it: the step becomes an assistant record
       // only if this returns, so a refusal here is before every consequence.
       assertStepStorable({ text: text.join(""), toolCalls }, options);
       completed = true;
     }
-    if (event.type === "text-delta") text.push(event.text);
+    if (type === "text-delta") {
+      // Read through the descriptor like every other field — an accessor is
+      // never run — but not otherwise reinterpreted here: what a text chunk
+      // must be is the Core's and the projection's question, and this guard
+      // does not get to change an answer they already give.
+      text.push(ownField(event, "text", "a text delta") as string);
+    }
 
     yield event;
   }

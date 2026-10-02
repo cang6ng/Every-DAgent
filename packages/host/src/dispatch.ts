@@ -472,7 +472,9 @@ function dispatchClientRequest(
       const streamId = newId();
       let snapshot;
       try {
-        snapshot = captureHostSnapshot(state, streamId);
+        // The cut is held to the frame this very request will be answered
+        // with, so what it accepts is exactly what can travel.
+        snapshot = captureHostSnapshot(state, streamId, requestId);
       } catch (error) {
         // The cut could not be composed at all — a directory that cannot be
         // read, or a state that cannot be published inside one frame after

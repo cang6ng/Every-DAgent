@@ -1573,6 +1573,19 @@ class SqliteRepository implements Repository {
    * the range, the turn row and the reason that claim implies. A status that
    * names a committed turn and holds no range is a record disagreeing with
    * itself, and is refused exactly like one pointing at somebody else's turn.
+   *
+   * Two further facts, because "this turn is mine" is not implied by the turn
+   * merely existing:
+   *
+   * - The turn is this run's own. Every terminal commit writes the run's range
+   *   and its turn in one transaction, so a committed turn has exactly one run.
+   *   A turn two runs both claim is a state this store cannot have produced,
+   *   and neither claim is served from it.
+   * - The range holds the canonical facts it claims — the same sequence, turn
+   *   closure and tool-pairing rules a history page and an execution window
+   *   apply, applied here to the run's own committed range instead of to a cut
+   *   out of it. That is what makes one authority: whichever way a client asks
+   *   about a settled run, the same records are held to the same rules.
    */
   verifyRunHistory(run: RunRecord): boolean {
     this.assertTrusted();
@@ -1599,6 +1612,7 @@ class SqliteRepository implements Repository {
     if (run.turnId === null) return false;
     const expected = endReasonFor(run.status);
     if (expected === undefined || run.endReason !== expected) return false;
+    if (to <= from) return false;
 
     const turn = this.database
       .prepare("SELECT start_seq, end_seq, reason FROM turns WHERE session_id = ? AND turn_id = ?")
@@ -1612,7 +1626,22 @@ class SqliteRepository implements Repository {
     // to reach at least its end; a session that does not hold the turn is a run
     // whose history is somewhere else.
     const session = this.getSession(run.sessionId);
-    return session !== undefined && session.committedSeq >= to;
+    if (session === undefined || session.committedSeq < to) return false;
+
+    const claimants = this.database
+      .prepare("SELECT COUNT(*) AS count FROM runs WHERE session_id = ? AND turn_id = ?")
+      .get(run.sessionId, run.turnId) as { readonly count?: number } | undefined;
+    if (claimants?.count !== 1) return false;
+
+    try {
+      const rows = this.database
+        .prepare("SELECT * FROM session_events WHERE session_id = ? AND seq >= ? AND seq < ? ORDER BY seq")
+        .all(run.sessionId, from, to) as Row[];
+      assertStoredRange(rows.map(storedOf), { partialPrefix: false, baseSeq: from });
+    } catch {
+      return false;
+    }
+    return true;
   }
 
   verifyTurnCommit(input: CommitTurnInput): "committed" | "absent" | "indeterminate" {

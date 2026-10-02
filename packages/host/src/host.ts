@@ -49,6 +49,7 @@ import {
   captureHostSnapshot,
   newId,
   pluginSummaryOf,
+  PREPARED_REQUEST_ID,
   snapshotFrameFits,
   snapshotOfHeaviestState,
   type ConnectionState,
@@ -280,7 +281,7 @@ function currentStepTurn(state: HostState): StepTurnIdentity | undefined {
  */
 function assertSelfDescription(state: HostState): void {
   const result: OperationMap["subscriptions.open"]["result"] = {
-    snapshot: captureHostSnapshot(state, "prepare:stream"),
+    snapshot: captureHostSnapshot(state, "prepare:stream", PREPARED_REQUEST_ID),
   };
   const validated = validateMessage(
     { kind: "host-response", method: "subscriptions.open" },

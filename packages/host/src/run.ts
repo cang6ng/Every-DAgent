@@ -30,6 +30,7 @@ import type { LiveToolItem, OperationMap, ProtocolError } from "@every-dagent/pr
 
 import {
   assertEventBuilds,
+  closeConnection,
   publishEvent,
   publishValidatedEvent,
   runEndedEvent,
@@ -142,7 +143,14 @@ export function startRun(
       return operationFailed(protocolError("SUBMISSION_CONFLICT"));
     }
     const previous = known.runId === null ? undefined : state.repository.getRun(known.runId);
-    if (previous !== undefined) return operationSucceeded({ run: runSnapshotOfRecord(previous, storedError(previous.errorCode)) });
+    if (previous !== undefined) {
+      // A resubmission is answered with its original run — and only when that
+      // run is the fact it claims. A terminal that disagrees with its own
+      // history is not a dedup answer but corruption: the session is stopped,
+      // and this request is refused instead of being served a repaired record.
+      if (!servesRun(state, previous)) return operationFailed(refuseCorruptRun(state, previous));
+      return operationSucceeded({ run: runSnapshotOfRecord(previous, storedError(previous.errorCode)) });
+    }
     return operationFailed(protocolError("SUBMISSION_CONFLICT"));
   }
 
@@ -222,8 +230,11 @@ export function startRun(
       return operationFailed(protocolError("HOST_BUSY"));
     case "existing":
       // Another connection admitted this submission between the read above and
-      // this transaction. Its run is the answer, and this call executes nothing.
+      // this transaction. Its run is the answer, and this call executes nothing
+      // — once the run has been held to the same validation every other read of
+      // a durable run is held to.
       lease.release();
+      if (!servesRun(state, admission.run)) return operationFailed(refuseCorruptRun(state, admission.run));
       return operationSucceeded({
         run: runSnapshotOfRecord(admission.run, storedError(admission.run.errorCode)),
       });
@@ -312,7 +323,10 @@ export function cancelRun(state: HostState, runId: string): OperationOutcome<Run
         run.cancelDurable = record.cancelRequested;
         if (record.status !== "accepted" && record.status !== "running") {
           // The store already holds this run's outcome — it is the durable
-          // terminal that is the answer, and cancelling executes nothing.
+          // terminal that is the answer, and cancelling executes nothing. The
+          // terminal is held to the same validation as any other read of one:
+          // a cancel never launders a record the host would refuse elsewhere.
+          if (!servesRun(state, record)) return operationFailed(refuseCorruptRun(state, record));
           return operationSucceeded({ run: runSnapshotOfRecord(record, storedError(record.errorCode)) });
         }
       } catch (error) {
@@ -348,7 +362,10 @@ export function cancelRun(state: HostState, runId: string): OperationOutcome<Run
     // no live entry is not a state this host can act on.
     return operationFailed(protocolError("HOST_BUSY"));
   }
-  // A committed terminal is never re-opened, and cancelling one executes nothing.
+  // A committed terminal is never re-opened, and cancelling one executes
+  // nothing — once the record has been held to the same validation every other
+  // read of a durable terminal is held to.
+  if (!servesRun(state, record)) return operationFailed(refuseCorruptRun(state, record));
   return operationSucceeded({ run: runSnapshotOfRecord(record, storedError(record.errorCode)) });
 }
 
@@ -372,12 +389,9 @@ export function readRun(state: HostState, params: { readonly runId?: string; rea
       return operationFailed(error instanceof StoreUntrustedError ? storageUnavailableError() : protocolError("INTERNAL_ERROR"));
     }
     if (record === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
-    if (!servesRun(state, record)) {
-      // The record and the history it claims disagree: this host will not
-      // describe the run, and it will not execute this session again either.
-      blockCorruptedSession(state, record.sessionId);
-      return operationFailed(protocolError("INTERNAL_ERROR"));
-    }
+    // The record and the history it claims disagree: this host will not
+    // describe the run, and it will not execute this session again either.
+    if (!servesRun(state, record)) return operationFailed(refuseCorruptRun(state, record));
     return operationSucceeded({ run: runSnapshotOfRecord(record, storedError(record.errorCode)) });
   }
 
@@ -397,14 +411,20 @@ export function readRun(state: HostState, params: { readonly runId?: string; rea
     return operationFailed(error instanceof StoreUntrustedError ? storageUnavailableError() : protocolError("INTERNAL_ERROR"));
   }
   if (record === undefined) return operationFailed(protocolError("RUN_NOT_FOUND"));
-  if (!servesRun(state, record)) {
-    blockCorruptedSession(state, record.sessionId);
-    return operationFailed(protocolError("INTERNAL_ERROR"));
-  }
+  if (!servesRun(state, record)) return operationFailed(refuseCorruptRun(state, record));
   return operationSucceeded({ run: runSnapshotOfRecord(record, storedError(record.errorCode)) });
 }
 
-/** Whether a durable run record's committed range is the turn the index holds. */
+/**
+ * Whether one durable run record may be served as the fact it claims.
+ *
+ * The one authority every public path asks before a terminal run leaves this
+ * host: the dedup answer, the run and submission reads, the cancel answer and
+ * the published cut all call it, so no path can be the one that serves a record
+ * the others would refuse. An unfinished run is this host's own admission and
+ * carries no history to disagree with; a terminal one is only what it says if
+ * the repository's own commit evidence says so too.
+ */
 export function servesRun(state: HostState, record: RunRecord): boolean {
   if (record.status === "accepted" || record.status === "running") return true;
   try {
@@ -412,6 +432,20 @@ export function servesRun(state: HostState, record: RunRecord): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The refusal one corrupt terminal run produces, and its one consequence.
+ *
+ * The session is stopped durably — it must not execute against a history the
+ * host cannot read — and the caller is told the host could not answer, never
+ * handed the damaged payload. The refusal is INTERNAL_ERROR, an existing frozen
+ * answer: a corrupted record is not a client's mistake, and it is not evidence
+ * that anything is unavailable either. Other sessions are untouched.
+ */
+export function refuseCorruptRun(state: HostState, record: RunRecord): ProtocolError {
+  blockCorruptedSession(state, record.sessionId);
+  return protocolError("INTERNAL_ERROR");
 }
 
 /**
@@ -1005,7 +1039,27 @@ function storedError(code: string | null): ProtocolError | null {
   return code === null ? null : storedProtocolError(code);
 }
 
-/** Marks the host unable to confirm writes, and says so once. */
+/**
+ * Marks the host unable to confirm writes, and stops claiming a live
+ * presentation.
+ *
+ * From this moment the host cannot say what storage holds for the work it was
+ * executing, and it cannot reconcile that — only a restart can, from durable
+ * facts. What it must not do is keep telling connected clients that the state
+ * they are reading is current: the run's terminal may or may not have landed,
+ * and a presentation that still says "running, live" is a claim nobody can
+ * back. So every connection is ended, which is the one transport-level signal
+ * the contract has for "this side no longer knows" — the client marks the
+ * presentation it keeps as stale, its pending work as unknown, and reads
+ * answer STORAGE_UNAVAILABLE until a restart reconciles the facts.
+ *
+ * Nothing durable is written here and nothing is invented: the run is left
+ * unfinished in the store exactly as it is, for the next start to reconcile to
+ * `interrupted`. The call is idempotent — the fault is a state, and the
+ * second report of it closes nothing that is not already gone.
+ */
 export function markStorageFault(state: HostState): void {
+  if (state.storageFault) return;
   state.storageFault = true;
+  for (const connection of [...state.connections]) closeConnection(state, connection);
 }

@@ -525,9 +525,14 @@ interface TrimmedRange {
  * The cut is chosen from the newest end backwards, so a page always carries the
  * most recent facts it can. One adjustment keeps the page honest at its own
  * edge: a tool result is never left without its call, because half of an
- * occurrence reads as a different occurrence. The call is inside the same read
- * whenever the fence allows it; when it is not, the fragment is dropped and the
- * next page picks it up, which keeps the traversal contiguous.
+ * occurrence reads as a different occurrence. When the call is inside the same
+ * read — it is the record immediately before the result — the page carries the
+ * occurrence whole, which may be one item more than the caller asked for and is
+ * the only way a `limit` smaller than an occurrence can serve one at all; the
+ * protocol's own ceilings are still respected, and a call and its result always
+ * fit one page together. When the call is outside the read, the fragment is
+ * dropped and the next page picks it up — the cursor then points below it —
+ * which keeps the traversal contiguous.
  */
 function trimToBudget(sessionId: string, records: readonly StoredRecord[], limit: number): TrimmedRange {
   const newest = records[records.length - 1];
@@ -548,7 +553,17 @@ function trimToBudget(sessionId: string, records: readonly StoredRecord[], limit
     bytes -= weight.bytes;
   }
 
-  while (kept > 0 && records[records.length - kept]?.type === "tool/result") kept -= 1;
+  while (kept > 0 && records[records.length - kept]?.type === "tool/result") {
+    const call = records[records.length - kept - 1];
+    if (call !== undefined && call.type === "tool/call") {
+      const weight = itemWeight(call);
+      if (itemCount + weight.items <= MAX_PAGE_ITEMS && bytes + weight.bytes <= PAGE_ITEM_BUDGET_BYTES) {
+        kept += 1;
+        break;
+      }
+    }
+    kept -= 1;
+  }
   if (kept === 0) {
     // Every record the read returned was an orphaned result, which a log this
     // store wrote cannot contain; refusing beats inventing a page.

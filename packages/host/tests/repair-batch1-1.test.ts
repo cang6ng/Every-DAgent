@@ -359,21 +359,30 @@ describe("R02 transaction endings", () => {
 
       // C and D: the COMMIT never ran and the ROLLBACK never ran. Nothing can
       // be proven, so nothing is published: no terminal of any kind, and the
-      // batch's uncommitted rows are never read as a durable outcome.
+      // batch's uncommitted rows are never read as a durable outcome. The
+      // host also stops claiming the presentation it was streaming is current:
+      // the connection it was on is ended, which is the one signal the contract
+      // has for "this side no longer knows" — a client's pending work becomes
+      // unknown and its retained presentation is stale.
       expect(client.events.filter((event) => event.type === "run.ended")).toHaveLength(0);
+      expect(client.isClosed).toBe(true);
 
-      // E: the live entry is released, so the client is not shown the execution
-      // it was watching. The durable record is what is served (a fresh
-      // connection reads committed facts only), and it says: unfinished.
-      const queried = await client.call("runs.get", { runId });
+      // The live entry is released, so a reader is not shown the execution the
+      // host was watching. A fresh connection reads committed facts only, and
+      // the record says: unfinished.
+      const reader = connect(composed.host);
+      await reader.describe();
+      const queried = await reader.call("runs.get", { runId });
       expect(queried.error).toBeUndefined();
       const run = queried.result?.run;
       if (run?.status !== "running") throw new Error(`the run should read as unfinished, not ${String(run?.status)}`);
       expect(run.live).toEqual([]);
       expect(run.liveTruncated).toBe(true);
 
-      // No new execution while the store cannot be trusted.
-      const refused = await client.call("runs.start", {
+      // No new execution while the store cannot be trusted. A reader gets the
+      // durable facts it can still read — the unfinished record, and no
+      // timeline this host was watching — but nothing new may start on them.
+      const refused = await reader.call("runs.start", {
         sessionId: session.sessionId,
         submissionId: nextId("sub"),
         text: "again",
@@ -382,6 +391,7 @@ describe("R02 transaction endings", () => {
 
       // The durable truth, read after the host released the file: no turn was
       // committed and the run never reached a terminal.
+      reader.detach();
       client.detach();
       await composed.host.shutdown();
       const database = new DatabaseSync(path);
@@ -432,13 +442,21 @@ describe("R02 transaction endings", () => {
     expect(interference.injected()).toBe(1);
     interference.restore();
 
-    const list = await client.call("sessions.list", {});
+    // The connection that was reading the unconfirmable execution is over; a
+    // client that wants to read again has to reconnect, and what it gets then
+    // is the truth about a store nobody can read.
+    expect(client.isClosed).toBe(true);
+    const reader = connect(composed.host);
+    await reader.describe();
+
+    const list = await reader.call("sessions.list", {});
     expect(list.error?.code).toBe("STORAGE_UNAVAILABLE");
-    const get = await client.call("sessions.get", { sessionId: session.sessionId });
+    const get = await reader.call("sessions.get", { sessionId: session.sessionId });
     expect(get.error?.code).toBe("STORAGE_UNAVAILABLE");
-    const opened = await client.call("subscriptions.open", {});
+    const opened = await reader.call("subscriptions.open", {});
     expect(opened.error?.code).toBe("STORAGE_UNAVAILABLE");
 
+    reader.detach();
     client.detach();
     await composed.host.shutdown();
   });

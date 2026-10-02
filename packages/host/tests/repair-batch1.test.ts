@@ -396,22 +396,28 @@ describe("R02 commit outcome reconciliation", () => {
 
     // Nothing was fabricated: the host publishes no terminal it could not
     // prove. What it must not do either is keep presenting the execution it was
-    // watching as a live run — the entry is released, and a query is answered by
-    // the durable record, which here really did land.
+    // watching as a live run — the entry is released and the connection it was
+    // streaming on is ended, because the host can no longer vouch for what a
+    // reader sees. A reader that reconnects is answered by the durable record,
+    // which here really did land.
     expect(client.events.filter((event) => event.type === "run.ended")).toHaveLength(0);
-    const queried = await client.call("runs.get", { runId });
+    expect(client.isClosed).toBe(true);
+    const reader = connect(composed.host);
+    await reader.describe();
+    const queried = await reader.call("runs.get", { runId });
     expect(queried.result?.run.status).toBe("completed");
     expect(queried.result?.run.live).toBeNull();
     expect(composed.repository.getRun(runId)?.status).toBe("completed");
 
     // New execution is refused while the store cannot be trusted.
-    const refused = await client.call("runs.start", {
+    const refused = await reader.call("runs.start", {
       sessionId: session.sessionId,
       submissionId: nextId("sub"),
       text: "again",
     });
     expect(refused.error?.code).toBe("STORAGE_UNAVAILABLE");
 
+    reader.detach();
     client.detach();
     await composed.host.shutdown();
   });
@@ -519,7 +525,13 @@ describe("R05 corruption is refused", () => {
       const path = join(dir, "window.db");
       await seed(path);
       const database = new DatabaseSync(path);
+      // The log the run would execute against is what is damaged: the committed
+      // turn left behind disagrees with itself — its user fact is not the
+      // payload its type promises — and no run row claims it any more, so a cut
+      // has nothing to refuse and the damage is found exactly where it matters:
+      // loading the history this run would continue.
       database.prepare("UPDATE session_events SET data = 'not-json' WHERE type = 'message/user'").run();
+      database.prepare("DELETE FROM runs").run();
       database.close();
 
       // No page is read first: the corruption is found while loading the
