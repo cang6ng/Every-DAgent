@@ -32,7 +32,7 @@ import type {
   SessionSummary,
   TerminalRunSnapshot,
 } from "@every-dagent/protocol";
-import { MAX_TITLE_CHARS, PROTOCOL_VERSION, encodeFrame } from "@every-dagent/protocol";
+import { MAX_REQUEST_ID_BYTES, MAX_TITLE_CHARS, PROTOCOL_VERSION, encodeFrame } from "@every-dagent/protocol";
 
 import { storedProtocolError } from "./errors.js";
 import { encodeCursor, readSessionPage, sessionSummaryOf } from "./history.js";
@@ -455,14 +455,20 @@ const MINTED_ID = "00000000-0000-4000-8000-000000000000";
 /**
  * The request identity a snapshot is measured with when no request exists yet.
  *
- * Startup and admission judge a frame that has not been asked for, so they
- * measure it with an id of this host's own shape — the same 36 bytes as any
- * session, run or stream id it mints. A real subscriber's request id is echoed
- * verbatim, and the capture measures the frame it will really send; this
- * placeholder exists only so the checks made *before* a state exists are the
- * same measurement as the ones made after, not a second budget beside it.
+ * Startup and admission judge a frame that has not been asked for, and the
+ * request id it will carry is not known yet — so the check reserves the most
+ * expensive legal one there is. Every legal id is at most
+ * `MAX_REQUEST_ID_BYTES` raw UTF-8 bytes, and the worst JSON string token such
+ * an id can produce is a full identity's worth of NUL, each escaped to six
+ * characters: `2 + 6 * MAX_REQUEST_ID_BYTES` bytes. Reserving that means a
+ * state these checks accept is a state *every* legal request id can be served
+ * in — a client with a long or escaping-heavy id cannot be refused by a
+ * frame that the same state would have accepted for a UUID.
+ *
+ * It is a measurement input, never a wire value: a real subscriber's id is
+ * echoed verbatim, and the capture measures the frame it will really send.
  */
-export const PREPARED_REQUEST_ID = MINTED_ID;
+export const PREPARED_REQUEST_ID = "\u0000".repeat(MAX_REQUEST_ID_BYTES);
 
 /**
  * One atomic cut of the published state.
@@ -763,6 +769,11 @@ export function snapshotOfProspectiveRun(
  * is the same question the response path asks at send time, asked while the
  * answer can still change something: a check made before a state exists and the
  * response a client later receives are never two different questions.
+ *
+ * With no request yet, the default is `PREPARED_REQUEST_ID` — the worst legal
+ * request id's full encoded cost — so what this accepts, every legal request id
+ * can be served in. Actual captures pass the real id and measure the real
+ * frame; the reservation never replaces that check, it only precedes it.
  */
 export function snapshotFrameFits(
   state: HostState,

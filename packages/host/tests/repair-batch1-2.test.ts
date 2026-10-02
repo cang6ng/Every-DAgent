@@ -18,7 +18,7 @@ import { describe, expect, it } from "vitest";
 import type { Tool } from "@every-dagent/agent-core";
 import type { Plugin } from "@every-dagent/plugin-system";
 import type { HostSnapshot } from "@every-dagent/protocol";
-import { MAX_FRAME_BYTES, PROTOCOL_VERSION, encodeFrame } from "@every-dagent/protocol";
+import { MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, PROTOCOL_VERSION, encodeFrame } from "@every-dagent/protocol";
 
 import { composeHost, type ComposedHost } from "../src/host.js";
 import { heaviestAcceptedText } from "../src/repository.js";
@@ -452,10 +452,10 @@ describe("R05 terminal run authority", () => {
 });
 
 // ---------------------------------------------------------------------------
-// R28 — one encoded frame authority.
+// E4 / R28 — the request-id bound, and one frame authority over it.
 // ---------------------------------------------------------------------------
 
-describe("R28 single frame authority", () => {
+describe("E4 request-id reservation and one frame authority", () => {
   /** A plugin whose static summary carries `bytes` of description. */
   function bigPlugin(bytes: number): Plugin {
     return {
@@ -482,32 +482,66 @@ describe("R28 single frame authority", () => {
     return { composed, state, model };
   }
 
-  it("composes, admits and serves exactly at the frame limit — and refuses one byte past it", async () => {
-    // The description is one frame byte per character, so the configuration
-    // whose heaviest frame is exactly the limit is found by measuring one safe
-    // configuration and adding the difference: no guessing, no second budget.
-    const base = 96 * 1024;
+  /** The boundary configuration: heaviest legal state exactly at the limit, with the reservation. */
+  async function boundaryAt(base: number): Promise<number> {
     const measured = hostAt(base);
     const baseSnapshot = snapshotOfHeaviestState(measured.state, "prepare:stream");
     const baseBytes = frameBytesOf(measured.state, baseSnapshot, PREPARED_REQUEST_ID);
     expect(snapshotFrameFits(measured.state, baseSnapshot)).toBe(true);
     const atLimit = base + (MAX_FRAME_BYTES - baseBytes);
     await measured.composed.host.shutdown();
+    return atLimit;
+  }
 
-    // Startup: at the limit the heaviest state composes and measures exactly
-    // the limit; one byte less in the same frame measures one byte less, and a
-    // frame one byte past the limit is one the encoder itself refuses —
-    // including when a whole configuration would only ever produce it.
+  /** One legal request id of each shape the bound allows. */
+  function legalIds(): readonly { readonly id: string; readonly what: string }[] {
+    return [
+      { id: "00000000-0000-4000-8000-000000000000", what: "a 36 B UUID" },
+      { id: "a".repeat(MAX_REQUEST_ID_BYTES), what: "128 B of ASCII" },
+      { id: "中".repeat(Math.floor(MAX_REQUEST_ID_BYTES / 3)), what: "128 B of multibyte text" },
+      { id: PREPARED_REQUEST_ID, what: "the worst-case NUL id" },
+    ];
+  }
+
+  it("reserves the worst legal request id, and refuses a configuration that would not carry it", async () => {
+    // The reservation really is the worst case: a full identity's worth of
+    // NUL costs six JSON bytes each, so its string token is 2 + 6 * 128.
+    const token = Buffer.byteLength(JSON.stringify(PREPARED_REQUEST_ID), "utf8");
+    expect(token).toBe(2 + 6 * MAX_REQUEST_ID_BYTES);
+    expect(Buffer.byteLength(PREPARED_REQUEST_ID, "utf8")).toBe(MAX_REQUEST_ID_BYTES);
+
+    const atLimit = await boundaryAt(96 * 1024);
+
+    // Startup: the heaviest state a legal run can force measures exactly the
+    // limit *with the reservation*, and one configuration byte more is
+    // refused — this host will not exist if the only ids it could serve are
+    // the short ones.
     const startup = hostAt(atLimit);
     const heaviest = snapshotOfHeaviestState(startup.state, "prepare:stream");
     expect(frameBytesOf(startup.state, heaviest, PREPARED_REQUEST_ID)).toBe(MAX_FRAME_BYTES);
-    expect(frameBytesOf(startup.state, heaviest, PREPARED_REQUEST_ID.slice(0, -1))).toBe(MAX_FRAME_BYTES - 1);
-    expect(snapshotFrameFits(startup.state, heaviest, `${PREPARED_REQUEST_ID}x`)).toBe(false);
     expect(() => hostAt(atLimit + 1)).toThrow(/frame|room/i);
 
-    // Admission and the running cut, in a host at that boundary. The run is
-    // held inside its model call, so the state being measured stays the state
-    // being served.
+    // And under that reservation every legal request id fits, measured one at
+    // a time through the encoder: the 36 B placeholder this used to reserve
+    // could accept a state that a real long id then failed to carry, and that
+    // counterexample is what the reservation removes.
+    for (const { id, what } of legalIds()) {
+      expect(snapshotFrameFits(startup.state, heaviest, id), what).toBe(true);
+      expect(frameBytesOf(startup.state, heaviest, id), what).toBeLessThanOrEqual(MAX_FRAME_BYTES);
+    }
+    // One raw byte past the bound is not a request id at all: the schema
+    // refuses it, so there is no frame for it to travel in.
+    expect(snapshotFrameFits(startup.state, heaviest, "a".repeat(MAX_REQUEST_ID_BYTES + 1))).toBe(false);
+
+    await startup.composed.host.shutdown();
+  });
+
+  it("serves a prospective-accepted state to every legal request id, at the boundary", async () => {
+    // The run is held inside its model call, so the state being measured stays
+    // the state being served, and the admission is sized with the same
+    // reserved request id the host's own check uses — exactly at the boundary
+    // the prospective check accepts.
+    const atLimit = await boundaryAt(96 * 1024);
     const hold = gate();
     const model = scriptedModel([gatedReply(hold, textReply("late"))], { repeatLast: true });
     const admitting = hostAt(atLimit, model);
@@ -518,12 +552,12 @@ describe("R28 single frame authority", () => {
     const record = admitting.composed.repository.getSession(session.sessionId);
     if (record === undefined) throw new Error("the session was not created");
 
-    // The prospective frame the host measures for this admission, sized with
-    // the same encoder: everything in it is fixed except the submission id,
-    // which is the part a caller sizes.
+    // The run id is measured at the shape the host really mints (a 36 B
+    // UUID); the submission id is the part a caller sizes, and it is what
+    // moves the prospective frame to the boundary the check accepts.
     const text = heaviestAcceptedText(64 * 1024);
     const prospective = snapshotOfProspectiveRun(admitting.state, "prepare:stream", record, {
-      runId: PREPARED_REQUEST_ID,
+      runId: "00000000-0000-4000-8000-000000000000",
       submissionId: "s",
       text,
       acceptedAt: 1_800_000_000_000,
@@ -539,30 +573,29 @@ describe("R28 single frame authority", () => {
     });
     expect(admitted.error).toBeUndefined();
     const runId = admitted.result?.run.runId as string;
-
-    // The run reaches the state the cut will carry — started, with its model
-    // step still pending — and stays there.
     await until(
       () => client.events.some((event) => event.type === "run.updated" && event.payload.run.status === "running"),
       "the run to start",
     );
 
-    // The running cut, measured on the frame the client really receives. The
-    // request id is the one part of a subscriber's frame the caller sizes, so
-    // it is what moves the frame to the boundary and one byte past it.
-    const opened = await client.call("subscriptions.open", {}, { requestId: "r" });
-    expect(opened.error).toBeUndefined();
-    const first = client.frames[client.frames.length - 1] as string;
-    const servedBytes = frameBytes(first);
-    expect(servedBytes).toBeLessThan(MAX_FRAME_BYTES);
-
-    const room = MAX_FRAME_BYTES - (servedBytes - 1);
-    const exact = await client.call("subscriptions.open", {}, { requestId: "r".repeat(room) });
-    expect(exact.error).toBeUndefined();
-    expect(frameBytes(client.frames[client.frames.length - 1] as string)).toBe(MAX_FRAME_BYTES);
-
-    const over = await client.call("subscriptions.open", {}, { requestId: "r".repeat(room + 1) });
-    expect(over.error?.code).toBe("INTERNAL_ERROR");
+    // The cut the host now really sends, captured and measured for each legal
+    // id shape. Nothing here is a second budget: each frame is the one the
+    // client received, and the reservation's own frame is the largest of the
+    // four — the reason the prospective check bounds them all.
+    const served: { readonly what: string; readonly bytes: number }[] = [];
+    for (const { id, what } of legalIds()) {
+      const opened = await client.call("subscriptions.open", {}, { requestId: id });
+      expect(opened.error, what).toBeUndefined();
+      const frame = client.frames[client.frames.length - 1] as string;
+      const bytes = frameBytes(frame);
+      expect(bytes, what).toBeLessThanOrEqual(MAX_FRAME_BYTES);
+      served.push({ what, bytes });
+    }
+    const worst = served[served.length - 1];
+    expect(worst?.what).toBe("the worst-case NUL id");
+    for (const entry of served) {
+      expect(entry.bytes, entry.what).toBeLessThanOrEqual(worst?.bytes ?? 0);
+    }
 
     // None of this disturbed the execution: it is still running, and settling
     // it after the gate opens leaves the same completed facts.

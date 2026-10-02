@@ -289,7 +289,7 @@ function assertSelfDescription(state: HostState): void {
       kind: "host-response",
       protocolVersion: PROTOCOL_VERSION,
       hostInstanceId: state.hostInstanceId,
-      requestId: "prepare",
+      requestId: PREPARED_REQUEST_ID,
       result,
     },
   );
@@ -302,7 +302,7 @@ function assertSelfDescription(state: HostState): void {
       kind: "host-response",
       protocolVersion: PROTOCOL_VERSION,
       hostInstanceId: state.hostInstanceId,
-      requestId: "prepare",
+      requestId: PREPARED_REQUEST_ID,
       result,
     },
   );
@@ -311,7 +311,8 @@ function assertSelfDescription(state: HostState): void {
   }
 
   // The catalogue is static configuration and travels on its own response, so
-  // it is checked the same way, with the same encoder.
+  // it is checked the same way, with the same encoder and the same reserved
+  // request id — the cost a real subscriber's id may legally reach.
   const catalogue: OperationMap["plugins.list"]["result"] = {
     plugins: state.pluginOrder.map((pluginId) => pluginSummaryOf(state, pluginId)),
   };
@@ -321,7 +322,7 @@ function assertSelfDescription(state: HostState): void {
       kind: "host-response",
       protocolVersion: PROTOCOL_VERSION,
       hostInstanceId: state.hostInstanceId,
-      requestId: "prepare",
+      requestId: PREPARED_REQUEST_ID,
       result: catalogue,
     },
   );
