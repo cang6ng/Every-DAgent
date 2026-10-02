@@ -396,17 +396,18 @@ describe("R02 commit outcome reconciliation", () => {
 
     // Nothing was fabricated: the host publishes no terminal it could not
     // prove. What it must not do either is keep presenting the execution it was
-    // watching as a live run — the entry is released and the connection it was
-    // streaming on is ended, because the host can no longer vouch for what a
-    // reader sees. A reader that reconnects is answered by the durable record,
-    // which here really did land.
+    // watching as current — the entry is released, the connection it was
+    // streaming on is ended, and a reader that reconnects is refused outright,
+    // because the host cannot confirm what storage holds. The record itself
+    // really did land, which is asserted directly against the store below —
+    // the fault is about what this host instance may claim, not about what the
+    // store holds.
     expect(client.events.filter((event) => event.type === "run.ended")).toHaveLength(0);
     expect(client.isClosed).toBe(true);
     const reader = connect(composed.host);
     await reader.describe();
     const queried = await reader.call("runs.get", { runId });
-    expect(queried.result?.run.status).toBe("completed");
-    expect(queried.result?.run.live).toBeNull();
+    expect(queried.error?.code).toBe("STORAGE_UNAVAILABLE");
     expect(composed.repository.getRun(runId)?.status).toBe("completed");
 
     // New execution is refused while the store cannot be trusted.

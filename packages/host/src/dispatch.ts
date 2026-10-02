@@ -22,6 +22,7 @@ import type {
   DecodedEnvelope,
   HostCapabilities,
   OperationMap,
+  OperationName,
   ProtocolError,
   ProtocolErrorCode,
   ValidationFailureReason,
@@ -106,6 +107,33 @@ const VALIDATION_ERROR_CODES: Readonly<Record<ValidationFailureReason, ProtocolE
   INVALID_TARGET: "INTERNAL_ERROR",
   FRAME_TOO_LARGE: "LIMIT_EXCEEDED",
 });
+
+/**
+ * The operations whose answer is a claim about *current* state.
+ *
+ * A storage fault ends this host's ability to vouch for what is current: the
+ * outcome of the execution it was streaming may or may not have landed, and
+ * nothing the host can read makes that a fact again — only a restart
+ * reconciles it. So these are refused for as long as the fault stands: a
+ * directory that still points at the unfinished run, a run query that would
+ * call it `running`, and a cut that would present it as current. The
+ * subscription is where a client bootstrap happens, and a successful bootstrap
+ * out of a faulted host is exactly the claim this set exists to prevent.
+ *
+ * What is deliberately not here: `host.describe` (the identity and the static
+ * capabilities are still true, and a describe is not a state bootstrap),
+ * `sessions.history` (committed canonical, readable as the store's own facts),
+ * `plugins.list` (this host's own catalogue), `runs.cancel` (a fault must not
+ * prevent aborting work that is still running) and `subscriptions.close`
+ * (delivery, not state).
+ */
+const CURRENT_STATE_METHODS: ReadonlySet<OperationName> = new Set([
+  "sessions.list",
+  "sessions.get",
+  "runs.get",
+  "runs.list",
+  "subscriptions.open",
+]);
 
 /** One frame: bytes in, an operation, a response out. */
 export function handleFrame(state: HostState, connection: ConnectionState, frame: string): void {
@@ -243,6 +271,16 @@ function dispatchClientRequest(
   }
   if (request.hostInstanceId !== state.hostInstanceId) {
     replyError(state, connection, requestId, protocolError("HOST_INSTANCE_MISMATCH"));
+    return;
+  }
+
+  // One authority for what a faulted host may still answer. The check is
+  // synchronous and in front of every current-state read, so a fault that
+  // lands between two frames cannot be raced by a bootstrap that was already
+  // in flight: by the time this runs, the fault either stands — and the
+  // answer is refusal — or it does not exist yet and the state is whole.
+  if (state.storageFault && CURRENT_STATE_METHODS.has(request.method)) {
+    replyError(state, connection, requestId, storageUnavailableError());
     return;
   }
 

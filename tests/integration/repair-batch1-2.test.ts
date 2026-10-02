@@ -174,9 +174,24 @@ describe("R02 presentation invalidation", () => {
       await waitFor(() => tools.executions.length === 1, { what: "the tool to run" });
       expect(model.requests).toHaveLength(2);
 
-      // A new execution is refused, on a connection that works: the store
-      // cannot be trusted to record it.
-      await client.reconnect();
+      // A new attempt cannot become a current-state connection: the cut a
+      // bootstrap needs is refused, so the client stays un-synchronized with
+      // its retained presentation marked stale — the existing sync-failure
+      // path, not a new client state. No read of this host becomes "current"
+      // again before a restart.
+      let refusedSync: string | undefined;
+      try {
+        await client.reconnect();
+      } catch (error) {
+        refusedSync = (error as { code?: string }).code;
+      }
+      expect(refusedSync).toBe("STORAGE_UNAVAILABLE");
+      const afterRefusal = client.getSnapshot();
+      expect(afterRefusal.status).not.toBe("ready");
+      expect(afterRefusal.stale).toBe(true);
+
+      // And nothing new may execute on the connection that still works: the
+      // store cannot be trusted to record it.
       let refusedCode: string | undefined;
       try {
         await client.runs.start({

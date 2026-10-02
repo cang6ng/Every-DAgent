@@ -368,20 +368,22 @@ describe("R02 transaction endings", () => {
       expect(client.isClosed).toBe(true);
 
       // The live entry is released, so a reader is not shown the execution the
-      // host was watching. A fresh connection reads committed facts only, and
-      // the record says: unfinished.
+      // host was watching — and a fresh connection is not told it is current
+      // either. The host cannot confirm the outcome, so it refuses to present
+      // the unfinished run as a trusted current execution: no run query, no
+      // cut, no directory pointing at it. What the durable record itself says
+      // is asserted below, from the file, where nothing can revise it.
       const reader = connect(composed.host);
       await reader.describe();
       const queried = await reader.call("runs.get", { runId });
-      expect(queried.error).toBeUndefined();
-      const run = queried.result?.run;
-      if (run?.status !== "running") throw new Error(`the run should read as unfinished, not ${String(run?.status)}`);
-      expect(run.live).toEqual([]);
-      expect(run.liveTruncated).toBe(true);
+      expect(queried.error?.code).toBe("STORAGE_UNAVAILABLE");
+      const listed = await reader.call("sessions.list", {});
+      expect(listed.error?.code).toBe("STORAGE_UNAVAILABLE");
+      const opened = await reader.call("subscriptions.open", {});
+      expect(opened.error?.code).toBe("STORAGE_UNAVAILABLE");
 
-      // No new execution while the store cannot be trusted. A reader gets the
-      // durable facts it can still read — the unfinished record, and no
-      // timeline this host was watching — but nothing new may start on them.
+      // No new execution while the store cannot be trusted, on a connection
+      // that works: the store cannot be made to record one.
       const refused = await reader.call("runs.start", {
         sessionId: session.sessionId,
         submissionId: nextId("sub"),

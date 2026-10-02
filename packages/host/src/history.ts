@@ -405,9 +405,13 @@ export type HistoryPageOutcome =
  * keeps this one round trip — and the trim lands on an event boundary, so the
  * pages of a traversal partition the fenced range without a gap or an overlap.
  *
- * A page is cut where it has to be, which may be inside a turn: a turn whose
- * items do not fit one page is split, and the boundary flags on the page say so
- * rather than letting a fragment be read as a finished turn.
+ * A page is cut where it has to be, and that cut is allowed to land inside a
+ * turn or between the two halves of a tool occurrence. A page is a fragment of
+ * the traversal, not a turn: the boundary flags say which ends are turn
+ * boundaries, the items carry the occurrence's own identity so the half on the
+ * next page pairs with the half here, and the complete-turn rules stay where
+ * they belong — the execution window and the terminal commit. `limit` is a
+ * hard maximum: a page never answers with more items than were asked for.
  */
 export function readHistoryPage(
   repository: Repository,
@@ -446,17 +450,27 @@ export function readHistoryPage(
 
   const limit = pageLimit(requested);
   const read = repository.readHistory(sessionId, beforeSeq, limit + 2);
-  const kept = trimToBudget(sessionId, read.records, limit);
+  const kept = trimToBudget(read.records, limit);
 
   // Everything the page will serve is checked as durable fact first: strict
   // payloads, unbroken positions, a turn's events all carrying its own id, and
-  // tool occurrences that pair. A fragment is allowed to *begin* mid-turn — a
-  // page is explicitly a window — but nothing inside it is repaired into place.
-  // A page that cannot be served honestly is refused, not served approximately.
+  // tool occurrences that pair *inside the page*. A fragment is allowed to
+  // *begin* and *end* mid-turn — a page is explicitly a window — but nothing
+  // inside it is repaired into place. A page that cannot be served honestly is
+  // refused, not served approximately.
   assertStoredRange(kept.records, { partialPrefix: true, baseSeq: kept.fromSeq });
 
+  // A page may begin at the second half of a tool occurrence: its call is the
+  // record immediately above the page, which this page does not carry. The
+  // identity the fragment publishes — `invocationId` — is the call's own, so
+  // the call is read back from storage and checked rather than assumed.
+  const head = kept.records[0];
+  let openCall: OpenCall | undefined =
+    head !== undefined && head.type === "tool/result"
+      ? precedingCall(repository, sessionId, head)
+      : undefined;
+
   const items: CanonicalItem[] = [];
-  let openCall: OpenCall | undefined;
   for (const record of kept.records) {
     if (record.type === "tool/call") {
       const parsed = parseStoredRecord(record);
@@ -522,19 +536,22 @@ interface TrimmedRange {
 /**
  * The newest suffix of `records` whose items fit the page budget.
  *
- * The cut is chosen from the newest end backwards, so a page always carries the
- * most recent facts it can. One adjustment keeps the page honest at its own
- * edge: a tool result is never left without its call, because half of an
- * occurrence reads as a different occurrence. When the call is inside the same
- * read — it is the record immediately before the result — the page carries the
- * occurrence whole, which may be one item more than the caller asked for and is
- * the only way a `limit` smaller than an occurrence can serve one at all; the
- * protocol's own ceilings are still respected, and a call and its result always
- * fit one page together. When the call is outside the read, the fragment is
- * dropped and the next page picks it up — the cursor then points below it —
- * which keeps the traversal contiguous.
+ * Two bounds decide the cut, and both are the caller's: the item count —
+ * `limit`, a hard maximum, so a page never answers with more items than were
+ * asked for, not even to keep an occurrence's two halves together — and the
+ * encoded byte budget. The cut is chosen from the newest end backwards, so a
+ * page always carries the most recent facts it can, and it may land inside a
+ * turn or between a call and its result: the page is a fragment, the coverage
+ * it reports says exactly which positions it accounts for, and the continuation
+ * cursor resumes at the oldest end of this page.
+ *
+ * One record is always kept, which is what makes a traversal progress: a
+ * single record's item and encoded size are both within any legal page budget,
+ * and the pages of a traversal then tile the fenced range with no gap and no
+ * overlap. Dropping an unpaired half instead would push the page's cursor below
+ * a record the page never covered, and covering it twice would be a repeat.
  */
-function trimToBudget(sessionId: string, records: readonly StoredRecord[], limit: number): TrimmedRange {
+function trimToBudget(records: readonly StoredRecord[], limit: number): TrimmedRange {
   const newest = records[records.length - 1];
   if (newest === undefined) return { records: [], fromSeq: 0, toSeq: 0 };
   const toSeq = newest.seq + 1;
@@ -553,27 +570,44 @@ function trimToBudget(sessionId: string, records: readonly StoredRecord[], limit
     bytes -= weight.bytes;
   }
 
-  while (kept > 0 && records[records.length - kept]?.type === "tool/result") {
-    const call = records[records.length - kept - 1];
-    if (call !== undefined && call.type === "tool/call") {
-      const weight = itemWeight(call);
-      if (itemCount + weight.items <= MAX_PAGE_ITEMS && bytes + weight.bytes <= PAGE_ITEM_BUDGET_BYTES) {
-        kept += 1;
-        break;
-      }
-    }
-    kept -= 1;
-  }
-  if (kept === 0) {
-    // Every record the read returned was an orphaned result, which a log this
-    // store wrote cannot contain; refusing beats inventing a page.
-    throw projectionError("the history window held no complete occurrence");
-  }
-
   const slice = records.slice(records.length - kept);
   const first = slice[0];
   if (first === undefined) throw projectionError("the history window is empty");
   return { records: slice, fromSeq: first.seq, toSeq };
+}
+
+/**
+ * The occurrence a page-leading result answers: the record immediately above
+ * it, read back and checked.
+ *
+ * A committed log writes a tool result directly after its call — the store
+ * enforces that when it takes a batch — so a page whose oldest record is a
+ * result has cut the occurrence in half, and the half above carries the
+ * `invocationId` both halves must publish. The call is read from storage to be
+ * checked, not assumed: a result whose predecessor is not the call it answers,
+ * or whose call belongs to another turn, is refused like any other record that
+ * is not shaped the way a committed fact must be.
+ */
+function precedingCall(repository: Repository, sessionId: string, result: StoredRecord): OpenCall {
+  if (result.seq <= 0) throw projectionError("a stored tool result has no call to belong to");
+  const read = repository.readHistory(sessionId, result.seq, 1);
+  const call = read.records[read.records.length - 1];
+  if (call === undefined || call.type !== "tool/call" || call.seq !== result.seq - 1) {
+    throw projectionError("a stored tool result has no call to belong to");
+  }
+  if (call.turnId !== result.turnId) {
+    throw projectionError("a stored tool result answers a call from another turn");
+  }
+  const parsedCall = parseStoredRecord(call);
+  const parsedResult = parseStoredRecord(result);
+  if (parsedCall["callId"] !== parsedResult["callId"] || parsedCall["name"] !== parsedResult["name"]) {
+    throw projectionError("a stored tool result answers a different call");
+  }
+  return {
+    invocationId: invocationOf(sessionId, call.seq),
+    callId: parsedCall["callId"] as string,
+    name: parsedCall["name"] as string,
+  };
 }
 
 /** The whole range's item count and encoded size. */
