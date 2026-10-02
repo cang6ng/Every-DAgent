@@ -457,8 +457,18 @@ export function readHistoryPage(
       // was not issued by this store.
       return { kind: "failure", failure: "malformed" };
     }
+    // The fence and the revision are the traversal's identity, and a page may
+    // not publish an identity this store never held: the fence has to be a
+    // committed turn boundary, and the revision has to be that boundary's own.
+    // Both are asked of the durable turn index, and the answer the page
+    // carries is the derived one — a client-authored pair is refused exactly
+    // like a malformed cursor, never echoed.
+    const revision = repository.fenceRevision(sessionId, decoded.cursor.fenceSeq);
+    if (revision === undefined || revision !== decoded.cursor.historyRevision) {
+      return { kind: "failure", failure: "malformed" };
+    }
     fenceSeq = decoded.cursor.fenceSeq;
-    historyRevision = decoded.cursor.historyRevision;
+    historyRevision = revision;
     beforeSeq = decoded.cursor.beforeSeq;
     generation = decoded.cursor.generation;
   }

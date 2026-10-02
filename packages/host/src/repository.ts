@@ -421,6 +421,21 @@ export interface Repository {
    */
   publishableTurnRange(sessionId: string, turnId: string): TurnOwnerRange | undefined;
   /**
+   * The durable history revision a legal history fence must carry, or
+   * `undefined` when no committed boundary ever stood at that position.
+   *
+   * A fence is the session's committed next seq at the moment a traversal
+   * began, and a committed next seq only ever lands on the exact end of a
+   * committed turn — a position inside a turn is not one this store ever held
+   * as its high-water. The revision is the boundary's own: `historyRevision`
+   * moves by exactly one per committed turn, so the revision at a fence is the
+   * number of committed turns at or below it. Both facts are read from the
+   * durable turn index alone — one indexed row lookup for the boundary and one
+   * counting scan of the same index — so a cursor is held to host authority
+   * without loading a session's history and without a new column.
+   */
+  fenceRevision(sessionId: string, fenceSeq: number): number | undefined;
+  /**
    * The durable evidence for one terminal batch.
    *
    * `committed` means every part of the batch — the events of the range, the
@@ -1879,6 +1894,36 @@ class SqliteRepository implements Repository {
     if (row["end_reason"] !== turn.reason) return false;
     if (endReasonFor(String(row["status"]) as RunStatus) !== turn.reason) return false;
     return this.userFactTextAt(sessionId, turn.startSeq + 1) === String(row["text"]);
+  }
+
+  /**
+   * The revision at one fence, read from the turn index.
+   *
+   * The boundary lookup and the count both use `turns_by_start`, so the work is
+   * one indexed row read plus a counting scan of the index — O(1) JS memory,
+   * nothing loaded into it, and no second authority beside the turn index the
+   * commits themselves built.
+   */
+  fenceRevision(sessionId: string, fenceSeq: number): number | undefined {
+    this.assertTrusted();
+    if (!Number.isSafeInteger(fenceSeq) || fenceSeq < 0) return undefined;
+    if (fenceSeq === 0) return 0;
+
+    // Turns are committed contiguously, so the turn ending at a boundary is the
+    // last turn that starts below it; a boundary that is not that turn's end is
+    // a position the committed high-water never held.
+    const row = this.database
+      .prepare("SELECT end_seq FROM turns WHERE session_id = ? AND start_seq < ? ORDER BY start_seq DESC LIMIT 1")
+      .get(sessionId, fenceSeq) as { readonly end_seq?: number } | undefined;
+    if (row === undefined || row.end_seq !== fenceSeq) return undefined;
+
+    // The revision the commit at that boundary produced: one bump per committed
+    // turn, so the revision at a fence is how many turns end at or below it —
+    // counted on the index, never on the events.
+    const counted = this.database
+      .prepare("SELECT COUNT(*) AS count FROM turns WHERE session_id = ? AND start_seq < ?")
+      .get(sessionId, fenceSeq) as { readonly count?: number } | undefined;
+    return typeof counted?.count === "number" ? counted.count : undefined;
   }
 
   verifyTurnCommit(input: CommitTurnInput): "committed" | "absent" | "indeterminate" {
