@@ -743,6 +743,18 @@ function operatePlugin(
 ): Promise<OperationOutcome<PluginResult>> {
   if (state.closing) return Promise.resolve(operationFailed(shuttingDownError()));
 
+  // The fault boundary, in front of both lifecycle mutations, for the one
+  // reason each of them has. An `enable` adds executable capability: the
+  // tool set this host would run with is not something a host that can no
+  // longer vouch for its current state may grow. A `disable` is the same
+  // class of write request as every other refused mutation, and its one
+  // durable effect — the catalogue revision — must not land after the fault
+  // either. Neither is a necessary cleanup: a shutdown releases plugins
+  // through the manager directly, never through this operation, so refusing
+  // here strands nothing. `plugins.list` is not a lifecycle mutation and
+  // stays readable.
+  if (state.storageFault) return Promise.resolve(operationFailed(storageUnavailableError()));
+
   const info = state.manager.get(pluginId);
   if (info === undefined) return Promise.resolve(operationFailed(protocolError("PLUGIN_NOT_FOUND")));
   if (info.status === "error") {

@@ -129,6 +129,14 @@ export function startRun(
   }
   if (state.closing) return operationFailed(shuttingDownError());
 
+  // The fault boundary stands in front of the dedup answer, not behind it. A
+  // resubmission is answered with its original run — a statement about what
+  // that run *is* right now — and that is exactly the claim a host whose
+  // durability is unconfirmed may not make, even when nothing would be
+  // re-executed. The check is synchronous and precedes every read, so a
+  // repeated submission cannot walk past the guard a new one already obeys.
+  if (state.storageFault) return operationFailed(storageUnavailableError());
+
   const inputHash = submissionHash(params.sessionId, params.text);
   let known;
   try {
@@ -153,8 +161,6 @@ export function startRun(
     }
     return operationFailed(protocolError("SUBMISSION_CONFLICT"));
   }
-
-  if (state.storageFault) return operationFailed(storageUnavailableError());
 
   const runId = newId();
   const acceptedAt = Date.now();
