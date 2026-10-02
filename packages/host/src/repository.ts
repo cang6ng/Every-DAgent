@@ -374,6 +374,21 @@ export interface Repository {
    */
   verifyRunHistory(run: RunRecord): boolean;
   /**
+   * Whether one turn index row is proven to be the turn its owner run
+   * committed — the same ownership and accepted-input proof the run read, the
+   * execution window and the commit confirmation all apply, asked about a
+   * single turn and checked from the turn's own side.
+   *
+   * This is the bounded question a history page asks about each turn its
+   * records belong to: a page may be a fragment, but every fact it publishes
+   * still has to belong to a turn this store can prove. `false` covers every
+   * way a turn can fail to be provable — no index row, no owner binding, a
+   * legacy NULL owner, an owner that names another turn, session, range or
+   * reason, or a canonical first user fact that is not the accepted input —
+   * and each of them is refused, never repaired.
+   */
+  verifyTurnOwnership(sessionId: string, turnId: string): boolean;
+  /**
    * The durable evidence for one terminal batch.
    *
    * `committed` means every part of the batch — the events of the range, the
@@ -1692,6 +1707,21 @@ class SqliteRepository implements Repository {
   }
 
   /**
+   * One turn, held to the ownership proof from the turn's own side.
+   *
+   * The lookup and the proof are one step so that no caller can hold a turn
+   * row it has not proven: the row is read by its own key, and the proof is
+   * `turnOwnershipHolds` — the same rule the execution window applies before
+   * a turn can be handed to a model, now also the rule a history page applies
+   * before a fragment of that turn can be published.
+   */
+  verifyTurnOwnership(sessionId: string, turnId: string): boolean {
+    this.assertTrusted();
+    const turn = this.turnOwnerRow(sessionId, turnId);
+    return turn !== undefined && this.turnOwnershipHolds(sessionId, turn);
+  }
+
+  /**
    * One turn index row's own ownership claim, as it is stored.
    *
    * `runId` is `null` exactly when the row predates the ownership binding —
@@ -1796,12 +1826,15 @@ class SqliteRepository implements Repository {
         turn.startSeq === input.turnStartSeq &&
         turn.endSeq === endSeq &&
         turn.reason === input.reason &&
-        // The same ownership and input constraints the read side applies: a
-        // batch whose turn index row does not name this run, or whose user
-        // fact is not the accepted text, is not this batch as far as the
-        // store's own evidence goes.
         turn.runId === input.runId &&
-        this.userFactTextAt(input.sessionId, input.turnStartSeq + 1) === run.text &&
+        // The one ownership authority, applied here as everywhere else: the
+        // owner run's own row must name this turn, this session, this exact
+        // half-open range, this reason and this accepted input. Confirming a
+        // lost commit receipt is deciding whether to publish a terminal, so
+        // "the pointers look consistent" is not enough — a batch whose range
+        // evidence disagrees with its own turn index is not the batch this
+        // store committed, and the honest answer is that the store cannot say.
+        this.turnOwnershipHolds(input.sessionId, turn) &&
         events?.count === input.records.length &&
         terminal &&
         run.turnId === input.turnId;

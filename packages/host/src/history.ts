@@ -412,6 +412,14 @@ export type HistoryPageOutcome =
  * next page pairs with the half here, and the complete-turn rules stay where
  * they belong — the execution window and the terminal commit. `limit` is a
  * hard maximum: a page never answers with more items than were asked for.
+ *
+ * Fragment is not the same as unprovable. Every turn a served record belongs
+ * to is held to the ownership proof the run read and the execution window
+ * apply — its owner binding, its exact range, its reason, its accepted input
+ * — because a page publishes durable history and durable history is only ever
+ * history some run committed. A turn that cannot be proven makes the page a
+ * refusal, exactly like a record that is not shaped the way a committed fact
+ * must be: the session is blocked and never repaired.
  */
 export function readHistoryPage(
   repository: Repository,
@@ -459,6 +467,23 @@ export function readHistoryPage(
   // inside it is repaired into place. A page that cannot be served honestly is
   // refused, not served approximately.
   assertStoredRange(kept.records, { partialPrefix: true, baseSeq: kept.fromSeq });
+
+  // And each turn the kept records belong to has to be a turn this store can
+  // prove: the ownership binding, the exact range, the reason and the accepted
+  // input, checked from the turn's own side against its owner run's own row —
+  // the same proof the run read and the execution window apply. A page may be
+  // a fragment of a turn; it may never publish a fragment of a fact nobody can
+  // vouch for. The check is bounded like the page itself: only the distinct
+  // turn ids the kept records already carry are asked about, so nothing is
+  // loaded that the page does not serve.
+  const involvedTurns = new Set<string>();
+  for (const record of kept.records) {
+    if (involvedTurns.has(record.turnId)) continue;
+    involvedTurns.add(record.turnId);
+    if (!repository.verifyTurnOwnership(sessionId, record.turnId)) {
+      throw new CorruptRecordError(`turn "${record.turnId}" is not owned by the run its index names`);
+    }
+  }
 
   // A page may begin at the second half of a tool occurrence: its call is the
   // record immediately above the page, which this page does not carry. The
