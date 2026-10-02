@@ -38,6 +38,7 @@ import type {
   DecodedEnvelope,
   HostCapabilities,
   HostDescription,
+  HostEvent,
   HostSnapshot,
   JsonValue,
   OperationMap,
@@ -55,7 +56,7 @@ import {
 
 import type { ClientMisuseReason, ConnectionLostReason, ProtocolViolationReason } from "./errors.js";
 import { ClientError, clientMisuse, connectionLost, protocolViolation, remoteError } from "./errors.js";
-import { applyHistoryPage, deepFreeze, foldEvent, foldHistoryEvent, foldLiveEvent } from "./fold.js";
+import { applyHistoryPage, deepFreeze, foldEvent, foldHistoryEvent, foldLiveEvent, liveRefreshExtends } from "./fold.js";
 import type { ReverseHandlerContext, ReverseHandlerOutcome, ReverseTable } from "./reverse.js";
 import type { ClientSnapshot, ConnectionStatus, PresentationStore } from "./store.js";
 import { createStore } from "./store.js";
@@ -303,6 +304,44 @@ export class ClientConnection {
   private detach: (() => void) | undefined;
   private identity: Identity | undefined;
   private stream: StreamState | undefined;
+  /**
+   * How many cuts this connection has installed.
+   *
+   * A history read is issued against the cut it was asked under, and its answer
+   * is only allowed to move the replica while that cut still stands: a page
+   * computed before a re-cut describes a presentation the client has already
+   * replaced, and filing it under the new one would mix two replicas.
+   */
+  private cutCount = 0;
+  /**
+   * How many deleted session identities this connection remembers.
+   *
+   * A deletion is final, and the pages that raced it are the ones this ledger
+   * exists for: it has to outlive every request that could have been in flight
+   * when the deletion was folded, and no longer. The ordinary pending budget is
+   * far smaller than this, so the oldest entry is only ever forgotten long
+   * after any answer for it could still arrive.
+   */
+  private static readonly DELETED_SESSION_BUDGET = 256;
+  /**
+   * The runs whose timeline this connection is re-reading.
+   *
+   * A timeline read is what places a run after a cut, so a publication that
+   * raced the cut is expected while one is in flight rather than a fault; the
+   * entry is also the dedup that keeps a burst of content from stacking reads.
+   */
+  private readonly liveRefreshes = new Set<string>();
+  /**
+   * Runs whose timeline has to be re-read once the read already in flight lands.
+   *
+   * A dropped frame is repaired by a read that starts *after* it: an answer
+   * that was asked for before the drop may predate the content all by itself.
+   * The second read is therefore queued rather than stacked — at most one in
+   * flight and one waiting, for every run, no matter how fast content arrives.
+   */
+  private readonly liveRefreshAgain = new Set<string>();
+  /** Session identities this connection has seen deleted: a late page may not resurrect one. */
+  private readonly deletedSessions = new Set<string>();
   /** The control transaction in flight, if any: `open` is single-flight. */
   private openToken: OpenToken | undefined;
   private sync: Promise<void> | undefined;
@@ -790,6 +829,10 @@ export class ClientConnection {
             expected: snapshot.watermark.sequence + 1,
           };
           this.everOpened = true;
+          // The cut this client now lives under: every history read issued from
+          // here on belongs to it, and the reads issued under the previous one
+          // are answered to their callers but no longer move the replica.
+          this.cutCount += 1;
           finish();
           // A cut replaces what the client knows. Live drafts and loaded
           // history belonged to the previous cut — or to a previous host — and
@@ -907,7 +950,12 @@ export class ClientConnection {
         handlers.decline(protocolViolation(mismatch, "unknown"));
         return;
       }
-      handlers.accept(response.output.result, envelope);
+      // One boundary, before anything internal or external touches it: the
+      // accepted result is an immutable snapshot. A caller that mutates what it
+      // was handed — and a caller is foreign code — changes its own copy of a
+      // response, never the replica this client keeps presenting, and never a
+      // page a later read has to be compared against.
+      handlers.accept(deepFreeze(response.output.result), envelope);
     };
     const fail = (error: ClientError): void => {
       handlers.decline(error);
@@ -943,9 +991,9 @@ export class ClientConnection {
    *
    * A cut carries summaries, not drafts: the timeline belongs to the run, and a
    * snapshot can only say that one exists. It is fetched here, best effort and
-   * at most once per active run — the contract allows exactly one — so a
-   * reconnected reader sees the same in-progress output it saw before, without
-   * the cut having to carry something that is not durable fact.
+   * at most one in flight per run, so a reconnected reader sees the same
+   * in-progress output it saw before, without the cut having to carry something
+   * that is not durable fact.
    */
   private refreshLive(owner: number): void {
     const snapshot = this.store.get().presentation;
@@ -954,21 +1002,81 @@ export class ClientConnection {
     for (const session of snapshot.sessions.items) {
       const runId = session.activeRunId;
       if (runId === null) continue;
-      if (Object.hasOwn(this.store.get().live, runId)) continue;
+      this.scheduleLiveRefresh(owner, runId);
+    }
+  }
 
-      void this.request("runs.get", { runId }).then(
+  /**
+   * Ends one unplaceable live frame without ending the connection.
+   *
+   * The frame's content is not applied — a fragment must never be presented as
+   * a timeline — but the replica says so: the draft is marked incomplete until
+   * a read replaces it with the host's own answer, which carries the host's own
+   * truncation flag. The read is scheduled only while the directory still names
+   * the run as executing, because only then is there something to repair.
+   */
+  private dropUnplaceableLive(owner: number, current: ClientSnapshot, sessionId: string, runId: string): void {
+    const draft = current.live[runId];
+    if (draft !== undefined && !draft.liveTruncated) {
+      this.store.update({
+        live: Object.freeze({
+          ...current.live,
+          [runId]: Object.freeze({ ...draft, liveTruncated: true }),
+        }),
+      });
+    }
+    if (activeRunStillHeld(this.store.get().presentation, sessionId, runId)) {
+      this.scheduleLiveRefresh(owner, runId);
+    }
+  }
+
+  /**
+   * Places one run's timeline from a fresh read, at most one read at a time.
+   *
+   * This is how a run becomes current after a cut — and how a publication that
+   * raced the cut is repaired: the frame that cannot be placed is dropped, and
+   * this read is what puts the run back where its content can follow. The
+   * answer is installed only while it still describes the directory the client
+   * holds: a run the directory has since called terminal stays terminal, and an
+   * answer that arrives after an event already placed the run loses to it.
+   */
+  private scheduleLiveRefresh(owner: number, runId: string): void {
+    if (this.liveRefreshes.has(runId)) {
+      // A read of this run is already in flight; it may have been asked for
+      // before the content that has to be repaired, so one more read is queued
+      // behind it instead of being lost with it.
+      this.liveRefreshAgain.add(runId);
+      return;
+    }
+
+    this.liveRefreshes.add(runId);
+    void this.request("runs.get", { runId })
+      .then(
         (result) => {
           if (!this.owns(owner)) return;
           const run = result.run;
           if (run.status !== "accepted" && run.status !== "running") return;
-          // An event that arrived while this was in flight is newer than the
-          // answer; it wins.
-          if (Object.hasOwn(this.store.get().live, runId)) return;
-          this.store.update({ live: Object.freeze({ ...this.store.get().live, [runId]: run }) });
+          const current = this.store.get();
+          // A draft this client already holds may only be *extended* by the
+          // answer: a read asked for before a frame that was dropped is older
+          // knowledge, and the timeline monotonicity is the one rule that says
+          // which of the two is newer.
+          const existing = current.live[runId];
+          if (existing !== undefined && !liveRefreshExtends(existing.live, run.live)) return;
+          // A directory that has moved on — the run finished, or the session
+          // stopped pointing at it — is the newer fact, and a timeline read
+          // may not resurrect it.
+          if (!activeRunStillHeld(current.presentation, run.sessionId, runId)) return;
+          this.store.update({ live: Object.freeze({ ...current.live, [runId]: run }) });
         },
         () => undefined,
-      );
-    }
+      )
+      .finally(() => {
+        this.liveRefreshes.delete(runId);
+        if (this.liveRefreshAgain.delete(runId) && this.owns(owner)) {
+          this.scheduleLiveRefresh(owner, runId);
+        }
+      });
   }
 
   /**
@@ -976,15 +1084,31 @@ export class ClientConnection {
    *
    * The fold happens where the answer is accepted, not where the caller is, so
    * a page that arrives is part of the client's coverage even when the caller
-   * that asked for it has gone away.
+   * that asked for it has gone away. Two guards decide whether it may be: the
+   * cut the request was issued under must still be the current one — a page
+   * computed against a presentation the client has replaced is answered to its
+   * caller and changes nothing here — and the page itself is held to the
+   * directory, so a deleted session stays deleted and coverage only ever grows.
    */
   requestHistory(
     params: OperationMap["sessions.history"]["params"],
   ): Promise<OperationMap["sessions.history"]["result"]> {
     return new Promise<OperationMap["sessions.history"]["result"]>((resolve, reject) => {
+      const cut = this.cutCount;
       this.send("sessions.history", params, {
         accept: (result) => {
-          this.store.update({ history: applyHistoryPage(this.store.get().history, result.page) });
+          // A deletion this connection has seen is final: a page that raced it
+          // is answered to its caller and never filed, so a retired session's
+          // cache cannot come back.
+          if (cut === this.cutCount && !this.deletedSessions.has(result.page.sessionId)) {
+            const presentation = this.store.get().presentation;
+            const session = presentation?.sessions.items.find(
+              (candidate) => candidate.sessionId === result.page.sessionId,
+            );
+            this.store.update({
+              history: applyHistoryPage(this.store.get().history, result.page, { session }),
+            });
+          }
           resolve(result);
         },
         decline: (error) => {
@@ -1154,6 +1278,29 @@ export class ClientConnection {
       this.protocolFailure(owner, "snapshot-fence");
       return;
     }
+
+    if (isRunScoped(event)) {
+      const verdict = liveVerdict(current.live, event, this.liveRefreshes.has(event.scope.runId));
+      if (verdict === "drop") {
+        // A publication that raced the cut — or content for a run this replica
+        // could not place yet — is not a peer breaking the contract. After a
+        // cut the client is already re-reading that run's timeline, and
+        // inventing a placement out of a fragment is exactly what it must not
+        // do: the frame is dropped, the draft says it is incomplete, and the
+        // read places the run so its content can follow. A frame that
+        // *contradicts* what this client knows — content scoped to another
+        // session, or a run announced as running that was never accepted — is
+        // still the violation it always was, and falls through to the fold.
+        //
+        // The stream position still moves: the frame was published on this
+        // stream, and a position left behind would turn every later frame into
+        // a gap and re-cut the subscription for nothing.
+        stream.expected = event.sequence + 1;
+        this.dropUnplaceableLive(owner, current, event.scope.sessionId, event.scope.runId);
+        return;
+      }
+    }
+
     const watermark: Watermark = Object.freeze({
       streamId: stream.streamId,
       sequence: event.sequence,
@@ -1169,6 +1316,16 @@ export class ClientConnection {
       return;
     }
     const history = foldHistoryEvent(current.history, event);
+    if (event.type === "session.deleted") {
+      // From here on, a page for this identity is a page for something the
+      // client knows is gone: it is answered to whoever asked and is not filed.
+      this.deletedSessions.add(event.payload.sessionId);
+      while (this.deletedSessions.size > ClientConnection.DELETED_SESSION_BUDGET) {
+        const oldest = this.deletedSessions.values().next().value;
+        if (oldest === undefined) break;
+        this.deletedSessions.delete(oldest);
+      }
+    }
 
     // The frame is applied whole or not at all: the position moves only once the
     // fold has accepted it, so a rejected event leaves no trace.
@@ -1478,6 +1635,13 @@ export class ClientConnection {
     this.retiredStreams.clear();
     this.openToken = undefined;
     this.everOpened = false;
+    // The reads this generation had in flight are settled below with its other
+    // pendings; their placements belonged to a cut that no longer stands, and a
+    // deletion this generation saw is carried by the cut that follows it (the
+    // session is simply absent from the new snapshot).
+    this.liveRefreshes.clear();
+    this.liveRefreshAgain.clear();
+    this.deletedSessions.clear();
 
     const pendings = [...this.pendings.values()];
     this.pendings.clear();
@@ -1526,6 +1690,79 @@ export class ClientConnection {
     this.retiredStreams.add(streamId);
     return true;
   }
+}
+
+/** A run-scoped event: its scope is the run whose placement the client has to hold. */
+type RunScopedEvent = Extract<HostEvent, { scope: { kind: "run" } }>;
+
+/** The narrowing the fold needs: `scope.kind` is nested, so the union member is picked by predicate. */
+function isRunScoped(event: HostEvent): event is RunScopedEvent {
+  return event.scope.kind === "run";
+}
+
+/**
+ * What one run-scoped event means for this replica.
+ *
+ * `place` is the ordinary path — the fold applies it under its own rules.
+ * `drop` is the frame this replica cannot place yet without inventing state: a
+ * chunk that arrives before the run it belongs to has been placed, or while
+ * this client is re-reading that run after a cut. Those are dropped and
+ * repaired, never fatal, because the client already knows it is catching up.
+ * `fault` is everything a client can check and find contradictory: content
+ * scoped to a session the run does not belong to, or a run announced as already
+ * running that this client was never told was accepted.
+ */
+type LiveVerdict = "place" | "drop" | "fault";
+
+function liveVerdict(live: ClientSnapshot["live"], event: RunScopedEvent, refreshing: boolean): LiveVerdict {
+  const draft = live[event.scope.runId];
+
+  if (event.type === "run.updated") {
+    if (draft !== undefined) {
+      // A run this client holds is folded under the fold's own rules: stage
+      // moves, identity and timeline continuity are all checked there.
+      return "place";
+    }
+    if (event.payload.run.status === "accepted") return "place";
+    // A run this client has never seen can only be announced as accepted; a
+    // publication that raced a cut the client is already repairing is dropped
+    // instead of ending the connection.
+    return refreshing ? "drop" : "fault";
+  }
+
+  if (!isLiveContent(event.type)) {
+    // A terminal correction is not display content: whether it can follow from
+    // what was published is the fold's own contract, and this replica never
+    // invents a run to receive one.
+    return "place";
+  }
+
+  if (draft !== undefined && draft.sessionId !== event.scope.sessionId) return "fault";
+  if (draft !== undefined && draft.status === "running" && !draft.liveTruncated) return "place";
+  // Not placed yet, or placed but not running: content this replica cannot
+  // safely put anywhere — dropped, marked, and re-read.
+  return "drop";
+}
+
+/** The events that carry live content, which is only ever placed into a running draft. */
+function isLiveContent(type: HostEvent["type"]): boolean {
+  return type === "run.output.delta" || type === "run.tool.call" || type === "run.tool.result";
+}
+
+/**
+ * Whether the directory this client holds still says the run is executing.
+ *
+ * The directory — never the draft, never an answer in flight — is the authority
+ * on a run's stage: once it says terminal, nothing may re-open a draft for it.
+ * A run outside the bounded run window is still executing when the session the
+ * client holds points at it.
+ */
+function activeRunStillHeld(presentation: HostSnapshot | null, sessionId: string, runId: string): boolean {
+  if (presentation === null) return false;
+  const known = presentation.runs.items.find((run) => run.runId === runId);
+  if (known !== undefined) return known.status === "accepted" || known.status === "running";
+  const session = presentation.sessions.items.find((candidate) => candidate.sessionId === sessionId);
+  return session !== undefined && session.activeRunId === runId;
 }
 
 /**

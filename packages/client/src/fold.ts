@@ -188,6 +188,19 @@ function liveContinues(previous: readonly LiveItem[], next: readonly LiveItem[])
   return seen.size === next.length;
 }
 
+/**
+ * Whether one freshly read timeline may replace what the replica already holds.
+ *
+ * A re-read is placed only when it *extends* the draft: the read may have been
+ * asked for before a frame this client dropped, so an answer that is shorter
+ * than the draft is older knowledge and loses to it. The rule is the fold's own
+ * timeline monotonicity, shared so a read and an event cannot disagree about
+ * which of them is newer.
+ */
+export function liveRefreshExtends(previous: readonly LiveItem[], next: readonly LiveItem[]): boolean {
+  return liveContinues(previous, next);
+}
+
 function newRevisions(base: CollectionRevisions, incoming: CollectionRevisions): CollectionRevisions {
   return Object.freeze({
     sessions: Math.max(base.sessions, incoming.sessions),
@@ -840,12 +853,39 @@ function cacheBytes(history: HistoryMap): number {
 }
 
 /**
+ * What the directory says about one session, at the moment a page is applied.
+ *
+ * A page is a claim about a cut, and the directory is what can still be checked
+ * about it: `session` is the summary this client currently holds for the page's
+ * session — its generation must be the page's, or the page is another
+ * identity's history — and its `committedSeq` is the high-water the loaded
+ * coverage is measured against, so "behind" is computed from current truth
+ * instead of being inherited from whatever the last page happened to say.
+ */
+export interface HistoryContext {
+  readonly session: SessionSummary | undefined;
+}
+
+/**
  * Records one page, merging it with what is already loaded.
  *
  * A page that continues the loaded range — same fence, same session, and meeting
  * the current coverage at its oldest end — extends it. Anything else replaces
  * it: a page from another fence or another revision is a different traversal,
  * and gluing two traversals together would present a conversation nobody read.
+ *
+ * Two rules here keep the merge monotone, and a third one lives with the
+ * connection that asked for the page:
+ *
+ * - a page that lands entirely below the loaded coverage is dropped: it belongs
+ *   to a smaller cut, and adopting it would strand the coverage this client
+ *   honestly read above it;
+ * - `behind` is recomputed from the directory's committed high-water and the
+ *   coverage that results, never inherited — so a replacement cannot make a
+ *   known gap look like a complete history;
+ * - a page for an identity this connection has seen deleted never gets here at
+ *   all (see the client connection's own ledger): deletion is final, and a late
+ *   answer may not resurrect the cache it retired.
  *
  * The result is then brought back inside the client's cache budget. Other
  * sessions' entries go first, least recently updated before more recent ones —
@@ -854,8 +894,26 @@ function cacheBytes(history: HistoryMap): number {
  * reads as "not loaded", which is what it is; the directory still lists the
  * session, and asking again reads it back from the host.
  */
-export function applyHistoryPage(history: HistoryMap, page: HistoryPage): HistoryMap {
+export function applyHistoryPage(
+  history: HistoryMap,
+  page: HistoryPage,
+  context?: HistoryContext,
+): HistoryMap {
   const current = history[page.sessionId];
+  if (context?.session !== undefined && current !== undefined && context.session.generation !== page.generation) {
+    // A different identity under the same id is not an update; the client will
+    // not file another generation's history under this one.
+    return history;
+  }
+  if (current !== undefined && page.coverage.toSeq < current.fromSeq) {
+    // A page that lands entirely below what is already loaded belongs to a
+    // smaller cut: adopting it would strand the coverage this client honestly
+    // read above it — a late answer may not move the replica backwards. A page
+    // that reaches up to (or past) the loaded range is either its continuation
+    // or a re-read the client itself asked for, and both are adoptable.
+    return history;
+  }
+
   const continues =
     current !== undefined &&
     current.storageId === page.storageId &&
@@ -887,7 +945,13 @@ export function applyHistoryPage(history: HistoryMap, page: HistoryPage): Histor
     fenceSeq: page.fenceSeq,
     behind: continues && current !== undefined ? current.behind : false,
   };
-  const next = flatten(segments, base);
+  const flattened = flatten(segments, base);
+  // Honest gap: the high-water the directory holds, measured against what is
+  // actually loaded now — never the flag an earlier page left behind.
+  const behind =
+    flattened.behind ||
+    (context?.session !== undefined && context.session.committedSeq > flattened.toSeq);
+  const next = behind === flattened.behind ? flattened : Object.freeze({ ...flattened, behind });
 
   // Re-insert the touched session last, so the map's own order is "least
   // recently read first" and eviction takes from the front.

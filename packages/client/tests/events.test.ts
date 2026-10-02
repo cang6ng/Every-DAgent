@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 
 import type { TerminalRunSnapshot } from "@every-dagent/protocol";
 
-import { createScenario, openWith } from "./helpers/scenario.js";
+import { createScenario, flush, openWith } from "./helpers/scenario.js";
 import {
   activeRun,
   completedRun,
@@ -150,13 +150,32 @@ describe("run events", () => {
     expect(scenario.client.getSnapshot().status).toBe("protocol-error");
   });
 
-  it("refuses content for a run the client does not have", async () => {
+  it("drops content for a run the client has not placed yet, and repairs by re-reading it", async () => {
     const scenario = createScenario({ host: { auto: false } });
-    await openWith(scenario, { sessions: sessionPage([SESSION]) });
+    // The directory names the run as the session's active one while its
+    // timeline has not been placed — exactly the state a cut leaves behind, and
+    // the state whose content has to be dropped rather than faulted.
+    await openWith(scenario, {
+      sessions: sessionPage([sessionSummary({ sessionId: "s-1", activeRunId: "r-1" })]),
+      runs: {
+        items: [runningRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" })],
+        collectionRevision: 1,
+        nextCursor: null,
+        hasMore: false,
+      },
+    });
+    expect(scenario.client.getSnapshot().live["r-1"]).toBeUndefined();
 
-    scenario.host.emit({ type: "run.output.delta", sessionId: "s-1", runId: "r-missing", itemId: "i-1", text: "hi" });
+    scenario.host.emit({ type: "run.output.delta", sessionId: "s-1", runId: "r-1", itemId: "i-1", text: "hi" });
+    await flush();
 
-    expect(scenario.client.getSnapshot().status).toBe("protocol-error");
+    // The frame is not applied and the connection is not ended: the client
+    // re-reads that run's timeline, which is what places it so its content can
+    // follow.
+    expect(scenario.host.requestIdOf("runs.get")).toBeDefined();
+    const snapshot = scenario.client.getSnapshot();
+    expect(snapshot.status).toBe("ready");
+    expect(snapshot.live["r-1"]).toBeUndefined();
   });
 });
 
@@ -553,14 +572,23 @@ describe("content and runs must fit the history the client published", () => {
     expect(scenario.client.getSnapshot().status).toBe("protocol-error");
   });
 
-  it("refuses content before the run has reached running", async () => {
+  it("drops content that arrives before the run has reached running, and repairs by re-reading it", async () => {
     const scenario = createScenario({ host: { auto: false } });
     await openWith(scenario, { sessions: sessionPage([SESSION]) });
     scenario.host.emit({ type: "run.updated", run: activeRun({ runId: "r-1", sessionId: "s-1", submissionId: "sub-1" }) });
 
     scenario.host.emit({ type: "run.output.delta", sessionId: "s-1", runId: "r-1", itemId: "i-1", text: "too early" });
+    await flush();
 
-    expect(scenario.client.getSnapshot().status).toBe("protocol-error");
+    // Legal fragments are dropped whole and the connection stays up: the
+    // client re-reads the run's timeline, and the draft it held says it does
+    // not carry everything the host published.
+    expect(scenario.host.requestIdOf("runs.get")).toBeDefined();
+    const snapshot = scenario.client.getSnapshot();
+    expect(snapshot.status).toBe("ready");
+    expect(snapshot.live["r-1"]?.status).toBe("accepted");
+    expect(snapshot.live["r-1"]?.liveTruncated).toBe(true);
+    expect(snapshot.live["r-1"]?.live).toEqual([]);
   });
 
   it("refuses a full live replacement that rewrites a published occurrence", async () => {
