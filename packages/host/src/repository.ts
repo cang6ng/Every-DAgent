@@ -1873,7 +1873,15 @@ class SqliteRepository implements Repository {
         this.turnOwnershipHolds(input.sessionId, turn) &&
         events?.count === input.records.length &&
         terminal &&
-        run.turnId === input.turnId;
+        run.turnId === input.turnId &&
+        // ...and the read's own authority is the last word here too, so the
+        // confirmation can never be weaker than `runs.get`: the exact committed
+        // range held to every rule the run read applies — record identities,
+        // payloads and structure, not a count of them. A batch whose records
+        // were rewritten inside their own range is a store this host cannot
+        // vouch for, and a lost receipt is not a licence to publish a terminal
+        // anyway.
+        this.verifyRunHistory(run);
       if (fullyThere) return "committed";
 
       const untouched = session.committedSeq === input.turnStartSeq && turn === undefined;

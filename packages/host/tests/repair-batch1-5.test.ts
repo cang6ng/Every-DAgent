@@ -1,5 +1,5 @@
 /**
- * Repair Batch 1.5 — the R05 residual the closure re-review proved open.
+ * Repair Batch 1.5 — the two R05 residuals the closure re-review proved open.
  *
  * A page was still allowed to publish a record whose own sequence the turn it
  * names never committed: proving the turn was owned is not the same as proving
@@ -7,6 +7,12 @@
  * against the range its turn's own index row returned — the same proof as
  * before, asked in the form that answers *where* as well as *whether* — while
  * a page stays a legal fragment.
+ *
+ * And the confirmation of a lost commit receipt still accepted a batch whose
+ * records had been rewritten inside their own range: it checked the pointers
+ * and a record *count*, never what the records were. The confirmation now ends
+ * with the run read's own authority over the exact committed range, so it can
+ * never be weaker than `runs.get`.
  */
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -22,6 +28,7 @@ import {
   connect,
   constantTool,
   createSessionThrough,
+  flush,
   scriptedModel,
   testPlugin,
   textReply,
@@ -38,6 +45,15 @@ async function withTempDir<T>(act: (dir: string) => T | Promise<T>): Promise<T> 
     } catch {
       // A store still held by a host that failed the test is not the failure.
     }
+  }
+}
+
+/** Waits until `check` holds, letting the host's own microtasks run. */
+async function until(check: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await flush();
   }
 }
 
@@ -190,6 +206,151 @@ describe("R05 history binds every record to its own turn's committed range", () 
       const again = await reader.call("sessions.history", { sessionId: seeded.session, limit: 1 });
       expect(again.error?.code).toBe("INTERNAL_ERROR");
       expect(again.result).toBeUndefined();
+      reader.detach();
+      await restarted.host.shutdown();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R05-B — a lost commit receipt is confirmed against the records themselves.
+// ---------------------------------------------------------------------------
+
+/**
+ * Interferes with the terminal COMMIT so the batch lands for real and the
+ * caller still sees an error — the lost receipt the store's own evidence has
+ * to reconcile. `damage` runs after the commit and before the error, so the
+ * evidence the reconciliation reads can be made to disagree with itself.
+ */
+function interfereWithTerminalCommitThen(
+  damage?: (database: DatabaseSync) => void,
+): { injected(): number; restore(): void } {
+  const originalExec = DatabaseSync.prototype.exec;
+  const originalPrepare = DatabaseSync.prototype.prepare;
+  let armed = false;
+  let fired = 0;
+
+  DatabaseSync.prototype.prepare = function patchedPrepare(this: DatabaseSync, sql: string) {
+    const statement = originalPrepare.call(this, sql);
+    if (sql.startsWith("INSERT INTO session_events")) armed = true;
+    return statement;
+  };
+
+  DatabaseSync.prototype.exec = function patchedExec(this: DatabaseSync, sql: string): void {
+    if (sql === "COMMIT" && armed && fired === 0) {
+      fired += 1;
+      armed = false;
+      originalExec.call(this, sql);
+      damage?.(this);
+      throw new Error("injected: the commit receipt was lost");
+    }
+    originalExec.call(this, sql);
+  };
+
+  return {
+    injected: () => fired,
+    restore: () => {
+      DatabaseSync.prototype.exec = originalExec;
+      DatabaseSync.prototype.prepare = originalPrepare;
+    },
+  };
+}
+
+/** One run started on a durable store, whose terminal commit is about to land and lose its receipt. */
+async function runAwaitingLostReceipt(
+  path: string,
+  damage: ((database: DatabaseSync, runId: string) => void) | undefined,
+): Promise<{
+  readonly composed: ReturnType<typeof composeTestHost>;
+  readonly model: ReturnType<typeof scriptedModel>;
+  readonly client: ReturnType<typeof connect>;
+  readonly sessionId: string;
+  readonly runId: string;
+  readonly interference: { injected(): number; restore(): void };
+}> {
+  const model = scriptedModel([textReply("answer")]);
+  const composed = composeTestHost({ modelClient: model.client, location: path });
+  const client = connect(composed.host);
+  await client.describe();
+  await client.call("subscriptions.open", {});
+  const session = await createSessionThrough(client);
+
+  const started = await client.call("runs.start", {
+    sessionId: session.sessionId,
+    submissionId: "sub-ack",
+    text: "hello",
+  });
+  const runId = started.result?.run.runId as string;
+
+  const interference = interfereWithTerminalCommitThen(
+    damage === undefined ? undefined : (database) => damage(database, runId),
+  );
+  return { composed, model, client, sessionId: session.sessionId, runId, interference };
+}
+
+describe("R05 commit confirmation holds the records to the run read's authority", () => {
+  it("refuses to publish a terminal whose record was rewritten inside its own range", async () => {
+    await withTempDir(async (dir) => {
+      const path = join(dir, "rewritten.db");
+      const damaged = await runAwaitingLostReceipt(path, (database, runId) => {
+        // The batch really committed; only one record's own turn id is moved
+        // to a turn nothing else agrees with. The run row, the turn index, the
+        // range and the count all still hold — exactly the shape the old
+        // confirmation accepted.
+        const run = database.prepare("SELECT session_id FROM runs WHERE run_id = ?").get(runId) as {
+          readonly session_id?: string;
+        };
+        const seq = newestAssistantSeq(database, run.session_id as string);
+        database
+          .prepare("UPDATE session_events SET turn_id = 'foreign-turn' WHERE session_id = ? AND seq = ?")
+          .run(run.session_id as string, seq);
+      });
+
+      // The refusal and the publication are the two possible outcomes; the
+      // wait ends at whichever happens first, so the assertion below is what
+      // judges it rather than a timeout.
+      const published = (): boolean =>
+        damaged.client.events.some((event) => event.type === "run.ended" && event.payload.run.runId === damaged.runId);
+      await until(() => damaged.client.isClosed || published(), "the host to refuse or publish");
+      expect(damaged.interference.injected()).toBe(1);
+      damaged.interference.restore();
+
+      // No terminal was published for a batch the store cannot prove: the run
+      // ends nowhere, and the host stops answering, exactly as an
+      // unconfirmable commit must.
+      expect(
+        damaged.client.events.filter((event) => event.type === "run.ended" && event.payload.run.runId === damaged.runId),
+      ).toHaveLength(0);
+      expect(damaged.client.isClosed).toBe(true);
+      expect(damaged.model.requests).toHaveLength(1);
+
+      damaged.client.detach();
+      await damaged.composed.host.shutdown();
+
+      // Nothing was repaired and nothing was re-run: the landed batch is the
+      // batch the store holds, with the rewritten record still in it.
+      const database = new DatabaseSync(path);
+      const run = database
+        .prepare("SELECT status FROM runs WHERE run_id = ?")
+        .get(damaged.runId) as Record<string, unknown>;
+      const rewritten = database
+        .prepare("SELECT COUNT(*) AS count FROM session_events WHERE session_id = ? AND turn_id = 'foreign-turn'")
+        .get(damaged.sessionId) as { readonly count?: number };
+      database.close();
+      expect(run["status"]).toBe("completed");
+      expect(rewritten.count).toBe(1);
+
+      // And the damaged evidence is refused wherever it is read: the run and
+      // the history of its turn are both corruption now, never a payload.
+      const restarted = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const reader = connect(restarted.host);
+      await reader.describe();
+      const got = await reader.call("runs.get", { runId: damaged.runId });
+      expect(got.error?.code).toBe("INTERNAL_ERROR");
+      const page = await reader.call("sessions.history", { sessionId: damaged.sessionId, limit: 5 });
+      expect(page.error?.code).toBe("INTERNAL_ERROR");
+      expect(restarted.repository.getSession(damaged.sessionId)?.status).toBe("blocked");
+
       reader.detach();
       await restarted.host.shutdown();
     });
