@@ -392,23 +392,21 @@ export function observePlugin(state: HostState, pluginId: string): PluginSummary
   const published = state.plugins.get(pluginId);
   if (published !== undefined && samePluginSummary(published, summary)) return summary;
 
+  // Expressibility first, then the durable half, then publication. The
+  // catalogue revision is part of the mutation, never a notification after it:
+  // a summary that reached subscribers while the revision still described the
+  // old catalogue would leave every client holding a page from a version that
+  // never was. A bump that cannot be recorded therefore propagates to the
+  // caller — which answers with the storage fault and publishes nothing —
+  // instead of the change reaching the wire half-committed. The manager's own
+  // lifecycle state is a fact about this instance either way, and a restart
+  // rebuilds the catalogue from it.
   const build = pluginUpdatedEvent(pluginId, summary);
   assertEventBuilds(state, build);
+  const revisions = state.repository.bumpPluginRevision();
   state.plugins.set(pluginId, summary);
   publishEvent(state, build);
-
-  // The catalogue itself changed too. The revision is what a client holding a
-  // page needs in order to know the page is no longer the current catalogue —
-  // and it is the one catalogue change that has no summary of its own to ride
-  // on, which is exactly what `collection.invalidated` is for.
-  try {
-    const revisions = state.repository.bumpPluginRevision();
-    publishEvent(state, collectionInvalidatedEvent(revisions));
-  } catch {
-    // A store that cannot record the revision does not un-change the plugin:
-    // the summary is already published, and the operations that need the store
-    // report its failure themselves.
-  }
+  publishEvent(state, collectionInvalidatedEvent(revisions));
 
   return summary;
 }

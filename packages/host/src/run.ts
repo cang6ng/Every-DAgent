@@ -26,11 +26,12 @@
 
 import { restoreSessionWindow } from "@every-dagent/agent-core";
 import type { AgentRuntime, RuntimeEvent, Session, TurnEndReason } from "@every-dagent/agent-core";
-import type { LiveToolItem, OperationMap, ProtocolError } from "@every-dagent/protocol";
+import type { CollectionRevisions, LiveToolItem, OperationMap, ProtocolError } from "@every-dagent/protocol";
 
 import {
   assertEventBuilds,
   closeConnection,
+  collectionInvalidatedEvent,
   publishEvent,
   publishValidatedEvent,
   runEndedEvent,
@@ -325,8 +326,14 @@ export function cancelRun(state: HostState, runId: string): OperationOutcome<Run
 
     if (!state.storageFault) {
       try {
+        const before = state.repository.revisions;
         const record = state.repository.requestCancel(runId, Date.now());
         run.cancelDurable = record.cancelRequested;
+        // A recorded cancel intent moves the runs catalogue, and `run.updated`
+        // carries a run — never the collections it moved. A client holding a
+        // runs page has to be able to tell that its page is no longer current,
+        // which is exactly what `collection.invalidated` is for.
+        announceRevisionMove(state, before);
         if (record.status !== "accepted" && record.status !== "running") {
           // The store already holds this run's outcome — it is the durable
           // terminal that is the answer, and cancelling executes nothing. The
@@ -954,6 +961,42 @@ function commitTerminal(state: HostState, run: RunEntry, batch: TerminalBatch): 
   const summary = sessionSummaryOf(result.session);
   applyTerminal(state, run, { snapshot, summary, revisions: result.revisions });
   return true;
+}
+
+/**
+ * Announces a catalogue revision that moved without a summary event to carry it.
+ *
+ * `run.updated` carries a run and nothing else, so a mutation whose only
+ * durable trace is a collection revision — a recorded cancel intent above all —
+ * still has to reach the clients that page by that revision. The revisions are
+ * read after the write and compared with what stood before it; a comparison
+ * that cannot be made, or an announcement that cannot be built, changes no
+ * durable fact: the next cut still carries the truth, and a subscriber that
+ * cannot be told reads it back there.
+ */
+function announceRevisionMove(state: HostState, before: CollectionRevisions): void {
+  let after: CollectionRevisions;
+  try {
+    after = state.repository.revisions;
+  } catch {
+    return;
+  }
+  if (
+    after.sessions === before.sessions &&
+    after.runs === before.runs &&
+    after.plugins === before.plugins
+  ) {
+    return;
+  }
+
+  try {
+    const build = collectionInvalidatedEvent(after);
+    assertEventBuilds(state, build);
+    publishEvent(state, build);
+  } catch {
+    // The revision is durable; announcement is delivery, and delivery failure
+    // is not a reason to un-record anything.
+  }
 }
 
 /**

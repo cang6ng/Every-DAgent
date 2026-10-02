@@ -12,7 +12,12 @@
 import { describe, expect, it } from "vitest";
 
 import type { PluginInfo } from "@every-dagent/plugin-system";
-import type { PluginSummary, ProtocolChannel, ProtocolChannelListener } from "@every-dagent/protocol";
+import type {
+  CollectionRevisions,
+  PluginSummary,
+  ProtocolChannel,
+  ProtocolChannelListener,
+} from "@every-dagent/protocol";
 
 import { observePlugin } from "../src/connection.js";
 import { samePluginSummary } from "../src/projection.js";
@@ -148,7 +153,12 @@ describe("observation of a live plugin", () => {
 
     expect(summaries.get("demo")?.status).toBe("disabled");
     expect(summaries.get("demo")?.lastFailure?.cleanupFailureCount).toBe(1);
-    expect(fired).toHaveLength(1);
+    // One change, one summary announcement — and the catalogue revision it
+    // moved travels with it as its own event, because `plugin.updated` carries
+    // no revisions. What must not happen is a second summary announcement.
+    const announced = fired.map((frame) => (JSON.parse(frame) as { type?: string }).type);
+    expect(announced.filter((type) => type === "plugin.updated")).toHaveLength(1);
+    expect(announced.filter((type) => type === "collection.invalidated")).toHaveLength(1);
   });
 
   it("says nothing when the safe summary is identical", async () => {
@@ -278,7 +288,10 @@ function observationState(
   current: () => PluginInfo,
 ): HostState {
   // Only the fields `observePlugin` reads are real; the rest of the host is not
-  // involved in observation, and this fixture never reaches it.
+  // involved in observation, and this fixture never reaches it. The catalogue
+  // revision is one of those fields now: a published change and its durable
+  // revision are one step, so the stub records the bump the way a store does.
+  let plugins = 0;
   return {
     hostInstanceId: "host-observation",
     name: "test",
@@ -287,5 +300,11 @@ function observationState(
     plugins: summaries,
     pluginOrder: ["demo"],
     connections: new Set([connection]),
+    repository: {
+      bumpPluginRevision: (): CollectionRevisions => {
+        plugins += 1;
+        return { sessions: 0, runs: 0, plugins };
+      },
+    },
   } as unknown as HostState;
 }

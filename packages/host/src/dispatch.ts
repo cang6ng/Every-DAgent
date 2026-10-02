@@ -32,11 +32,13 @@ import { PROTOCOL_VERSION, decodeFrame, encodeFrame, validateMessage } from "@ev
 import {
   assertEventBuilds,
   closeConnection,
+  collectionInvalidatedEvent,
   observePlugin,
   publishEvent,
   sendFrame,
   sessionCreatedEvent,
   sessionDeletedEvent,
+  sessionUpdatedEvent,
 } from "./connection.js";
 import {
   codeForPluginFailure,
@@ -48,8 +50,9 @@ import {
 } from "./errors.js";
 import { HOST_LIMITS } from "./limits.js";
 import { defaultTitle, readHistoryPage, readRunPage, readSessionPage, sessionSummaryOf } from "./history.js";
+import { ProjectionError } from "./projection.js";
 import { answerReversePending, dropReverseForStream } from "./reverse.js";
-import { blockCorruptedSession, cancelRun, readRun, startRun } from "./run.js";
+import { blockCorruptedSession, cancelRun, markStorageFault, readRun, startRun } from "./run.js";
 import { StoreUntrustedError } from "./repository.js";
 import {
   captureHostSnapshot,
@@ -681,6 +684,21 @@ function renameSession(
   if (outcome.kind === "revision-conflict") return operationFailed(revisionConflictError());
 
   const summary = sessionSummaryOf(outcome.session);
+
+  // The rename committed and it moved the session's own catalogue revision, so
+  // the change is announced with it — the same one-step shape create and
+  // delete already have. A replica that asked for this rename may never keep
+  // serving the old title, and a client that connects afterwards reads the
+  // very summary this response carries.
+  try {
+    const build = sessionUpdatedEvent(summary, state.repository.revisions);
+    assertEventBuilds(state, build);
+    publishEvent(state, build);
+  } catch {
+    // The durable fact stands and the caller is answered from it; a subscriber
+    // that could not be told reads the new summary on its next cut or list.
+  }
+
   return operationSucceeded({ session: summary });
 }
 
@@ -776,11 +794,21 @@ async function completePluginOperation(
   lease: { release(): void },
 ): Promise<OperationOutcome<PluginResult>> {
   let projectionFailed = false;
+  let storageFailure: unknown;
   const observe = (): void => {
     try {
       observePlugin(state, pluginId);
-    } catch {
-      projectionFailed = true;
+    } catch (error) {
+      // Two different failures, told apart by what they are: a summary the
+      // protocol cannot carry is a host limitation, while a catalogue revision
+      // that could not be recorded durably means this host can no longer say
+      // what its own catalogue version is — the same unconfirmable-write
+      // boundary every other durable write obeys.
+      if (error instanceof ProjectionError) {
+        projectionFailed = true;
+        return;
+      }
+      if (storageFailure === undefined) storageFailure = error;
     }
   };
 
@@ -799,6 +827,15 @@ async function completePluginOperation(
     const result = await outcome;
     observe();
 
+    if (storageFailure !== undefined) {
+      // The lifecycle ran — the manager's own fact, which nothing here undoes —
+      // but the catalogue revision that has to travel with it did not land, so
+      // no success is published and no current state is claimed. The host stops
+      // vouching for writes rather than keep a catalogue whose version it
+      // cannot state.
+      markStorageFault(state);
+      return operationFailed(storageUnavailableError());
+    }
     if (projectionFailed) return operationFailed(protocolError("INTERNAL_ERROR"));
     if (result.failed) return operationFailed(pluginOperationError(state, pluginId, operation));
 
