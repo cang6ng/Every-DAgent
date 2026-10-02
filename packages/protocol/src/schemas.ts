@@ -298,6 +298,17 @@ const canonicalItemSchema = v.variant("kind", [
   }),
 ]);
 
+/** The identity a tool call and its result both carry for one occurrence. */
+interface OccurrenceIdentity {
+  readonly turnId: string;
+  readonly callId: string;
+  readonly name: string;
+}
+
+function sameOccurrence(left: OccurrenceIdentity, right: OccurrenceIdentity): boolean {
+  return left.turnId === right.turnId && left.callId === right.callId && left.name === right.name;
+}
+
 /**
  * Occurrence-level consistency of one published canonical array.
  *
@@ -313,11 +324,17 @@ const canonicalItemSchema = v.variant("kind", [
  * page — the result here, its call on the page below. So pairing is checked
  * *within* the array and never demanded *of* it: a result whose call is not in
  * the same array is legal, while two items claiming one identity, one position,
- * or one occurrence twice are contradictions no projection could produce. The
- * whole-turn rules — every declaration recorded, every call answered, no turn
- * left open — belong to the execution window and the commit, where the host
- * applies them to complete ranges (see the host's `assertStoredRange` and
- * `projectSettledTurn`), not to a bounded cut.
+ * or one occurrence twice are contradictions no projection could produce.
+ *
+ * The check is order-independent: each occurrence's two halves are compared
+ * with each other whichever way round they appear, because a page's cut can
+ * land on either side of an occurrence and a validator that only looked
+ * backwards would accept a result-then-contradicting-call array. Whichever
+ * half arrives second must agree with the one already here; a half that stands
+ * alone stays legal. The whole-turn rules — every declaration recorded, every
+ * call answered, no turn left open — belong to the execution window and the
+ * commit, where the host applies them to complete ranges (see the host's
+ * `assertStoredRange` and `projectSettledTurn`), not to a bounded cut.
  *
  * Positions are checked here too, because "these are log-ordered facts" is a
  * property of the sequence, not of any one item: `id`, `seq` and position in
@@ -325,9 +342,7 @@ const canonicalItemSchema = v.variant("kind", [
  */
 function canonicalItemsConsistent(items: readonly CanonicalItem[]): boolean {
   const itemIds = new Set<string>();
-  const calls = new Set<string>();
-  const results = new Set<string>();
-  const openCalls = new Map<string, { turnId: string; callId: string; name: string }>();
+  const occurrences = new Map<string, { call?: OccurrenceIdentity; result?: OccurrenceIdentity }>();
 
   for (let index = 0; index < items.length; index++) {
     const item = items[index];
@@ -341,23 +356,23 @@ function canonicalItemsConsistent(items: readonly CanonicalItem[]): boolean {
       if (previous === undefined || previous.seq >= item.seq) return false;
     }
 
+    if (item.kind !== "tool-call" && item.kind !== "tool-result") continue;
+
+    const half: OccurrenceIdentity = { turnId: item.turnId, callId: item.callId, name: item.name };
+    const known = occurrences.get(item.invocationId) ?? {};
     if (item.kind === "tool-call") {
-      if (calls.has(item.invocationId)) return false;
-      calls.add(item.invocationId);
-      openCalls.set(item.invocationId, { turnId: item.turnId, callId: item.callId, name: item.name });
-    } else if (item.kind === "tool-result") {
-      if (results.has(item.invocationId)) return false;
-      results.add(item.invocationId);
-      const call = openCalls.get(item.invocationId);
-      if (call !== undefined) {
-        if (call.turnId !== item.turnId || call.callId !== item.callId || call.name !== item.name) {
-          return false;
-        }
-        openCalls.delete(item.invocationId);
-      }
-      // No call in this array: the fragment case. The other half is on the
-      // page below, and the occurrence's own identity is what ties the two.
+      // A second call for one occurrence is a duplicate; a call whose
+      // occurrence already holds a result has to be the result's own call,
+      // however many items apart they arrived.
+      if (known.call !== undefined) return false;
+      if (known.result !== undefined && !sameOccurrence(known.result, half)) return false;
+      known.call = half;
+    } else {
+      if (known.result !== undefined) return false;
+      if (known.call !== undefined && !sameOccurrence(known.call, half)) return false;
+      known.result = half;
     }
+    occurrences.set(item.invocationId, known);
   }
   return true;
 }
