@@ -112,6 +112,7 @@ function presentationFixture(parts: Partial<HostSnapshot> = {}): HostSnapshot {
     sessions: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
     runs: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
     plugins: [],
+    approval: null,
     settings: [
       { namespace: "host", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
       { namespace: "model", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
@@ -156,6 +157,8 @@ function snapshotFixture(parts: Partial<ClientSnapshot> = {}): ClientSnapshot {
     live: {},
     history: {},
     settings: {},
+    approvalReply: { state: "none" },
+    approvalCanRespond: false,
     stale: false,
     error: null,
   };

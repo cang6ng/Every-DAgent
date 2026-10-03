@@ -49,6 +49,68 @@ export function flush(): Promise<void> {
   });
 }
 
+/**
+ * A monotonic clock a test can move.
+ *
+ * The approval deadline is a fixed 120 seconds, so a test that wants to see one
+ * expire cannot wait for it: it advances this instead. Timers are held as
+ * `(at, fire)` pairs and run in order — never re-entrantly — so "the deadline
+ * passed" and "the clock was read" happen in an order the test chose.
+ */
+export interface TestClock {
+  now(): number;
+  wallNow(): number;
+  setTimer(fire: () => void, delayMs: number): { cancel(): void };
+  /** Moves the clock forward, running every timer that comes due, then flushes. */
+  advance(byMs: number): Promise<void>;
+  /**
+   * Moves the clock forward *without* running timers — the late-callback case.
+   *
+   * A timer that has not fired yet is not evidence that its deadline has not
+   * passed: the authority is the clock, and this is how a test lets time move
+   * while the callback that would have noticed is still queued.
+   */
+  advanceWithoutTimers(byMs: number): void;
+  readonly time: number;
+}
+
+export function testClock(start = 1_000_000): TestClock {
+  let now = start;
+  let timers: { readonly at: number; readonly fire: () => void; cancelled: boolean }[] = [];
+
+  return {
+    now: (): number => now,
+    wallNow: (): number => 1_700_000_000_000 + now - start,
+    setTimer(fire: () => void, delayMs: number): { cancel(): void } {
+      const entry = { at: now + delayMs, fire, cancelled: false };
+      timers.push(entry);
+      return {
+        cancel: (): void => {
+          entry.cancelled = true;
+          timers = timers.filter((candidate) => candidate !== entry);
+        },
+      };
+    },
+    async advance(byMs: number): Promise<void> {
+      now += byMs;
+      for (;;) {
+        const due = timers.filter((entry) => entry.at <= now).sort((left, right) => left.at - right.at)[0];
+        if (due === undefined) break;
+        timers = timers.filter((candidate) => candidate !== due);
+        if (!due.cancelled) due.fire();
+        await flush();
+      }
+      await flush();
+    },
+    advanceWithoutTimers(byMs: number): void {
+      now += byMs;
+    },
+    get time(): number {
+      return now;
+    },
+  };
+}
+
 export interface Gate {
   readonly promise: Promise<void>;
   open(): void;
@@ -86,6 +148,8 @@ export interface TestHostOptions {
   readonly composition?: TrustedComposition;
   /** The defaults a store with no configuration is initialized from. */
   readonly bootstrap?: BootstrapSettings;
+  /** What the fixture composition decides about tool calls; absent allows every tool. */
+  readonly toolPolicy?: import("@every-dagent/host").ToolPolicy | null;
 }
 
 export async function testHost(options: TestHostOptions): Promise<Host> {
@@ -111,6 +175,7 @@ export async function composeTestHost(
         testComposition({
           modelClient: options.modelClient,
           ...(options.contextBuilder === undefined ? {} : { contextBuilder: options.contextBuilder }),
+          ...(options.toolPolicy === undefined ? {} : { toolPolicy: options.toolPolicy }),
         }),
       plugins: options.plugins ?? [],
       ...(options.grants === undefined ? {} : { grants: options.grants }),

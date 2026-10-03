@@ -117,6 +117,7 @@ export function toolItem(
 ): LiveToolItem {
   return Object.freeze({
     kind: "tool" as const,
+    executionId: "exec-1",
     callId: "",
     name: "demo",
     input: Object.freeze({ kind: "json" as const, value: Object.freeze({}) }),

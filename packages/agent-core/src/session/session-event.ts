@@ -29,6 +29,8 @@ export interface ToolCallData {
   readonly callId: string;
   readonly name: string;
   readonly input: unknown;
+  /** The managed execution this call is, when a boundary prepared it. */
+  readonly executionId?: string;
 }
 
 export interface ToolResultData {
@@ -48,6 +50,8 @@ export interface ToolResultData {
    * `ok: false` is never allowed to stand in for `not-executed`.
    */
   readonly disposition?: "executed" | "not-executed";
+  /** The managed execution this result answers, when a boundary prepared the call. */
+  readonly executionId?: string;
 }
 
 /**

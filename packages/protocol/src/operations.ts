@@ -22,6 +22,7 @@
 import * as v from "valibot";
 
 import type {
+  ApprovalSnapshot,
   HistoryPage,
   HostDescription,
   HostSnapshot,
@@ -35,9 +36,11 @@ import type {
   SessionSummary,
   SessionSummaryPage,
   SettingsSnapshot,
+  ToolApprovalResponse,
 } from "./contracts.js";
 import { MAX_PAGE_ITEMS } from "./contracts.js";
 import {
+  approvalSnapshotSchema,
   clientCapabilitiesSchema,
   generationStringSchema,
   hasNonWhitespaceSchema,
@@ -59,6 +62,7 @@ import {
   sessionSummarySchema,
   settingsSnapshotSchema,
   titleSchema,
+  toolApprovalResponseSchema,
 } from "./schemas.js";
 
 // ---------------------------------------------------------------------------
@@ -249,6 +253,44 @@ export type HostRequest = {
 };
 
 export type ClientResponse<R = JsonValue> = ClientResponseBase & ResponseXor<R>;
+
+// ---------------------------------------------------------------------------
+// The frozen reverse profiles.
+// ---------------------------------------------------------------------------
+
+/**
+ * The reverse methods this generation defines, and the strict bodies each one
+ * may carry. `tool.approval` is the only one: it exists so a Host can ask a
+ * client about one prepared execution, and it is answered with exactly one of
+ * two decisions about exactly that execution.
+ *
+ * Everything else stays out on purpose. There is no `approvals.approve` (a
+ * forward duplicate of the answer it would carry), no `tools.execute` (the
+ * client never runs a tool), no resume and no generic business registry.
+ */
+export interface ReverseProfiles {
+  "tool.approval": { params: ApprovalSnapshot; result: ToolApprovalResponse };
+}
+
+export type ReverseMethod = keyof ReverseProfiles;
+
+export type HostRequestFor<M extends ReverseMethod> = Omit<HostRequest, "method" | "params"> & {
+  readonly method: M;
+  readonly params: ReverseProfiles[M]["params"];
+};
+
+export type ClientResponseFor<M extends ReverseMethod> = ClientResponseBase &
+  ResponseXor<ReverseProfiles[M]["result"]>;
+
+/** The runtime schema for one reverse method's params, keyed like the type. */
+const reverseParamSchemas = {
+  "tool.approval": approvalSnapshotSchema,
+} as const;
+
+/** The runtime schema for one reverse method's answer. */
+const reverseResultSchemas = {
+  "tool.approval": toolApprovalResponseSchema,
+} as const;
 
 // ---------------------------------------------------------------------------
 // Runtime schemas (internal). Keyed by exactly the OperationName literals.
@@ -586,4 +628,6 @@ export {
   requestSchemas,
   responseSchemaFor,
   resultSchemas,
+  reverseParamSchemas,
+  reverseResultSchemas,
 };

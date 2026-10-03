@@ -11,6 +11,7 @@
 
 import type {
   ActiveRunSnapshot,
+  ApprovalSnapshot,
   CollectionRevisions,
   EventScope,
   HostEvent,
@@ -21,6 +22,7 @@ import type {
   TerminalRunSnapshot,
 } from "@every-dagent/protocol";
 import { encodeFrame, validateMessage } from "@every-dagent/protocol";
+import { utf8Bytes } from "@every-dagent/agent-core";
 
 import { HOST_LIMITS, OUTBOX_LIMIT_FRAMES } from "./limits.js";
 import { ProjectionError, pluginFactsOf, projectPluginInfo, samePluginSummary } from "./projection.js";
@@ -136,20 +138,30 @@ export function closeConnection(state: HostState, connection: ConnectionState): 
   }
 }
 
-/** Queues one frame for delivery, or closes the connection that cannot hold it. */
+/**
+ * Queues one frame for delivery, or closes the connection that cannot hold it.
+ *
+ * The queue is measured in the bytes the frame really occupies once encoded —
+ * its UTF-8 length, not its JavaScript string length. A frame of emoji or of
+ * non-Latin text costs two to four bytes per character on the wire, and a bound
+ * checked against code units would let a connection hold several times the
+ * memory this limit promises. The length is taken once, here, and carried with
+ * the entry: what was admitted is what the drain subtracts.
+ */
 export function sendFrame(state: HostState, connection: ConnectionState, frame: string): void {
   if (connection.closed) return;
 
+  const frameBytes = utf8Bytes(frame);
   if (
     connection.outbox.length >= MAX_OUTBOX_FRAMES ||
-    connection.outboxBytes + frame.length > MAX_OUTBOX_BYTES
+    connection.outboxBytes + frameBytes > MAX_OUTBOX_BYTES
   ) {
     closeConnection(state, connection);
     return;
   }
 
-  connection.outbox.push(frame);
-  connection.outboxBytes += frame.length;
+  connection.outbox.push({ frame, bytes: frameBytes });
+  connection.outboxBytes += frameBytes;
 
   if (connection.pumping) return;
   connection.pumping = true;
@@ -168,12 +180,12 @@ export function sendFrame(state: HostState, connection: ConnectionState, frame: 
 function pump(state: HostState, connection: ConnectionState): void {
   for (;;) {
     if (connection.closed) break;
-    const frame = connection.outbox.shift();
-    if (frame === undefined) break;
-    connection.outboxBytes -= frame.length;
+    const entry = connection.outbox.shift();
+    if (entry === undefined) break;
+    connection.outboxBytes -= entry.bytes;
 
     try {
-      connection.channel.send(frame);
+      connection.channel.send(entry.frame);
     } catch {
       closeConnection(state, connection);
       break;
@@ -293,9 +305,10 @@ export function runToolResultEvent(
   invocationId: string,
   ok: boolean,
   content: string,
+  disposition: "executed" | "not-executed",
 ): EventBuilder {
   const scope = runScope(run);
-  const payload = Object.freeze({ invocationId, ok, content });
+  const payload = Object.freeze({ invocationId, ok, content, disposition });
   return (base) => ({ ...base, scope, type: "run.tool.result", payload });
 }
 
@@ -363,6 +376,21 @@ export function collectionInvalidatedEvent(collections: CollectionRevisions): Ev
  * here — a client that wants it reads the namespace — and neither does anything
  * effective, because that is this instance's own fact.
  */
+/**
+ * The Host's current approval state, or its removal.
+ *
+ * It is a business fact and never an execution command: a client that sees
+ * `approved` knows the Host decided, not that anything ran. It is published
+ * before the `tool.approval` delivery that asks about the same approval, on the
+ * same stream, so a client is never asked to answer an approval it has not been
+ * told about.
+ */
+export function approvalUpdatedEvent(approval: ApprovalSnapshot | null): EventBuilder {
+  const scope: EventScope = Object.freeze({ kind: "host" as const });
+  const payload = Object.freeze({ approval });
+  return (base) => ({ ...base, scope, type: "approval.updated", payload });
+}
+
 export function settingsUpdatedEvent(
   namespace: string,
   revision: number,

@@ -63,6 +63,7 @@ function presentation(parts: Partial<HostSnapshot> = {}): HostSnapshot {
     sessions: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
     runs: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
     plugins: [],
+    approval: null,
     settings: [
       { namespace: "host", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
       { namespace: "model", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
@@ -107,6 +108,8 @@ function snapshot(parts: Partial<ClientSnapshot> = {}): ClientSnapshot {
     live: {},
     history: {},
     settings: {},
+    approvalReply: { state: "none" },
+    approvalCanRespond: false,
     stale: false,
     error: null,
   };
@@ -262,7 +265,7 @@ describe("the conversation", () => {
   it("renders history and labels the live area as live", () => {
     const live: readonly LiveItem[] = [
       { kind: "text", itemId: "live-1", text: "正在生成" },
-      { kind: "tool", itemId: "live-2", invocationId: "inv-2", callId: "", name: "calculator", input: { kind: "json", value: { a: 1, b: 2 } }, result: null },
+      { kind: "tool", itemId: "live-2", invocationId: "inv-2", executionId: "exec-2", callId: "", name: "calculator", input: { kind: "json", value: { a: 1, b: 2 } }, result: null },
     ];
     const markup = renderToStaticMarkup(
       <Conversation

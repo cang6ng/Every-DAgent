@@ -42,6 +42,8 @@ export interface HostPlatformOptions extends Omit<HostOptions, "bootstrap" | "co
   readonly modelClient?: ModelClient;
   /** A catalogue the fixture composition accepts; absent means "any shaped value". */
   readonly catalog?: readonly TestCatalogEntry[];
+  /** What the fixture composition decides about tool calls; absent allows every tool. */
+  readonly toolPolicy?: import("@every-dagent/host").ToolPolicy;
   /** The defaults a store with no configuration is initialized from. */
   readonly bootstrap?: BootstrapSettings;
   /** A trusted composition of the test's own, replacing the fixture one. */
@@ -63,7 +65,7 @@ export interface HostPlatform {
 /** The host plus a memory-carrier channel source. */
 export async function createHostPlatform(options: HostPlatformOptions): Promise<HostPlatform> {
   const attached: AttachedConnection[] = [];
-  const { modelClient, catalog, bootstrap, composition, ...hostOptions } = options;
+  const { modelClient, catalog, bootstrap, composition, toolPolicy, reverseProfiles, ...hostOptions } = options;
   const composed = await composeHost(
     {
       ...hostOptions,
@@ -73,10 +75,11 @@ export async function createHostPlatform(options: HostPlatformOptions): Promise<
         testComposition({
           modelClient: requiredModel(modelClient),
           ...(catalog === undefined ? {} : { catalog }),
+          ...(toolPolicy === undefined ? {} : { toolPolicy }),
         }),
     },
     {
-      ...(options.reverseProfiles === undefined ? {} : { reverseProfiles: options.reverseProfiles }),
+      ...(reverseProfiles === undefined ? {} : { reverseProfiles }),
       onAttach: (connection) => {
         attached.push(connection);
       },

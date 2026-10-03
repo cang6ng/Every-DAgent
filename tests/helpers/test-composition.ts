@@ -18,6 +18,8 @@ import type {
   ComposedExecution,
   HostSettings,
   ModelSettingsCheck,
+  ToolPolicy,
+  ToolPolicyView,
   TrustedComposition,
 } from "@every-dagent/host";
 import type { JsonValue } from "@every-dagent/protocol";
@@ -45,7 +47,32 @@ export interface TestCompositionOptions {
   readonly refuseCompose?: string;
   /** The composition's own release path, for lifecycle assertions. */
   readonly dispose?: () => void | Promise<void>;
+  /**
+   * What this fixture composition decides about tool calls.
+   *
+   * The default is a policy that speaks about every tool and allows it: this
+   * fixture stands in for the trusted composition root, and a test that does
+   * not care about policy should see the tools it configured run. A test that
+   * *does* care passes its own — with an explicit catalogue, a `require-approval`
+   * decision, or a refusal — exactly as a real composition would. `null` is the
+   * third case: a composition that deliberately classifies nothing, which is
+   * what an unconfigured product composition carries.
+   */
+  readonly toolPolicy?: ToolPolicy | null;
 }
+
+/**
+ * The fixture's default policy: every tool this composition was composed with
+ * is allowed.
+ *
+ * It is deliberately not the product default (a host composed without a policy
+ * denies everything); it is the *fixture* saying, on the trusted side, that the
+ * tools a test handed it may run.
+ */
+export const TEST_TOOL_POLICY: ToolPolicy = Object.freeze({
+  revision: 1,
+  decide: (_view: ToolPolicyView): "allow" => "allow",
+});
 
 /** The bootstrap a test host starts from unless it says otherwise. */
 export const TEST_BOOTSTRAP = Object.freeze({
@@ -70,6 +97,7 @@ function modelShape(value: unknown): { readonly provider: string; readonly model
 export function testComposition(options: TestCompositionOptions): TrustedComposition {
   const catalog = options.catalog;
   return {
+    toolPolicy: options.toolPolicy === null ? undefined : (options.toolPolicy ?? TEST_TOOL_POLICY),
     validateModel(value: JsonValue): ModelSettingsCheck {
       const shaped = modelShape(value);
       if (shaped === undefined) return { ok: false, reason: "model-settings-shape" };

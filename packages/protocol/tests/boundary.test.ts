@@ -127,14 +127,22 @@ describe("dependency boundary", () => {
     expect(tsconfig.include).toEqual(["src"]);
   });
 
-  it("keeps the reverse business registry empty in production code", () => {
+  it("declares exactly the one frozen reverse profile, and no registry", () => {
+    const operations = codeOnly(readFileSync(join(srcRoot, "operations.ts"), "utf8"));
+    // v2 froze exactly one production reverse method — `tool.approval` — and the
+    // declared set is pinned here, so a second one cannot appear by accident:
+    // there is no `approvals.approve`, no `tools.execute` and no generic
+    // registry for a caller to grow one out of.
+    const block = operations.match(/export interface ReverseProfiles \{([\s\S]*?)\n\}/);
+    expect(block).not.toBeNull();
+    const declared = [...(block?.[1] ?? "").matchAll(/"([a-z]+\.[a-z]+)"/g)].map((match) => match[1]);
+    expect(new Set(declared)).toEqual(new Set(["tool.approval"]));
+
     for (const file of srcFiles) {
-      // Code, not prose: v2 declares an `approvals` capability and says so in
-      // its comments, but no product reverse method is registered anywhere.
       const source = codeOnly(readFileSync(file, "utf8"));
-      expect(source, `${file} must not register reverse methods`).not.toMatch(/test\.ping|test\.echo/);
-      expect(source, `${file} must not name product reverse methods`).not.toMatch(
-        /\bapproval\b|\bfile\.picker\b|\boauth\b/i,
+      expect(source, `${file} must not register test-only reverse methods`).not.toMatch(/test\.ping|test\.echo/);
+      expect(source, `${file} must not name a profile that was never frozen`).not.toMatch(
+        /\bfile\.picker\b|\boauth\b|\btools\.execute\b|\bruns\.resume\b|approvals\.(approve|reject|resume)/i,
       );
     }
   });

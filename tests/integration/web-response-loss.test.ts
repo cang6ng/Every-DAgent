@@ -181,6 +181,9 @@ describe("a lost runs.start answer over the web binding", () => {
     await client.connect();
 
     const session = (await client.sessions.create()).session;
+    // The model asks for the plugin's tool, so the plugin has to be enabled for
+    // the step to be declarable at all.
+    await client.plugins.enable({ pluginId: PLUGIN_ID });
     const started = await client.runs.start({
       sessionId: session.sessionId,
       submissionId: "sub-web-away",

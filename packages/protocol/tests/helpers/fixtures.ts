@@ -8,6 +8,7 @@
 
 import type {
   ActiveRunSnapshot,
+  ApprovalSnapshot,
   CanonicalItem,
   CollectionRevisions,
   HistoryPage,
@@ -246,16 +247,26 @@ export function liveTextItem(itemId = "live-1"): LiveItem {
   return { kind: "text", itemId, text: "partial" };
 }
 
-export function liveToolItem(invocationId = "inv-1", callId = ""): LiveItem {
+export function liveToolItem(invocationId = "inv-1", callId = "", executionId = "exec-1"): LiveItem {
   return {
     kind: "tool",
     itemId: "live-2",
     invocationId,
+    executionId,
     callId,
     name: "calculator",
     input: { kind: "json", value: { a: 21, b: 2 } },
     result: null,
   };
+}
+
+/** The result slot of a live occurrence, as a managed execution fills it. */
+export function liveToolResult(ok = true, content = "42"): {
+  readonly ok: boolean;
+  readonly content: string;
+  readonly disposition: "executed" | "not-executed";
+} {
+  return { ok, content, disposition: "executed" };
 }
 
 export function activeRun(
@@ -309,6 +320,24 @@ export function terminalRun(
   }
 }
 
+export function approvalSnapshot(overrides: Partial<ApprovalSnapshot> = {}): ApprovalSnapshot {
+  return {
+    approvalId: "approval-1",
+    executionId: "exec-1",
+    sessionId: "s-1",
+    runId: "run-1",
+    turnId: "turn-1",
+    invocationId: "inv-1",
+    callId: "call-1",
+    name: "calculator",
+    input: { kind: "json", value: { a: 21, b: 2 } },
+    deadlineAt: 1_700_000_000_000,
+    status: "pending",
+    canRespond: true,
+    ...overrides,
+  };
+}
+
 export function hostSnapshot(): HostSnapshot {
   return {
     hostInstanceId: INSTANCE,
@@ -322,6 +351,7 @@ export function hostSnapshot(): HostSnapshot {
       { namespace: "host", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
       { namespace: "model", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
     ],
+    approval: null,
   };
 }
 

@@ -48,8 +48,11 @@ import type { BootstrapSettings, ComposedExecution, TrustedComposition } from ".
 import { loadConfiguration, type LoadedConfiguration } from "./configuration.js";
 import { closeConnection, createConnection, observePlugin } from "./connection.js";
 import { handleFrame } from "./dispatch.js";
+import { createManagedExecution, createToolApprovalProfile, SYSTEM_CLOCK } from "./execution.js";
+import type { HostClock } from "./execution.js";
 import { guardedModelClient, openTurnOf } from "./guard.js";
 import type { StepTurnIdentity } from "./guard.js";
+import { captureToolPolicy } from "./policy.js";
 import { HOST_LIMITS } from "./limits.js";
 import { pluginFactsOf, projectPluginInfo } from "./projection.js";
 import { openRepository } from "./repository.js";
@@ -143,6 +146,15 @@ export interface HostInternals {
   readonly onRepository?: (repository: Repository) => void;
   /** Test-only: observes the host's own live state, so a test can ask what it holds. */
   readonly onState?: (state: HostState) => void;
+  /**
+   * Test-only: the clock every approval deadline is measured against.
+   *
+   * Production uses the system clock; a test that needs a deadline to happen
+   * within its own lifetime passes one it can advance. The approval profile is
+   * fixed at 120 seconds either way — this is the measuring instrument, not the
+   * number.
+   */
+  readonly clock?: HostClock;
 }
 
 /** One attached connection, seen by tests: the channel, the trigger, the disposer. */
@@ -174,6 +186,17 @@ export async function composeHost(options: HostOptions, internals: HostInternals
 
   let state: HostState | undefined;
   let execution: ComposedExecution | undefined;
+
+  const clock = internals.clock ?? SYSTEM_CLOCK;
+  const policy = captureToolPolicy(options.composition.toolPolicy);
+    // The managed boundary is created before the host state it consults, and
+    // reaches it through this late binding: a composed host is the only thing
+    // that can satisfy it, and reaching the boundary before then is a bug this
+    // throws on rather than a state it invents.
+  const managed = createManagedExecution(() => {
+    if (state === undefined) throw new Error("the managed execution was reached before the host existed");
+    return state;
+  }, clock);
 
   try {
     const hostInstanceId = newId();
@@ -232,8 +255,15 @@ export async function composeHost(options: HostOptions, internals: HostInternals
       tools: registry,
       contextBuilder,
       limits: loopLimits,
+      // The product path is managed, always: there is no composition of this
+      // host in which a call reaches a tool without passing the policy, the
+      // approval gate and the dispatch guard.
+      executionBoundary: managed.boundary,
     });
-    const reverseProfiles = internals.reverseProfiles ?? [];
+    // The production catalog is the `tool.approval` profile plus whatever a
+    // test composition adds; a duplicate name is refused where the connection's
+    // profile map is built.
+    const reverseProfiles = [createToolApprovalProfile(managed), ...(internals.reverseProfiles ?? [])];
 
     // Reconciliation is part of coming up, not something that happens later: a
     // previous instance's unfinished runs are settled here, before any frame
@@ -250,6 +280,9 @@ export async function composeHost(options: HostOptions, internals: HostInternals
       gate: createRegistryGate(),
       repository,
       limits: HOST_LIMITS,
+      policy,
+      execution: managed,
+      clock,
       configuration: {
         effective: loaded.effective,
         host: loaded.host,
@@ -326,7 +359,7 @@ export async function composeHost(options: HostOptions, internals: HostInternals
     internals.onState?.(hostState);
 
     const attach = (channel: ProtocolChannel): AttachedConnection => {
-      const connection = attachConnection(hostState, channel, internals.reverseProfiles ?? []);
+      const connection = attachConnection(hostState, channel, reverseProfiles);
       const attached: AttachedConnection = {
         channel,
         reverse: createReverseTrigger(hostState, connection),
@@ -620,6 +653,11 @@ function shutdownHost(state: HostState): Promise<void> {
 async function executeShutdown(state: HostState): Promise<void> {
   // The readers go first: a client that is going away is not the work.
   for (const connection of [...state.connections]) closeConnection(state, connection);
+
+  // Then every wait that was a hand-off rather than work: an execution parked
+  // on its approval or on the projection rendezvous is woken here, so shutdown
+  // cannot deadlock behind a question no client can answer any more.
+  state.execution.wakeAll();
 
   // A request, not a stop. The run keeps the registry until its stream
   // settles, and the wait below is what makes shutdown honest.

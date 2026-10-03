@@ -10,6 +10,7 @@
 
 import type {
   ActiveRunSnapshot,
+  ApprovalSnapshot,
   ClientRequest,
   CollectionRevisions,
   HostCapabilities,
@@ -84,6 +85,7 @@ export type FakeEvent =
     }
   | {
       readonly type: "run.tool.result";
+      readonly disposition?: "executed" | "not-executed";
       readonly sessionId: string;
       readonly runId: string;
       readonly invocationId: string;
@@ -336,6 +338,7 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
       readonly settings?: readonly SettingsSummary[];
       readonly storage?: StorageIdentity;
       readonly collections?: CollectionRevisions;
+      readonly approval?: ApprovalSnapshot | null;
     } = {},
   ): HostSnapshot {
     return Object.freeze({
@@ -356,6 +359,7 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
           Object.freeze({ namespace: "model", desiredRevision: 1, effectiveRevision: 1, restartRequired: false }),
         ]),
       ]),
+      approval: fields.approval ?? null,
     });
   }
 
@@ -496,7 +500,12 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
           ...base,
           type: "run.tool.result",
           scope: { kind: "run", sessionId: event.sessionId, runId: event.runId },
-          payload: { invocationId: event.invocationId, ok: event.ok, content: event.content },
+          payload: {
+            invocationId: event.invocationId,
+            ok: event.ok,
+            content: event.content,
+            disposition: event.disposition ?? "executed",
+          },
         });
         return;
       case "run.ended":

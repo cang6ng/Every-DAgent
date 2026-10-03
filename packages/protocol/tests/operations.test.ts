@@ -107,6 +107,7 @@ function hostSnapshotForOpen(): Record<string, unknown> {
     sessions: sessionPage([sessionSummary()]),
     runs: runPage(),
     plugins: [pluginSummary()],
+    approval: null,
     settings: [
       { namespace: "host", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
       { namespace: "model", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
@@ -569,6 +570,7 @@ describe("host snapshot consistency (single-snapshot cross-field)", () => {
       sessions: sessionPage(sessions as never),
       runs: runPage(runs as never),
       plugins: [],
+      approval: null,
       settings: [
         { namespace: "host", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
         { namespace: "model", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },

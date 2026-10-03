@@ -29,6 +29,7 @@
 
 import type {
   ActiveRunSnapshot,
+  ApprovalSnapshot,
   CanonicalItem,
   CollectionRevisions,
   EventScope,
@@ -304,7 +305,37 @@ export function foldEvent(previous: HostSnapshot, event: HostEvent, watermark: W
         ok: true,
         presentation: withWatermark(directoryOf(previous), watermark),
       };
+    case "approval.updated":
+      return foldApprovalUpdated(previous, event.payload.approval, watermark);
   }
+}
+
+/**
+ * One approval publication, folded into the business snapshot.
+ *
+ * The Host is the only authority on an approval's state, so this fold only
+ * refuses what the Host itself must never say: that a decided approval became
+ * pending again. A `null` payload means the Host holds no approval — that is
+ * how a client learns the delivery it answered is over.
+ */
+function foldApprovalUpdated(
+  previous: HostSnapshot,
+  approval: ApprovalSnapshot | null,
+  watermark: Watermark,
+): FoldOutcome {
+  const current = previous.approval;
+  if (approval !== null && current !== null && approval.approvalId === current.approvalId) {
+    if (current.status !== "pending" && approval.status === "pending") {
+      return { ok: false, reason: "invalid-event" };
+    }
+    if (approval.executionId !== current.executionId) {
+      return { ok: false, reason: "invalid-event" };
+    }
+  }
+  return {
+    ok: true,
+    presentation: withWatermark({ ...directoryOf(previous), approval }, watermark),
+  };
 }
 
 function directoryOf(previous: HostSnapshot): Omit<HostSnapshot, "watermark"> {
@@ -316,6 +347,7 @@ function directoryOf(previous: HostSnapshot): Omit<HostSnapshot, "watermark"> {
     runs: previous.runs,
     plugins: previous.plugins,
     settings: previous.settings,
+    approval: previous.approval,
   };
 }
 
@@ -687,7 +719,14 @@ export function foldLiveEvent(live: LiveMap, event: HostEvent): LiveOutcome {
       const items = replaceAt(
         run.live,
         index,
-        Object.freeze({ ...item, result: Object.freeze({ ok: event.payload.ok, content: event.payload.content }) }),
+        Object.freeze({
+          ...item,
+          result: Object.freeze({
+            ok: event.payload.ok,
+            content: event.payload.content,
+            disposition: event.payload.disposition,
+          }),
+        }),
       );
       return { ok: true, live: withLive(live, run.runId, Object.freeze({ ...run, live: items })) };
     }

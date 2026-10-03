@@ -21,6 +21,7 @@ import type {
   ClientRequestFor,
   DecodedEnvelope,
   HostCapabilities,
+  JsonValue,
   OperationMap,
   OperationName,
   ProtocolError,
@@ -254,6 +255,24 @@ function acceptClientResponse(
   if (!pending.acceptsResult(answer.result)) {
     closeConnection(state, connection);
     return;
+  }
+
+  // The profile's business half, run here and now: a claim is the synchronous
+  // linearization point of an answer, so the winner of two near-simultaneous
+  // decisions is decided by frame order and never by which promise resolved
+  // first. A refused claim is a peer this side may not keep waiting on.
+  const profile = connection.reverse.profiles.get(pending.method);
+  if (profile?.claim !== undefined) {
+    let claimed: boolean;
+    try {
+      claimed = profile.claim(pending, answer.result as JsonValue);
+    } catch {
+      claimed = false;
+    }
+    if (!claimed) {
+      closeConnection(state, connection);
+      return;
+    }
   }
   answerReversePending(connection, pending, { ok: true, result: answer.result });
 }
@@ -570,6 +589,11 @@ function dispatchClientRequest(
       }
       connection.subscription = { streamId, sequence: 0 };
       sendFrame(state, connection, encoded.output);
+      // The cut carries the current approval; the delivery that asks about it
+      // follows on the same stream, so a client that reconnected is asked
+      // again with this stream's own request id instead of being left with an
+      // approval it can see but cannot answer.
+      state.execution.offerToConnection(connection);
       return;
     }
 

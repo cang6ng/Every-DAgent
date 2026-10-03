@@ -132,6 +132,65 @@ export type DisplayInput =
   | { readonly kind: "json"; readonly value: JsonValue }
   | { readonly kind: "unavailable"; readonly reason: "not-json-safe" };
 
+/** Where one tool approval stands, as the Host's business state. */
+export type ApprovalStatus = "pending" | "approved" | "denied" | "expired" | "cancelled";
+
+/** The only two things a client may answer an approval with. */
+export type ToolApprovalDecision = "approve" | "reject";
+
+/**
+ * One pending (or just-decided) tool approval, as the current Host authority
+ * publishes it.
+ *
+ * It is a *business* fact: the execution it guards, the call it belongs to,
+ * the exact arguments the call will run with, and where that execution's
+ * deadline stands. It deliberately carries none of the machinery behind the
+ * decision — no executor, no closure, no resolver, no monotonic clock — and no
+ * step index or registry/policy generation, because none of those are facts a
+ * client could act on.
+ *
+ * `input` is the exact owned argument value, never a display truncation: an
+ * approval a client cannot read in full is an approval it cannot honestly
+ * answer, which is why an unrepresentable input fails the call closed instead
+ * of being shortened here.
+ *
+ * `canRespond` is true only while this approval is still the Host's to decide —
+ * pending and unexpired. A client must combine it with its own delivery state
+ * before offering a choice, because a client that can no longer deliver an
+ * answer may not treat the Host's `true` as its own.
+ */
+export interface ApprovalSnapshot {
+  readonly approvalId: Id;
+  readonly executionId: Id;
+  readonly sessionId: Id;
+  readonly runId: Id;
+  readonly turnId: Id;
+  /** The stable occurrence identity of the call this approval guards. */
+  readonly invocationId: Id;
+  readonly callId: string;
+  readonly name: string;
+  readonly input: DisplayInput;
+  /** Host clock epoch milliseconds; display only — the Host's own clock decides. */
+  readonly deadlineAt: number;
+  readonly status: ApprovalStatus;
+  readonly canRespond: boolean;
+}
+
+/**
+ * What a client answers one `tool.approval` request with.
+ *
+ * The identities are the whole contract: a decision is a statement about one
+ * execution, and an answer that names a different approval or execution than
+ * the one it arrived with is not a decision this Host will accept. There is no
+ * field for modified arguments and no third decision — the host already holds
+ * the arguments it prepared, and "maybe" is not a state any execution has.
+ */
+export interface ToolApprovalResponse {
+  readonly approvalId: Id;
+  readonly executionId: Id;
+  readonly decision: ToolApprovalDecision;
+}
+
 /** A plugin lifecycle failure, reduced to safe, enumerable facts. */
 export interface PluginFailureSummary {
   readonly operation: "enable" | "disable";
@@ -214,6 +273,12 @@ export type CanonicalItem =
       readonly callId: string;
       readonly name: string;
       readonly input: DisplayInput;
+      /**
+       * The managed execution this call was, when the record carries one.
+       * Absent on records written before managed execution existed — which is
+       * not corruption, just history that predates the fact.
+       */
+      readonly executionId?: Id;
     })
   | (CanonicalBase & {
       readonly kind: "tool-result";
@@ -222,6 +287,14 @@ export type CanonicalItem =
       readonly name: string;
       readonly ok: boolean;
       readonly content: string;
+      readonly executionId?: Id;
+      /**
+       * Whether the call was dispatched, when the record says. Absent is
+       * `unknown`: a record from before this fact existed may describe a run
+       * that executed or one that was refused, and nothing here may be read
+       * backwards into "no side effect happened".
+       */
+      readonly disposition?: "executed" | "not-executed";
     });
 
 /**
@@ -305,11 +378,26 @@ export type LiveItem =
       readonly kind: "tool";
       readonly itemId: Id;
       readonly invocationId: Id;
+      /**
+       * The managed execution this occurrence is. Every call a Host runs has
+       * one, and it is what ties this card to an approval and to the canonical
+       * record the call will become.
+       */
+      readonly executionId: Id;
       readonly callId: string;
       readonly name: string;
       readonly input: DisplayInput;
       /** Filled by `run.tool.result`; null while the call is unsettled. */
-      readonly result: null | { readonly ok: boolean; readonly content: string };
+      readonly result: null | {
+        readonly ok: boolean;
+        readonly content: string;
+        /**
+         * Whether the call was dispatched at all. `ok: false` is never a
+         * substitute for this: an executed failure and a call the host refused
+         * to run are different facts with the same `ok`.
+         */
+        readonly disposition: "executed" | "not-executed";
+      };
     };
 
 /** The tool variant on its own, for events that carry exactly one tool item. */
@@ -561,6 +649,14 @@ export interface HostSnapshot {
    * plugin summaries.
    */
   readonly settings: readonly SettingsSummary[];
+  /**
+   * The approval the Host is currently holding, or null.
+   *
+   * At most one: this host runs one execution at a time, and an approval
+   * belongs to the execution that is waiting on it. An approval that is not
+   * here is not a state a client may invent an answer for.
+   */
+  readonly approval: ApprovalSnapshot | null;
 }
 
 /**

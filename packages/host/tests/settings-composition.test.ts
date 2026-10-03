@@ -218,6 +218,10 @@ describe("what the effective settings drive", () => {
       });
       const client = connect(composed.host);
       await client.describe();
+      // The tool has to be registered for the step to be declarable at all: a
+      // managed step that names a tool the registry does not have is refused
+      // before anything runs, which is a different question than the budget.
+      await client.call("plugins.enable", { pluginId: "tools" });
       const session = await createSessionThrough(client);
 
       const started = await client.call("runs.start", {

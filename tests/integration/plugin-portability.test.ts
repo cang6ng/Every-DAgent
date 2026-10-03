@@ -92,16 +92,19 @@ describe.each(["memory", "web"] as const)("a second plugin over the %s carrier",
     );
 
     const second = await client.runs.start({ sessionId: session.sessionId, submissionId: "sub-2", text: "再统计一次" });
-    await waitFor(() => model.requests.length >= 4, { what: "the second run's requests" });
+    await waitFor(() => runSettled(client.getSnapshot(), second.run.runId), { what: "the second run to settle" });
     // The request that would decide to call the tool no longer offers it.
     expect(model.requests[2]?.tools.map((tool) => tool.name)).not.toContain("text-stats");
-
-    await waitFor(() => runSettled(client.getSnapshot(), second.run.runId), { what: "the second run to settle" });
+    // The model still asked for the missing tool, and the managed profile
+    // refused the whole step before anything was written down: no second model
+    // step, no second tool record, and the fixture never ran again.
+    expect(model.requests).toHaveLength(3);
+    const settled = client.getSnapshot().presentation?.runs.items.find((run) => run.runId === second.run.runId);
+    expect(settled?.status).toBe("failed");
     const results = (await client.sessions.history({ sessionId: session.sessionId })).page.items.filter(
       (item) => item.kind === "tool-result",
     );
-    // The call failed as an unknown tool, and the fixture never ran again.
-    expect(results[1]).toMatchObject({ kind: "tool-result", name: "text-stats", ok: false });
+    expect(results).toHaveLength(1);
     expect(textStats.executions).toEqual([{ text: "hello world" }]);
 
     client.disconnect();

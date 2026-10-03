@@ -34,6 +34,7 @@ import type {
 } from "@every-dagent/protocol";
 import { MAX_REQUEST_ID_BYTES, MAX_TITLE_CHARS, PROTOCOL_VERSION, encodeFrame } from "@every-dagent/protocol";
 
+import { APPROVAL_INPUT_MAX_BYTES } from "./limits.js";
 import { storedProtocolError } from "./errors.js";
 import { encodeCursor, readSessionPage, sessionSummaryOf } from "./history.js";
 import type { Lease, RegistryGate } from "./registry-gate.js";
@@ -55,6 +56,8 @@ import type { ReverseOutcome, ReverseProfile, ReverseTimer } from "./reverse.js"
 export interface OpenToolSlot {
   readonly index: number | undefined;
   readonly invocationId: string;
+  /** The managed execution this occurrence is; a result must answer this one. */
+  readonly executionId: string;
   readonly itemId: string;
   readonly callId: string;
   readonly name: string;
@@ -150,6 +153,12 @@ export interface ReversePendingEntry {
   /** Whether the request itself ever reached the wire; a notice is only owed for one that did. */
   sent: boolean;
   timer: ReverseTimer | undefined;
+  /**
+   * The sender's own bookkeeping for this request, handed to the profile's
+   * claim exactly as it was given. Opaque here on purpose: what a delivery is
+   * is a fact about the method's owner, not about this connection.
+   */
+  readonly context?: unknown;
 }
 
 /**
@@ -166,6 +175,12 @@ export interface ReverseConnectionState {
   counter: number;
 }
 
+/** One queued frame, with the UTF-8 size it was admitted at. */
+export interface OutboxEntry {
+  readonly frame: string;
+  readonly bytes: number;
+}
+
 export interface ConnectionState {
   readonly channel: ProtocolChannel;
   /** Every request id this connection has used, in either direction it sent. */
@@ -180,7 +195,8 @@ export interface ConnectionState {
   /** Removes the frame listener; the transport itself is closed separately. */
   detachListener: (() => void) | undefined;
   subscription: SubscriptionState | undefined;
-  outbox: string[];
+  outbox: OutboxEntry[];
+  /** The real UTF-8 bytes the queue holds, summed over the entries' own measures. */
   outboxBytes: number;
   pumping: boolean;
   closed: boolean;
@@ -238,6 +254,15 @@ export interface HostState {
   readonly gate: RegistryGate;
   readonly repository: Repository;
   readonly limits: HostLimits;
+  /**
+   * The trusted tool policy, captured at startup. Immutable for this host's
+   * life: there is no hot reload, no settings surface and no second reading.
+   */
+  readonly policy: import("./policy.js").CapturedToolPolicy;
+  /** The managed execution boundary: policy, approvals and dispatch, in one owner. */
+  readonly execution: import("./execution.js").ManagedExecution;
+  /** The monotonic clock every approval deadline is measured against. */
+  readonly clock: import("./execution.js").HostClock;
   /** What this instance is running from; see the note on `HostConfiguration`. */
   readonly configuration: HostConfiguration;
   /** The composition's own release path, held from the moment it handed execution over. */
@@ -465,6 +490,9 @@ export function runEntryOf(state: HostState, runId: string): RunEntry {
  */
 export function retireRun(state: HostState, run: RunEntry): void {
   state.runs.delete(run.runId);
+  // What the execution boundary held for this run — prepared calls and any
+  // approval still attached to one — ends with the run's live entry.
+  state.execution.forgetRun(run.runId);
   run.text = "";
   run.live = [];
   run.liveBytes = 0;
@@ -653,6 +681,11 @@ export function captureHostSnapshot(
       }),
       plugins: Object.freeze(state.pluginOrder.map((pluginId) => pluginSummaryOf(state, pluginId))),
       settings: settingsSummariesOf(state),
+      // Read inside the cut's own synchronous step, like every other window. The
+      // current approval is never dropped by a reduction: it belongs to the
+      // executing run, and a cut that carries the run but not what it is waiting
+      // for would be a pointer to nothing.
+      approval: state.execution.currentApproval(),
     });
 
   let snapshot = compose();
@@ -721,6 +754,7 @@ export function snapshotCoreOf(
   streamId: string,
   session: SessionSummary,
   run: RunSummary,
+  approval: import("@every-dagent/protocol").ApprovalSnapshot | null = null,
 ): HostSnapshot {
   const revisions = state.repository.revisions;
   return Object.freeze({
@@ -746,6 +780,7 @@ export function snapshotCoreOf(
     }),
     plugins: Object.freeze(state.pluginOrder.map((pluginId) => pluginSummaryOf(state, pluginId))),
     settings: settingsSummariesOf(state),
+    approval,
   });
 }
 

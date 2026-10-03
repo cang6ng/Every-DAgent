@@ -91,6 +91,7 @@ export function storedItem(
       const parsed = parseStoredRecord(record);
       const display = storedDisplay(record.data);
       if (display === undefined) throw new CorruptRecordError("a tool call record's input cannot be read back");
+      const executionId = parsed["executionId"];
       return Object.freeze({
         id: `${sessionId}:${record.seq}`,
         turnId: record.turnId,
@@ -100,6 +101,7 @@ export function storedItem(
         callId: parsed["callId"] as string,
         name: parsed["name"] as string,
         input: display,
+        ...(typeof executionId === "string" ? { executionId } : {}),
       });
     }
     case "tool/result": {
@@ -108,6 +110,8 @@ export function storedItem(
       if (parsed["callId"] !== openCall.callId || parsed["name"] !== openCall.name) {
         throw new CorruptRecordError(`a stored tool result at seq ${record.seq} answers a different call`);
       }
+      const disposition = parsed["disposition"];
+      const executionId = parsed["executionId"];
       return Object.freeze({
         id: `${sessionId}:${record.seq}`,
         turnId: record.turnId,
@@ -118,6 +122,8 @@ export function storedItem(
         name: parsed["name"] as string,
         ok: parsed["ok"] as boolean,
         content: parsed["content"] as string,
+        ...(disposition === "executed" || disposition === "not-executed" ? { disposition } : {}),
+        ...(typeof executionId === "string" ? { executionId } : {}),
       });
     }
     default:

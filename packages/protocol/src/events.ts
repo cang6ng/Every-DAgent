@@ -18,6 +18,7 @@ import * as v from "valibot";
 
 import type {
   ActiveRunSnapshot,
+  ApprovalSnapshot,
   CollectionRevisions,
   EventScope,
   Id,
@@ -29,6 +30,7 @@ import type {
 } from "./contracts.js";
 import {
   activeRunSchema,
+  approvalSnapshotSchema,
   collectionRevisionsSchema,
   idSchema,
   liveToolItemSchema,
@@ -90,7 +92,16 @@ export type HostEvent =
   | (HostEventBase & {
       readonly scope: EventScope & { readonly kind: "run"; readonly sessionId: Id; readonly runId: Id };
       readonly type: "run.tool.result";
-      readonly payload: { readonly invocationId: Id; readonly ok: boolean; readonly content: string };
+      readonly payload: {
+        readonly invocationId: Id;
+        readonly ok: boolean;
+        readonly content: string;
+        /**
+         * Whether the call was dispatched at all. `ok: false` alone would leave
+         * an executed failure and a refused call indistinguishable.
+         */
+        readonly disposition: "executed" | "not-executed";
+      };
     })
   | (HostEventBase & {
       readonly scope: EventScope & { readonly kind: "run"; readonly sessionId: Id; readonly runId: Id };
@@ -124,6 +135,22 @@ export type HostEvent =
       readonly scope: EventScope & { readonly kind: "host" };
       readonly type: "host.request.cancelled";
       readonly payload: { readonly requestId: Id; readonly reason: "cancelled" | "timeout" };
+    })
+  | (HostEventBase & {
+      readonly scope: EventScope & { readonly kind: "host" };
+      readonly type: "approval.updated";
+      /**
+       * The Host's authoritative approval state, or null when there is none.
+       *
+       * It is a business fact and never an execution command: a client that
+       * sees `approved` knows the Host decided, not that anything ran. It is
+       * published before the `tool.approval` delivery that asks about the same
+       * approval, on the same stream, so a client can never be asked to answer
+       * an approval it has not been told about — and the final update is what
+       * tells a client that its own answer (or the deadline, or a
+       * cancellation) was the one that decided.
+       */
+      readonly payload: { readonly approval: ApprovalSnapshot | null };
     });
 
 /** The frozen event type literals, derived from the public union. */
@@ -240,6 +267,7 @@ const eventSchemas = {
       invocationId: idSchema,
       ok: v.boolean(),
       content: plainStringSchema,
+      disposition: v.union([v.literal("executed"), v.literal("not-executed")]),
     }),
   }),
   "run.ended": v.pipe(
@@ -309,6 +337,15 @@ const eventSchemas = {
       requestId: requestIdSchema,
       reason: v.union([v.literal("cancelled"), v.literal("timeout")]),
     }),
+  }),
+  // The current business approval state, or null. Host-scoped on purpose: it
+  // is about the Host's decision, and the approval's own snapshot carries the
+  // session/run/turn identities a client needs to place it.
+  "approval.updated": v.object({
+    ...eventBaseEntries,
+    type: v.literal("approval.updated"),
+    scope: v.object({ kind: v.literal("host") }),
+    payload: v.object({ approval: v.union([v.null(), approvalSnapshotSchema]) }),
   }),
 } as const;
 

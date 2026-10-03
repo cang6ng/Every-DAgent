@@ -284,12 +284,18 @@ describe("live timeline", () => {
       name: "echo",
       input: { kind: "json", value: { value: 7 } },
       result: null,
+      // The live card carries the managed execution it is: what ties it to an
+      // approval and to the canonical record the call becomes.
+      executionId: expect.any(String),
     });
     expect(results).toHaveLength(1);
     expect(results[0]?.payload).toEqual({
       invocationId: calls[0]?.payload.item.invocationId,
       ok: true,
       content: "42",
+      // The result says the tool was dispatched: an observed failure and a
+      // call the host refused to run are different facts with the same `ok`.
+      disposition: "executed",
     });
 
     // Two chunks, one text item: both deltas carry the same item id.
@@ -339,16 +345,15 @@ describe("live timeline", () => {
     ]);
   });
 
-  it("keeps an empty and a repeated call id as separate occurrences", async () => {
+  it("keeps a call id reused across steps as two separate occurrences", async () => {
     const host = await testHost({
       modelClient: scriptedModel([
         [
-          { type: "tool-call", call: { callId: "", name: "echo", input: { n: 1 } } },
-          { type: "tool-call", call: { callId: "", name: "echo", input: { n: 2 } } },
+          { type: "tool-call", call: { callId: "call-1", name: "echo", input: { n: 1 } } },
           { type: "done" },
         ],
         [
-          { type: "tool-call", call: { callId: "", name: "echo", input: { n: 3 } } },
+          { type: "tool-call", call: { callId: "call-1", name: "echo", input: { n: 2 } } },
           { type: "done" },
         ],
         textReply("done"),
@@ -361,19 +366,71 @@ describe("live timeline", () => {
     await client.call("plugins.enable", { pluginId: "tools" });
     const session = await createSessionThrough(client);
 
-    await runToTerminal(client, session.sessionId, "triple");
+    await runToTerminal(client, session.sessionId, "twice");
 
     const calls = client.events.filter((event) => event.type === "run.tool.call");
-    expect(calls).toHaveLength(3);
-    expect(new Set(calls.map((event) => event.payload.item.invocationId)).size).toBe(3);
-    expect(new Set(calls.map((event) => event.payload.item.itemId)).size).toBe(3);
+    expect(calls).toHaveLength(2);
+    // One call id, two occurrences: the occurrence — its own invocation and item
+    // — is the identity the live view and the canonical history are built on.
+    expect(calls.every((event) => event.payload.item.callId === "call-1")).toBe(true);
+    expect(new Set(calls.map((event) => event.payload.item.invocationId)).size).toBe(2);
+    expect(new Set(calls.map((event) => event.payload.item.itemId)).size).toBe(2);
 
     const canonical = await conversation(client, session.sessionId);
-    expect(canonical.filter((item) => item.kind === "tool-call")).toHaveLength(3);
-    expect(canonical.filter((item) => item.kind === "tool-result")).toHaveLength(3);
+    expect(canonical.filter((item) => item.kind === "tool-call")).toHaveLength(2);
+    expect(canonical.filter((item) => item.kind === "tool-result")).toHaveLength(2);
     expect(
       new Set(canonical.filter((item) => item.kind === "tool-call").map((item) => item.invocationId)).size,
-    ).toBe(3);
+    ).toBe(2);
+  });
+
+  it("refuses a managed group whose call ids are empty or repeated within the step", async () => {
+    for (const calls of [
+      [{ callId: "", name: "echo", input: { n: 1 } }],
+      [
+        { callId: "call-1", name: "echo", input: { n: 1 } },
+        { callId: "call-1", name: "echo", input: { n: 2 } },
+      ],
+    ]) {
+      let executions = 0;
+      const host = await testHost({
+        modelClient: scriptedModel([
+          [...calls.map((call) => ({ type: "tool-call" as const, call })), { type: "done" as const }],
+          textReply("never reached"),
+        ]).client,
+        plugins: [
+          pluginWith([
+            {
+              ...constantTool("echo", "42"),
+              execute: async (): Promise<string> => {
+                executions += 1;
+                return "42";
+              },
+            },
+          ]),
+        ],
+      });
+      const client = connect(host);
+      await client.describe();
+      await client.call("plugins.enable", { pluginId: "tools" });
+      const session = await createSessionThrough(client);
+
+      const started = await client.call("runs.start", {
+        sessionId: session.sessionId,
+        submissionId: nextId("sub"),
+        text: "bad group",
+      });
+      const terminal = await awaitRunTerminal(client, started.result?.run.runId as string);
+
+      // The whole group is judged before anything is written down: no call ran,
+      // no call was declared, and the turn stops there.
+      expect(terminal.status).toBe("failed");
+      expect(executions).toBe(0);
+      const canonical = await conversation(client, session.sessionId);
+      expect(canonical.map((item) => item.kind)).toEqual(["user"]);
+      client.detach();
+      await host.shutdown();
+    }
   });
 });
 

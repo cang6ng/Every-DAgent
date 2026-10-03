@@ -631,6 +631,12 @@ function payloadOf(event: SessionEvent): JsonValue {
         })),
       };
     case "tool/call":
+      // Deliberately without the execution id: what must survive a restart is
+      // the occurrence (callId, name, input at its log position), and the
+      // invocation id the read side derives from that position is the durable
+      // identity. An execution id is this instance's live fact, and writing it
+      // here would spend part of the record bound on something a later host
+      // could never honour.
       return {
         callId: event.data.callId,
         name: event.data.name,
@@ -642,6 +648,10 @@ function payloadOf(event: SessionEvent): JsonValue {
         name: event.data.name,
         ok: event.data.ok,
         content: event.data.content,
+        // Whether the call was dispatched is a durable fact worth keeping: a
+        // reader of history must be able to tell an executed failure from a
+        // call the host refused to run, and `ok` alone cannot say that.
+        ...(event.data.disposition === undefined ? {} : { disposition: event.data.disposition }),
       };
     case "turn/end":
       // The Core's own message never travels into storage; whether the turn
@@ -791,12 +801,21 @@ export function parseStoredRecord(record: StoredRecord): Record<string, unknown>
       requireString(parsed, "callId");
       requireString(parsed, "name");
       if (!isDisplayInput(parsed["input"])) throw new CorruptRecordError("a tool call record has no display input");
+      requireOptionalExecutionId(parsed);
       return parsed;
     case "tool/result":
       requireString(parsed, "callId");
       requireString(parsed, "name");
       if (typeof parsed["ok"] !== "boolean") throw new CorruptRecordError("a tool result record has no outcome");
       requireString(parsed, "content");
+      requireOptionalExecutionId(parsed);
+      if (
+        parsed["disposition"] !== undefined &&
+        parsed["disposition"] !== "executed" &&
+        parsed["disposition"] !== "not-executed"
+      ) {
+        throw new CorruptRecordError("a tool result record carries an execution disposition it cannot have");
+      }
       return parsed;
     case "turn/end": {
       const reason = parsed["reason"];
@@ -810,6 +829,21 @@ export function parseStoredRecord(record: StoredRecord): Record<string, unknown>
     }
     default:
       throw new CorruptRecordError(`a record carries an unknown event type`);
+  }
+}
+
+/**
+ * The execution identity a managed record may carry, when it carries one.
+ *
+ * Present, it must be a real identity; absent is legal history. The field is
+ * never invented on read: a record without one is a record from before managed
+ * execution, and writing an id into it would be repairing a fact.
+ */
+function requireOptionalExecutionId(parsed: Record<string, unknown>): void {
+  const executionId = parsed["executionId"];
+  if (executionId === undefined) return;
+  if (typeof executionId !== "string" || executionId.length === 0) {
+    throw new CorruptRecordError("a stored execution id is not text");
   }
 }
 
@@ -850,6 +884,7 @@ export function toSessionEvent(record: StoredRecord): SessionEvent {
     case "tool/call": {
       const display = storedDisplay(record.data);
       if (display === undefined) throw new CorruptRecordError("a tool call record's input cannot be read back");
+      const executionId = parsed["executionId"];
       return Object.freeze({
         ...base,
         type: "tool/call" as const,
@@ -857,10 +892,13 @@ export function toSessionEvent(record: StoredRecord): SessionEvent {
           callId: parsed["callId"] as string,
           name: parsed["name"] as string,
           input: restoredInput(display),
+          ...(typeof executionId === "string" ? { executionId } : {}),
         }),
       });
     }
-    case "tool/result":
+    case "tool/result": {
+      const disposition = parsed["disposition"];
+      const executionId = parsed["executionId"];
       return Object.freeze({
         ...base,
         type: "tool/result" as const,
@@ -869,8 +907,11 @@ export function toSessionEvent(record: StoredRecord): SessionEvent {
           name: parsed["name"] as string,
           ok: parsed["ok"] as boolean,
           content: parsed["content"] as string,
+          ...(disposition === "executed" || disposition === "not-executed" ? { disposition } : {}),
+          ...(typeof executionId === "string" ? { executionId } : {}),
         }),
       });
+    }
     case "turn/end": {
       const error = parsed["error"];
       return Object.freeze({

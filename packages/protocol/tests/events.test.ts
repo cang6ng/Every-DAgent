@@ -24,6 +24,7 @@ const EVENT_TYPES = [
   "plugin.updated",
   "collection.invalidated",
   "host.request.cancelled",
+  "approval.updated",
 ] as const;
 
 type EventType = (typeof EVENT_TYPES)[number];
@@ -61,7 +62,12 @@ function validEvent(type: EventType, sequence = 1): Record<string, unknown> {
     case "run.tool.call":
       return hostEvent(type, RUN_SCOPE, { item: liveToolItem() }, sequence);
     case "run.tool.result":
-      return hostEvent(type, RUN_SCOPE, { invocationId: "inv-1", ok: true, content: "42" }, sequence);
+      return hostEvent(
+        type,
+        RUN_SCOPE,
+        { invocationId: "inv-1", ok: true, content: "42", disposition: "executed" },
+        sequence,
+      );
     case "run.ended":
       return hostEvent(
         type,
@@ -75,6 +81,8 @@ function validEvent(type: EventType, sequence = 1): Record<string, unknown> {
       return hostEvent(type, { kind: "host" }, { collections: collectionRevisions() }, sequence);
     case "host.request.cancelled":
       return hostEvent(type, { kind: "host" }, { requestId: "h-1", reason: "timeout" }, sequence);
+    case "approval.updated":
+      return hostEvent(type, { kind: "host" }, { approval: null }, sequence);
   }
 }
 
@@ -231,7 +239,7 @@ describe("host events", () => {
 
   it("never exports semantics the Core does not produce", () => {
     // Sanity pin on the frozen v2 literal set itself.
-    expect(EVENT_TYPES).toHaveLength(11);
+    expect(EVENT_TYPES).toHaveLength(12);
     expect(EVENT_TYPES).not.toContain("message.start");
     expect(EVENT_TYPES).not.toContain("tool.args.delta");
     expect(EVENT_TYPES).not.toContain("state.delta");

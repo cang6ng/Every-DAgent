@@ -33,6 +33,8 @@ const RUNTIME_EXPORTS = [
   "decodeFrame",
   "encodeFrame",
   "validateJsonValue",
+  "validateReverseParams",
+  "validateReverseResult",
   "validateMessage",
 ].sort();
 
@@ -73,7 +75,7 @@ describe("public API surface", () => {
     expect(pinned).toBe(true);
   });
 
-  it("pins the twelve event type literals at the type level", () => {
+  it("pins the thirteen event type literals at the type level", () => {
     const pinned: Expect<
       Equal<
         HostEvent["type"],
@@ -89,6 +91,7 @@ describe("public API surface", () => {
         | "settings.updated"
         | "collection.invalidated"
         | "host.request.cancelled"
+        | "approval.updated"
       >
     > = true;
     expect(pinned).toBe(true);

@@ -212,7 +212,13 @@ describe("calculator plugin end to end (no real model)", () => {
     const secondTool = registry.get("calculator");
 
     expect(secondTool).toBeDefined();
-    expect(secondTool).not.toBe(firstTool);
+    // The plugin owns one tool object for its whole life, and a re-enable
+    // registers that same object again: a trusted composition binds a policy to
+    // tool identities, so the object a policy names and the object the plugin
+    // registers have to be the same one. The registry still holds exactly one
+    // registration, and the generation moved — a prepared execution from the
+    // first activation cannot dispatch against the second.
+    expect(secondTool).toBe(firstTool);
     expect(registry.list().filter((tool) => tool.name === "calculator")).toHaveLength(1);
 
     const { client, requests } = scriptedModelClient(calculatorScript("call-2", 6, 5, "6 x 5 = 30."));

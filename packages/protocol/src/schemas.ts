@@ -28,6 +28,7 @@ import {
   MAX_REQUEST_ID_BYTES,
   MAX_TITLE_CHARS,
   type ActiveRunSnapshot,
+  type ApprovalSnapshot,
   type CanonicalItem,
   type CollectionRevisions,
   type HistoryPage,
@@ -48,6 +49,7 @@ import {
   type SettingsSummary,
   type StorageIdentity,
   type TerminalRunSnapshot,
+  type ToolApprovalResponse,
 } from "./contracts.js";
 import { utf8Bytes } from "./bytes.js";
 import { isStrictJsonValue } from "./json-value.js";
@@ -305,6 +307,9 @@ const canonicalItemSchema = v.variant("kind", [
     callId: plainStringSchema,
     name: plainStringSchema,
     input: displayInputSchema,
+    // Optional on purpose: records written before managed execution existed
+    // carry no execution id, and history that predates a field is not corruption.
+    executionId: v.optional(idSchema),
   }),
   v.object({
     ...canonicalBaseEntries,
@@ -314,6 +319,8 @@ const canonicalItemSchema = v.variant("kind", [
     name: plainStringSchema,
     ok: v.boolean(),
     content: v.string(),
+    executionId: v.optional(idSchema),
+    disposition: v.optional(v.union([v.literal("executed"), v.literal("not-executed")])),
   }),
 ]);
 
@@ -498,12 +505,21 @@ const historyPageSchema: v.GenericSchema<HistoryPage> = v.pipe(
 // Runs.
 // ---------------------------------------------------------------------------
 
-const liveToolResultSchema = v.object({ ok: v.boolean(), content: v.string() });
+const liveToolResultSchema = v.object({
+  ok: v.boolean(),
+  content: v.string(),
+  // Required here, unlike the canonical item's optional field: a live item is
+  // built by a host that just made the decision, so it always knows — and a
+  // client deciding whether to show "failed" or "never ran" needs the fact,
+  // not an absence it would have to guess about.
+  disposition: v.union([v.literal("executed"), v.literal("not-executed")]),
+});
 
 const liveToolItemObjectSchema = v.object({
   kind: v.literal("tool"),
   itemId: idSchema,
   invocationId: idSchema,
+  executionId: idSchema,
   callId: plainStringSchema,
   name: plainStringSchema,
   input: displayInputSchema,
@@ -736,6 +752,58 @@ const settingsSummarySchema: v.GenericSchema<SettingsSummary> = v.pipe(
 );
 
 // ---------------------------------------------------------------------------
+// Tool approvals.
+// ---------------------------------------------------------------------------
+
+/**
+ * One approval, as the Host publishes it and as a client answers about it.
+ *
+ * The cross-field rules are the ones a decision depends on: a status that is
+ * not `pending` cannot claim to be answerable, and a call identity is present
+ * exactly as the Host minted it (a `callId` may legally be empty — that is the
+ * provider's string, and the protocol does not tighten it here either).
+ */
+const approvalSnapshotSchema: v.GenericSchema<ApprovalSnapshot> = v.pipe(
+  v.object({
+    approvalId: idSchema,
+    executionId: idSchema,
+    sessionId: idSchema,
+    runId: idSchema,
+    turnId: idSchema,
+    invocationId: idSchema,
+    callId: plainStringSchema,
+    name: plainStringSchema,
+    input: displayInputSchema,
+    deadlineAt: clockSchema,
+    status: v.union([
+      v.literal("pending"),
+      v.literal("approved"),
+      v.literal("denied"),
+      v.literal("expired"),
+      v.literal("cancelled"),
+    ]),
+    canRespond: v.boolean(),
+  }),
+  // Only a pending approval may claim to be answerable. The other direction is
+  // deliberately not pinned: a pending approval whose deadline has passed is
+  // still `pending` in the Host's business state until the Host itself says
+  // otherwise, and `canRespond` is where that shows.
+  v.check((approval) => (approval.status === "pending" ? true : approval.canRespond === false)),
+);
+
+/**
+ * The client's answer: exactly the two identities and one of two decisions.
+ *
+ * Strict, not lenient: an answer with an extra field is not an answer this
+ * profile defines, and stripping it would be accepting a claim nobody made.
+ */
+const toolApprovalResponseSchema: v.GenericSchema<ToolApprovalResponse> = v.strictObject({
+  approvalId: idSchema,
+  executionId: idSchema,
+  decision: v.union([v.literal("approve"), v.literal("reject")]),
+});
+
+// ---------------------------------------------------------------------------
 // Snapshots.
 // ---------------------------------------------------------------------------
 
@@ -751,6 +819,7 @@ const hostSnapshotSchema: v.GenericSchema<HostSnapshot> = v.pipe(
     runs: runPageSchema,
     plugins: v.array(pluginSummarySchema),
     settings: v.array(settingsSummarySchema),
+    approval: v.union([v.null(), approvalSnapshotSchema]),
   }),
   // What the snapshot can prove about itself, and nothing more. The directory
   // and the run window are each bounded, so a run may legitimately outlive the
@@ -798,6 +867,7 @@ const hostSnapshotSchema: v.GenericSchema<HostSnapshot> = v.pipe(
 
 export {
   activeRunSchema,
+  approvalSnapshotSchema,
   canonicalItemSchema,
   clientCapabilitiesSchema,
   clockSchema,
@@ -837,5 +907,6 @@ export {
   storageIdentitySchema,
   terminalRunSchema,
   titleSchema,
+  toolApprovalResponseSchema,
   watermarkSchema,
 };

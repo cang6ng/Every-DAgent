@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { Tool } from "@every-dagent/agent-core";
 import type { ModelEvent } from "@every-dagent/agent-core";
 import type { CanonicalItem } from "@every-dagent/protocol";
 import { MAX_PAGE_ITEMS } from "@every-dagent/protocol";
@@ -223,6 +224,9 @@ describe("canonical occurrences", () => {
       modelClient: scriptedModel([
         [
           { type: "tool-call", call: { callId: "call-1", name: "echo", input: { n: 1 } } },
+          { type: "done" },
+        ],
+        [
           { type: "tool-call", call: { callId: "call-1", name: "echo", input: { n: 2 } } },
           { type: "done" },
         ],
@@ -250,6 +254,7 @@ describe("canonical occurrences", () => {
       "assistant",
       "tool-call",
       "tool-result",
+      "assistant",
       "tool-call",
       "tool-result",
       "assistant",
@@ -260,19 +265,32 @@ describe("canonical occurrences", () => {
     expect(calls[0]?.invocationId).toBe(results[0]?.invocationId);
     expect(calls[1]?.invocationId).toBe(results[1]?.invocationId);
     expect(calls[0]?.invocationId).not.toBe(calls[1]?.invocationId);
-    // Same call id, different inputs: two occurrences, never merged.
+    // The same call id twice: two occurrences, never merged — one in each step,
+    // which is exactly where a managed step's profile allows the repeat.
     expect(calls[0]?.callId).toBe("call-1");
     expect(calls[1]?.callId).toBe("call-1");
     expect(calls[0]?.input).toEqual({ kind: "json", value: { n: 1 } });
     expect(calls[1]?.input).toEqual({ kind: "json", value: { n: 2 } });
+    // A managed result says whether the call ran; the tool here ran and answered.
+    expect(results[0]?.disposition).toBe("executed");
   });
 
   it("records a failed tool observation as ok:false without interpreting it", async () => {
+    const exploding: Tool = {
+      name: "grumpy",
+      description: "Fails on purpose.",
+      inputSchema: { type: "object" },
+      execute: async (): Promise<never> => {
+        throw new Error("the tool failed on purpose");
+      },
+    };
     const host = await testHost({
-      modelClient: scriptedModel([toolReply("call-1", "ghost", {}), textReply("recovered")]).client,
+      modelClient: scriptedModel([toolReply("call-1", "grumpy", {}), textReply("recovered")]).client,
+      plugins: [testPlugin({ id: "tools", tools: [exploding] })],
     });
     const client = connect(host);
     await client.describe();
+    await client.call("plugins.enable", { pluginId: "tools" });
     const session = await createSessionThrough(client);
 
     await awaitRunTerminal(
@@ -280,7 +298,7 @@ describe("canonical occurrences", () => {
       (await client.call("runs.start", {
         sessionId: session.sessionId,
         submissionId: nextId("sub"),
-        text: "call something missing",
+        text: "call something that fails",
       })).result?.run.runId as string,
     );
 
@@ -288,6 +306,31 @@ describe("canonical occurrences", () => {
     const result = canonical.find((item) => item.kind === "tool-result");
     expect(result?.ok).toBe(false);
     expect(typeof result?.content).toBe("string");
+    // A failure *after* dispatch is an executed failure, never "did not run".
+    expect(result?.disposition).toBe("executed");
+  });
+
+  it("refuses a step that names a tool the registry does not have", async () => {
+    const host = await testHost({
+      modelClient: scriptedModel([toolReply("call-1", "ghost", {}), textReply("never reached")]).client,
+    });
+    const client = connect(host);
+    await client.describe();
+    const session = await createSessionThrough(client);
+
+    const started = await client.call("runs.start", {
+      sessionId: session.sessionId,
+      submissionId: nextId("sub"),
+      text: "call something missing",
+    });
+    const terminal = await awaitRunTerminal(client, started.result?.run.runId as string);
+
+    // The managed profile refuses the whole group before anything is written
+    // down: an unknown tool is not an observation, it is a step that cannot be
+    // declared — so nothing ran and nothing was recorded as run.
+    expect(terminal.status).toBe("failed");
+    const canonical = await conversation(client, session.sessionId);
+    expect(canonical.map((item) => item.kind)).toEqual(["user"]);
   });
 });
 

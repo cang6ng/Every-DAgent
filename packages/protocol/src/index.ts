@@ -18,6 +18,8 @@ export {
 } from "./contracts.js";
 export type {
   ActiveRunSnapshot,
+  ApprovalSnapshot,
+  ApprovalStatus,
   BlockedReason,
   CanonicalItem,
   ClientCapabilities,
@@ -55,6 +57,8 @@ export type {
   SettingsSummary,
   StorageIdentity,
   TerminalRunSnapshot,
+  ToolApprovalDecision,
+  ToolApprovalResponse,
   Watermark,
 } from "./contracts.js";
 
@@ -62,13 +66,17 @@ export type {
   ClientRequest,
   ClientRequestFor,
   ClientResponse,
+  ClientResponseFor,
   DescribeParams,
   EmptyParams,
   HostRequest,
+  HostRequestFor,
   HostResponse,
   OperationMap,
   OperationName,
   PageParams,
+  ReverseMethod,
+  ReverseProfiles,
 } from "./operations.js";
 
 export type { HostEvent } from "./events.js";
@@ -87,4 +95,4 @@ export type {
   ValidationResult,
   ValidationTarget,
 } from "./validation.js";
-export { validateJsonValue, validateMessage } from "./validation.js";
+export { validateJsonValue, validateMessage, validateReverseParams, validateReverseResult } from "./validation.js";

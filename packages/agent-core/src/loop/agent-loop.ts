@@ -301,7 +301,12 @@ async function runSteps(
       commitFact(meter, session, {
         type: "tool/call",
         turnId,
-        data: { callId: call.callId, name: call.name, input: call.input },
+        data: {
+          callId: call.callId,
+          name: call.name,
+          input: call.input,
+          ...(entry.executionId === undefined ? {} : { executionId: entry.executionId }),
+        },
       });
       emit?.({
         type: "tool/call",
@@ -330,6 +335,7 @@ async function runSteps(
             ok: dispatched.result.ok,
             content,
             ...(dispatched.disposition === undefined ? {} : { disposition: dispatched.disposition }),
+            ...(entry.executionId === undefined ? {} : { executionId: entry.executionId }),
           },
         },
         // Charged after the tool ran, which is why this one raises a fault rather

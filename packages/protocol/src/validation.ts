@@ -23,12 +23,16 @@ import {
   hostErrorResponseSchema,
   requestSchemas,
   responseSchemaFor,
-  type OperationName,
+  reverseParamSchemas,
+  reverseResultSchemas,
   type ClientRequest,
   type ClientResponse,
   type HostErrorResponse,
   type HostRequest,
   type HostResponse,
+  type OperationName,
+  type ReverseMethod,
+  type ReverseProfiles,
 } from "./operations.js";
 import { eventSchemas, hostEventSchema, type HostEvent } from "./events.js";
 import {
@@ -254,6 +258,39 @@ export function validateMessageCore(target: ValidationTarget, input: unknown): V
       return run(responseSchemaFor(method)) as ValidationResult<HostResponse<OperationName>>;
     }
   }
+}
+
+/**
+ * Validates one reverse profile's params (a `host-request` body) or result (a
+ * `client-response` body) against the frozen profile that makes the method
+ * real.
+ *
+ * The same two steps as every other message: the strict JSON guard first — so
+ * accessors, prototypes and non-JSON shapes are refused before any schema sees
+ * them — and then the method's own schema on the isolated snapshot. `unknown`
+ * is never softened into a default: a body that is not this profile's is
+ * refused, and the caller decides what a refusal means on its side.
+ */
+export function validateReverseParams<M extends ReverseMethod>(
+  method: M,
+  input: unknown,
+): ValidationResult<ReverseProfiles[M]["params"]> {
+  const guarded = guardedSnapshot(input);
+  if (!guarded.ok) return failure("NON_JSON_VALUE");
+  const parsed = v.safeParse(reverseParamSchemas[method], guarded.snapshot);
+  if (!parsed.success) return failure("INVALID_MESSAGE");
+  return { success: true, output: parsed.output as ReverseProfiles[M]["params"] };
+}
+
+export function validateReverseResult<M extends ReverseMethod>(
+  method: M,
+  input: unknown,
+): ValidationResult<ReverseProfiles[M]["result"]> {
+  const guarded = guardedSnapshot(input);
+  if (!guarded.ok) return failure("NON_JSON_VALUE");
+  const parsed = v.safeParse(reverseResultSchemas[method], guarded.snapshot);
+  if (!parsed.success) return failure("INVALID_MESSAGE");
+  return { success: true, output: parsed.output as ReverseProfiles[M]["result"] };
 }
 
 /** Validates that `input` is a strict `JsonValue`, returning an isolated snapshot. */

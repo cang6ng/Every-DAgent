@@ -97,6 +97,16 @@ export interface ComposedExecution {
 
 export interface TrustedComposition {
   /**
+   * What this composition says about the tools the host may run.
+   *
+   * Left out, the host classifies nothing and refuses every tool call: running
+   * a tool the trusted side never vouched for is exactly what the approval gate
+   * exists to prevent, so silence is a refusal. The policy is captured once at
+   * startup — immutable for the host's life, never reloaded, and never derived
+   * from anything a plugin or a tool says about itself.
+   */
+  readonly toolPolicy?: import("./policy.js").ToolPolicy;
+  /**
    * Whether one model settings value may be persisted and run.
    *
    * Called at write time (so an unacceptable value is never stored) and again

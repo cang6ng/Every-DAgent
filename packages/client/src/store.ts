@@ -14,7 +14,13 @@
  * `subscribe` hears about each change exactly once.
  */
 
-import type { ActiveRunSnapshot, HostDescription, HostSnapshot, Id } from "@every-dagent/protocol";
+import type {
+  ActiveRunSnapshot,
+  HostDescription,
+  HostSnapshot,
+  Id,
+  ToolApprovalDecision,
+} from "@every-dagent/protocol";
 
 import type { HistoryMap } from "./fold.js";
 import type { ClientError } from "./errors.js";
@@ -42,6 +48,35 @@ export type PresentationHost = "none" | "unconfirmed" | "current" | "previous";
 
 export type LiveMap = Readonly<Record<Id, ActiveRunSnapshot>>;
 
+/**
+ * What this client has done with the approval delivery it was handed.
+ *
+ * It is deliberately *local* state, and separate from the Host's business
+ * snapshot: `sent` means an answer left this client and the Host has not said
+ * anything since — never that the execution was approved. Only the Host's own
+ * `approval.updated` (and the business snapshot it folds into) says what was
+ * decided, and a client that showed "approved" because it sent an approval
+ * would be showing its own wish.
+ */
+export type ApprovalReplyState =
+  | { readonly state: "none" }
+  | {
+      readonly state: "pending";
+      readonly requestId: Id;
+      readonly approvalId: Id;
+      readonly executionId: Id;
+    }
+  | {
+      readonly state: "sent";
+      readonly approvalId: Id;
+      readonly executionId: Id;
+      readonly decision: ToolApprovalDecision;
+    }
+  | { readonly state: "closed"; readonly approvalId: Id; readonly executionId: Id }
+  | { readonly state: "failed"; readonly approvalId: Id; readonly executionId: Id };
+
+export const NO_APPROVAL_REPLY: ApprovalReplyState = Object.freeze({ state: "none" });
+
 /** Everything a reader may see about this client. Frozen, and replaced whole. */
 export interface ClientSnapshot {
   readonly status: ConnectionStatus;
@@ -58,6 +93,24 @@ export interface ClientSnapshot {
    * when it may be: nothing here is a claim about a host it is not talking to.
    */
   readonly settings: SettingsMap;
+  /**
+   * What this client has done with the approval delivery it holds.
+   *
+   * `pending` is the only state in which a caller may answer: it means a
+   * `tool.approval` request is outstanding on the current stream and no answer
+   * has left this client yet.
+   */
+  readonly approvalReply: ApprovalReplyState;
+  /**
+   * Whether a caller may answer the current approval *from here*.
+   *
+   * The Host's `canRespond` is necessary and not sufficient: this flag also
+   * requires a synchronized, current connection with an outstanding delivery.
+   * A client whose delivery ended — a disconnect, a replaced stream, a
+   * reconnected host — shows this false while the Host's business snapshot may
+   * still say `pending`.
+   */
+  readonly approvalCanRespond: boolean;
   /** True while the presentation is retained but no longer live. */
   readonly stale: boolean;
   /** The last terminal error — a protocol violation or a lost connection. */
@@ -72,7 +125,7 @@ export interface PresentationStore {
 }
 
 function merge(current: ClientSnapshot, patch: Partial<ClientSnapshot>): ClientSnapshot {
-  return Object.freeze({
+  const merged = {
     status: patch.status ?? current.status,
     description: patch.description !== undefined ? patch.description : current.description,
     presentation: patch.presentation !== undefined ? patch.presentation : current.presentation,
@@ -80,9 +133,36 @@ function merge(current: ClientSnapshot, patch: Partial<ClientSnapshot>): ClientS
     live: patch.live !== undefined ? patch.live : current.live,
     history: patch.history !== undefined ? patch.history : current.history,
     settings: patch.settings !== undefined ? patch.settings : current.settings,
+    approvalReply: patch.approvalReply ?? current.approvalReply,
     stale: patch.stale ?? current.stale,
     error: patch.error !== undefined ? patch.error : current.error,
-  });
+  };
+  return Object.freeze({ ...merged, approvalCanRespond: canRespondFrom(merged) });
+}
+
+/**
+ * The one place the two halves of "may answer" are combined.
+ *
+ * It is derived, never stored from a patch: every input is a fact about the
+ * connection or the folded presentation, and a flag a caller could set would
+ * be a client claiming a capability it does not have.
+ */
+function canRespondFrom(snapshot: {
+  readonly status: ConnectionStatus;
+  readonly presentation: HostSnapshot | null;
+  readonly presentationHost: PresentationHost;
+  readonly approvalReply: ApprovalReplyState;
+  readonly stale: boolean;
+}): boolean {
+  if (snapshot.status !== "ready" || snapshot.stale) return false;
+  if (snapshot.presentationHost !== "current") return false;
+  const approval = snapshot.presentation?.approval;
+  if (approval === undefined || approval === null || !approval.canRespond) return false;
+  if (snapshot.approvalReply.state !== "pending") return false;
+  return (
+    snapshot.approvalReply.approvalId === approval.approvalId &&
+    snapshot.approvalReply.executionId === approval.executionId
+  );
 }
 
 function differs(current: ClientSnapshot, next: ClientSnapshot): boolean {
@@ -94,6 +174,8 @@ function differs(current: ClientSnapshot, next: ClientSnapshot): boolean {
     current.live !== next.live ||
     current.history !== next.history ||
     current.settings !== next.settings ||
+    current.approvalReply !== next.approvalReply ||
+    current.approvalCanRespond !== next.approvalCanRespond ||
     current.stale !== next.stale ||
     current.error !== next.error
   );
@@ -108,6 +190,8 @@ export function createStore(): PresentationStore {
     live: Object.freeze({}),
     history: Object.freeze({}),
     settings: EMPTY_SETTINGS,
+    approvalReply: NO_APPROVAL_REPLY,
+    approvalCanRespond: false,
     stale: false,
     error: null,
   });

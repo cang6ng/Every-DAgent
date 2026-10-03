@@ -537,7 +537,15 @@ async function drainRun(state: HostState, run: RunEntry): Promise<void> {
     try {
       const stream = runtimeStream(state, run);
       for await (const event of stream) {
-        attempt(run, () => observeRuntimeEvent(state, run, event));
+        try {
+          if (!run.faulted) observeRuntimeEvent(state, run, event);
+        } catch {
+          // The projection failed. The execution keeps draining — a tool that is
+          // already running still settles, and the run is recorded as the host
+          // failure it is — but nothing new may park on a projection that will
+          // never come, so every wait this run owns is woken here.
+          faultRun(state, run);
+        }
       }
       completed = true;
     } catch {
@@ -643,6 +651,12 @@ function commitLive(state: HostState, build: EventBuilder, apply: () => void): v
   assertEventBuilds(state, build);
   apply();
   publishEvent(state, build);
+}
+
+/** Marks a run faulted, and lets the host wake whatever was waiting on its projection. */
+function faultRun(state: HostState, run: RunEntry): void {
+  run.faulted = true;
+  state.execution.abandonRun(run.runId);
 }
 
 function observeRuntimeEvent(state: HostState, run: RunEntry, event: RuntimeEvent): void {
@@ -770,6 +784,13 @@ function openLiveToolCall(
   if (run.posTool !== undefined) {
     throw new ProjectionError("a tool call arrived while another call was still open");
   }
+  const executionId = event.executionId;
+  if (executionId === undefined) {
+    // Every call this host executes is a managed execution with an identity.
+    // One without it is a call whose approval, result and record could not be
+    // lined up — the run stops here rather than publishing it.
+    throw new ProjectionError("a tool call has no managed execution identity");
+  }
 
   // The occurrence is established first, unconditionally: pairing is execution
   // bookkeeping, and it must hold whether or not the item is ever published.
@@ -778,6 +799,7 @@ function openLiveToolCall(
     kind: "tool" as const,
     itemId: newLiveId(run, "item"),
     invocationId,
+    executionId,
     callId: event.callId,
     name: event.name,
     input: projectDisplayInput(event.input),
@@ -786,6 +808,7 @@ function openLiveToolCall(
   const slot = {
     index: undefined as number | undefined,
     invocationId,
+    executionId,
     itemId: item.itemId,
     callId: event.callId,
     name: event.name,
@@ -794,6 +817,10 @@ function openLiveToolCall(
   if (!liveHasRoom(state, run, liveItemCost(item))) {
     run.posTool = slot;
     run.textItemIndex = undefined;
+    // The call was never shown, but it is placed: the execution waiting to be
+    // bound to this occurrence has to be told about it either way, or an
+    // approval for a call no subscriber can see would wait forever.
+    state.execution.bindInvocation(executionId, { invocationId });
     return;
   }
 
@@ -805,6 +832,10 @@ function openLiveToolCall(
     // A tool call ends the current text item: the next chunk starts a new one.
     run.textItemIndex = undefined;
   });
+  // The occurrence reaches subscribers before anything may be asked about it:
+  // the approval for this call is published only after the card it belongs to
+  // is queued for every connection that will receive it.
+  state.execution.bindInvocation(executionId, { invocationId });
 }
 
 /**
@@ -828,6 +859,17 @@ function closeLiveToolCall(
   if (open.callId !== event.callId || open.name !== event.name) {
     throw new ProjectionError("a tool result did not match the open call");
   }
+  if (event.executionId === undefined || event.executionId !== open.executionId) {
+    // A result that answers a different execution than the one this occurrence
+    // opened — or one with no execution at all — is not this call's outcome.
+    throw new ProjectionError("a tool result did not answer the open call's execution");
+  }
+  const disposition = event.disposition;
+  if (disposition === undefined) {
+    // A managed result always knows whether the tool ran; without it the card
+    // could not tell an executed failure from a call that never ran.
+    throw new ProjectionError("a tool result carries no execution disposition");
+  }
   if (open.index === undefined) {
     // The call was never shown, so there is nothing to fill in; the result was
     // still matched, which is what the canonical turn needs.
@@ -843,7 +885,7 @@ function closeLiveToolCall(
 
   const filled = Object.freeze({
     ...previous,
-    result: Object.freeze({ ok: event.ok, content: event.content }),
+    result: Object.freeze({ ok: event.ok, content: event.content, disposition }),
   });
   // The result is the largest thing an occurrence ever carries, so it is what
   // the live budget is really spent on — measured as the item will encode, not
@@ -855,7 +897,7 @@ function closeLiveToolCall(
     return;
   }
 
-  const build = runToolResultEvent(run, open.invocationId, event.ok, event.content);
+  const build = runToolResultEvent(run, open.invocationId, event.ok, event.content, disposition);
   commitLive(state, build, () => {
     run.live[index] = filled;
     run.liveBytes += liveItemCost(filled) - liveItemCost(previous);
@@ -1140,5 +1182,9 @@ function storedError(code: string | null): ProtocolError | null {
 export function markStorageFault(state: HostState): void {
   if (state.storageFault) return;
   state.storageFault = true;
+  // Every approval wait and every rendezvous is woken before the connections
+  // go: the host can no longer vouch for outcomes, and a run parked on a
+  // question whose answer it could not confirm would hold the registry forever.
+  state.execution.wakeAll();
   for (const connection of [...state.connections]) closeConnection(state, connection);
 }

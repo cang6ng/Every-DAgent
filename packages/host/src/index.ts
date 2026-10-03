@@ -18,3 +18,4 @@ export type {
   TrustedComposition,
 } from "./composition.js";
 export type { HostSettings } from "./settings.js";
+export type { ToolPolicy, ToolPolicyDecision, ToolPolicyView } from "./policy.js";

@@ -22,13 +22,28 @@ import { PROTOCOL_VERSION, encodeFrame, validateMessage } from "@every-dagent/pr
 import { hostRequestCancelledEvent, publishEventTo, sendFrame } from "./connection.js";
 import type { ConnectionState, HostState, ReversePendingEntry } from "./state.js";
 
-/** One test-only reverse profile. The production catalog is empty. */
+/**
+ * One reverse profile: what makes a method real.
+ *
+ * `tool.approval` is the one production profile; test compositions may add
+ * their own through `HostInternals`. A profile's two contracts decide what may
+ * be sent and what may be accepted; its optional `claim` is the method's
+ * *business* half, and it runs synchronously in the frame path for an accepted
+ * answer — before the waiting caller is resolved, so the order two
+ * near-simultaneous answers were received in is the order they are decided in.
+ *
+ * A claim returns `false` only for an answer this connection may not send at
+ * all (a protocol violation, which ends it). An answer that is legal but
+ * arrives too late to change anything returns `true`: the frame was read, and
+ * its business effect is exactly nothing.
+ */
 export interface ReverseProfile {
   readonly method: string;
   /** The strict contract for this method's params; anything else is not sendable. */
   readonly acceptsParams: (params: JsonValue) => boolean;
   /** The strict contract for the client's answer; anything else is a connection fault. */
   readonly acceptsResult: (result: JsonValue) => boolean;
+  readonly claim?: (pending: ReversePendingEntry, result: JsonValue) => boolean;
 }
 
 /** How one reverse request ended. `reason` values are local and never travel. */
@@ -48,11 +63,21 @@ export interface ReverseRequestHandle {
   readonly outcome: Promise<ReverseOutcome>;
   /** Stops waiting and tells the client why; the answer is ignored from here on. */
   cancel(): void;
+  /** The request id this request went out under; absent when it never went out. */
+  readonly requestId?: string;
 }
 
 /** The narrow trigger one connection exposes for tests; production never sees it. */
 export interface ReverseTrigger {
-  request(method: string, params: JsonValue, timeoutMs: number): ReverseRequestHandle;
+  /**
+   * Sends one reverse request and installs its wait.
+   *
+   * `context` is the caller's own bookkeeping for this request (the business
+   * record a delivery belongs to); it travels on the pending entry and is
+   * handed back to the profile's `claim` exactly as it was given, so nothing
+   * has to be looked up by request id afterwards.
+   */
+  request(method: string, params: JsonValue, timeoutMs: number, context?: unknown): ReverseRequestHandle;
 }
 
 export interface ReverseTimer {
@@ -98,8 +123,19 @@ export function createReverseConnectionState(
   readonly requestIds: Set<string>;
   counter: number;
 } {
+  const byMethod = new Map<string, ReverseProfile>();
+  for (const profile of profiles) {
+    // Two profiles for one method would make "what may be sent" depend on
+    // registration order: the second would silently win, and an answer would be
+    // judged by a contract the question was never asked under.
+    if (byMethod.has(profile.method)) {
+      throw new Error(`the reverse method "${profile.method}" is registered twice`);
+    }
+    byMethod.set(profile.method, profile);
+  }
+
   return {
-    profiles: new Map(profiles.map((profile) => [profile.method, profile])),
+    profiles: byMethod,
     pending: new Map(),
     requestIds: new Set(),
     counter: 0,
@@ -121,7 +157,12 @@ export function createReverseTrigger(
   connection: ConnectionState,
 ): ReverseTrigger {
   return {
-    request: (method: string, params: JsonValue, timeoutMs: number): ReverseRequestHandle => {
+    request: (
+      method: string,
+      params: JsonValue,
+      timeoutMs: number,
+      context?: unknown,
+    ): ReverseRequestHandle => {
       let settle!: (outcome: ReverseOutcome) => void;
       const outcome = new Promise<ReverseOutcome>((resolve) => {
         settle = resolve;
@@ -168,6 +209,7 @@ export function createReverseTrigger(
         settle,
         sent: false,
         timer: undefined,
+        ...(context === undefined ? {} : { context }),
       };
       // The entry exists before the wait does: a deadline that has already
       // passed fires inside `scheduleDeadline`, and it has to find something
@@ -189,6 +231,7 @@ export function createReverseTrigger(
         cancel: (): void => {
           cancelReversePending(state, connection, pending, "cancelled");
         },
+        requestId,
       };
     },
   };
