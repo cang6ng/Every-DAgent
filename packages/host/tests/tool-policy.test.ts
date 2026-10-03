@@ -79,12 +79,26 @@ function namePolicy(options: {
   } as unknown as ToolPolicy;
 }
 
-async function waitFor(condition: () => boolean, what: string, attempts = 400): Promise<void> {
+async function waitFor(condition: () => boolean, what: string, attempts = 200): Promise<void> {
+  if (await waitUntil(condition, attempts)) return;
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+/**
+ * The same wait, without the throw.
+ *
+ * A test that is *about* something not happening — a call that must not run, a
+ * delivery that must not be re-offered — cannot assert it by timing out: the
+ * timeout would be the failure message instead of the fact. These waits settle
+ * quietly, and the assertions that follow are what fail when the behaviour is
+ * wrong.
+ */
+async function waitUntil(condition: () => boolean, attempts = 120): Promise<boolean> {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    if (condition()) return;
+    if (condition()) return true;
     await flush();
   }
-  throw new Error(`timed out waiting for ${what}`);
+  return condition();
 }
 
 interface OpenApproval {
@@ -454,7 +468,8 @@ describe("approvals", () => {
       policy: namePolicy({ requireApproval: ["counter"] }),
     });
 
-    await waitFor(() => approvals.length === 1, "the approval request");
+    await waitUntil(() => approvals.length >= 1);
+    expect(approvals).toHaveLength(1);
     expect(counter.executions).toEqual([]);
     const snapshot = approvals[0]?.request.params as ApprovalSnapshot;
     expect(snapshot.status).toBe("pending");
@@ -466,6 +481,14 @@ describe("approvals", () => {
     // And the delivery window is the whole remaining business deadline.
     expect(approvals[0]?.request.timeoutMs).toBe(120_000);
 
+    // The approval is keyed to the occurrence this host's own projection made:
+    // the live card and the approval carry one invocation id, which is what a
+    // client needs to place the question next to the call it is about.
+    const live = (await client.call("runs.get", { runId })).result?.run.live ?? [];
+    const card = live.find((item) => item.kind === "tool");
+    expect(card?.kind === "tool" && card.invocationId).toBe(snapshot.invocationId);
+    expect(card?.kind === "tool" && card.executionId).toBe(snapshot.executionId);
+
     approvals[0]?.answer.respond({
       approvalId: snapshot.approvalId,
       executionId: snapshot.executionId,
@@ -476,7 +499,7 @@ describe("approvals", () => {
     expect(counter.executions).toEqual([{ n: 1 }]);
   });
 
-  it("keeps duplicate and late approvals from dispatching twice", async () => {
+  it("keeps duplicate and late approvals from dispatching twice, or deciding twice", async () => {
     const counter = countingTool();
     const { client, approvals, runId } = await runToApproval({
       tool: counter.tool,
@@ -486,13 +509,20 @@ describe("approvals", () => {
     const snapshot = approvals[0]?.request.params as ApprovalSnapshot;
     const answer = { approvalId: snapshot.approvalId, executionId: snapshot.executionId, decision: "approve" };
 
+    // Three answers, sent back to back: the decision, a duplicate of it, and a
+    // contradictory one. All three are read; only the first is a decision.
     approvals[0]?.answer.respond(answer);
-    // A second answer for the same approval: the request is already settled, so
-    // the frame is validated and dropped — no second decision, no second run.
     approvals[0]?.answer.respond(answer);
+    approvals[0]?.answer.respond({ ...answer, decision: "reject" });
 
     expect((await terminalOf(client, runId)).status).toBe("completed");
     expect(counter.executions).toEqual([{ n: 1 }]);
+    const decided = client.events.filter((event) => event.type === "approval.updated");
+    // The approval was decided once, and no later frame re-opened it: the
+    // duplicate and the contradiction changed nothing, not even the state the
+    // Host published.
+    expect(decided.some((event) => event.payload.approval?.status === "denied")).toBe(false);
+    expect(decided.filter((event) => event.payload.approval?.status === "approved")).toHaveLength(1);
   });
 
   it("records a rejection as a not-executed observation and continues", async () => {
@@ -625,7 +655,9 @@ describe("approvals", () => {
     const second = connectApprovals(composed, approvals);
     await second.describe();
     await second.call("subscriptions.open", {});
-    await waitFor(() => approvals.length === 2, "the re-offered approval");
+    await waitUntil(() => approvals.length >= 2);
+    // The approval is still the Host's, and the new stream is asked about it.
+    expect(approvals).toHaveLength(2);
 
     const again = approvals[1]?.request.params as ApprovalSnapshot;
     // The same business approval, delivered again: same identities, same exact
@@ -646,6 +678,241 @@ describe("approvals", () => {
     expect((await terminalOf(second, runId)).status).toBe("completed");
     expect(counter.executions).toEqual([{ n: 1 }]);
     second.detach();
+  });
+
+  it("refuses to dispatch when the run was cancelled before the approval was decided", async () => {
+    const counter = countingTool();
+    const { client, approvals, runId } = await runToApproval({
+      tool: counter.tool,
+      policy: namePolicy({ requireApproval: ["counter"] }),
+    });
+    await waitFor(() => approvals.length === 1, "the approval request");
+
+    await client.call("runs.cancel", { runId });
+    const terminal = await terminalOf(client, runId);
+
+    expect(terminal.status).toBe("cancelled");
+    expect(counter.executions).toEqual([]);
+  });
+
+  it("decides the approve/cancel race deterministically, and dispatches at most once", async () => {
+    const counter = countingTool();
+    const { client, approvals, runId } = await runToApproval({
+      tool: counter.tool,
+      policy: namePolicy({ requireApproval: ["counter"] }),
+    });
+    await waitFor(() => approvals.length === 1, "the approval request");
+    const snapshot = approvals[0]?.request.params as ApprovalSnapshot;
+
+    // The approval is claimed first, synchronously, in the frame path; the
+    // cancellation arrives while the execution is authorized but not yet
+    // dispatched. The guard decides: the call does not run, and the run does
+    // not claim to have completed it.
+    approvals[0]?.answer.respond({
+      approvalId: snapshot.approvalId,
+      executionId: snapshot.executionId,
+      decision: "approve",
+    });
+    await client.call("runs.cancel", { runId });
+
+    const terminal = await terminalOf(client, runId);
+    expect(terminal.status).toBe("cancelled");
+    expect(counter.executions).toEqual([]);
+  });
+
+  it("lets a cancel after dispatch only ask for an abort, and keeps the disposition executed", async () => {
+    const starts: (() => void)[] = [];
+    const tool = {
+      name: "counter",
+      description: "The counter tool.",
+      inputSchema: { type: "object" },
+      async execute(_input: unknown, context: { readonly signal: AbortSignal }): Promise<string> {
+        await new Promise<void>((resolve) => {
+          starts.push(resolve);
+          context.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return "settled after the abort";
+      },
+    } as unknown as Tool;
+    const { client, approvals, runId, composed, sessionId } = await runToApproval({
+      tool,
+      policy: namePolicy({ requireApproval: ["counter"] }),
+    });
+    await waitFor(() => approvals.length === 1, "the approval request");
+    const snapshot = approvals[0]?.request.params as ApprovalSnapshot;
+
+    approvals[0]?.answer.respond({
+      approvalId: snapshot.approvalId,
+      executionId: snapshot.executionId,
+      decision: "approve",
+    });
+    await waitFor(() => starts.length === 1, "the tool to start");
+
+    // The execution already exists: cancelling asks for an abort, and the
+    // record says the call was dispatched — never that it did not happen.
+    await client.call("runs.cancel", { runId });
+    starts[0]?.();
+    const terminal = await terminalOf(client, runId);
+
+    expect(terminal.status).toBe("cancelled");
+    const records = composed.repository.readHistory(sessionId, 100, 50).records;
+    const result = records.find((record) => record.type === "tool/result");
+    expect(result?.data).toContain('"disposition":"executed"');
+  });
+
+  it("keeps the approval's exact input even when the tool rewrites what it was handed", async () => {
+    const seen: unknown[] = [];
+    const tool = {
+      name: "counter",
+      description: "The counter tool.",
+      inputSchema: { type: "object" },
+      async execute(input: { n: number }): Promise<string> {
+        seen.push({ ...input });
+        input.n = 4242;
+        return "rewritten";
+      },
+    } as unknown as Tool;
+    const { client, approvals, runId, composed, sessionId } = await runToApproval({
+      tool,
+      policy: namePolicy({ requireApproval: ["counter"] }),
+    });
+    await waitFor(() => approvals.length === 1, "the approval request");
+    const snapshot = approvals[0]?.request.params as ApprovalSnapshot;
+    expect(snapshot.input).toEqual({ kind: "json", value: { n: 1 } });
+
+    approvals[0]?.answer.respond({
+      approvalId: snapshot.approvalId,
+      executionId: snapshot.executionId,
+      decision: "approve",
+    });
+    expect((await terminalOf(client, runId)).status).toBe("completed");
+
+    expect(seen).toEqual([{ n: 1 }]);
+    // The tool's own copy was rewritten; the approval that authorized the call
+    // and the canonical fact that records it were not.
+    const records = composed.repository.readHistory(sessionId, 100, 50).records;
+    expect(records.find((record) => record.type === "tool/call")?.data).not.toContain("4242");
+  });
+
+  it("never re-shortens the delivery window on reconnect", async () => {
+    const clock = testClock();
+    const counter = countingTool();
+    const { client, approvals, composed, runId } = await runToApproval({
+      tool: counter.tool,
+      policy: namePolicy({ requireApproval: ["counter"] }),
+      clock,
+    });
+    await waitFor(() => approvals.length === 1, "the approval request");
+    expect(approvals[0]?.request.timeoutMs).toBe(120_000);
+
+    // Thirty of the business window's seconds pass, the client drops and comes
+    // back: the new delivery gets the *rest* of the window, not a fresh one.
+    clock.advanceWithoutTimers(30_000);
+    client.detach();
+    await flush();
+
+    const second = connectApprovals(composed, approvals);
+    await second.describe();
+    await second.call("subscriptions.open", {});
+    await waitFor(() => approvals.length === 2, "the re-offered approval");
+    expect(approvals[1]?.request.timeoutMs).toBe(90_000);
+
+    const snapshot = approvals[1]?.request.params as ApprovalSnapshot;
+    approvals[1]?.answer.respond({
+      approvalId: snapshot.approvalId,
+      executionId: snapshot.executionId,
+      decision: "approve",
+    });
+    expect((await terminalOf(second, runId)).status).toBe("completed");
+    expect(counter.executions).toEqual([{ n: 1 }]);
+    second.detach();
+  });
+
+  it("ignores an answer that arrives on a connection the request was not sent to", async () => {
+    const counter = countingTool();
+    const { client, approvals, composed, runId } = await runToApproval({
+      tool: counter.tool,
+      policy: namePolicy({ requireApproval: ["counter"] }),
+    });
+    await waitFor(() => approvals.length === 1, "the approval request");
+    const snapshot = approvals[0]?.request.params as ApprovalSnapshot;
+
+    // A second connection knows the request id and tries to answer it: the
+    // host's pending ledger belongs to the connection the request went out on,
+    // so this frame is read, validated and dropped.
+    const stranger = connect(composed.host, { reverseRequests: true });
+    await stranger.describe();
+    await stranger.call("subscriptions.open", {});
+    stranger.sendRaw(
+      JSON.stringify({
+        kind: "client-response",
+        protocolVersion: "2",
+        hostInstanceId: stranger.hostInstanceId,
+        streamId: approvals[0]?.request.streamId,
+        requestId: approvals[0]?.request.requestId,
+        result: { approvalId: snapshot.approvalId, executionId: snapshot.executionId, decision: "approve" },
+      }),
+    );
+    await flush();
+    expect(counter.executions).toEqual([]);
+
+    // The real delivery still decides.
+    approvals[0]?.answer.respond({
+      approvalId: snapshot.approvalId,
+      executionId: snapshot.executionId,
+      decision: "approve",
+    });
+    expect((await terminalOf(client, runId)).status).toBe("completed");
+    expect(counter.executions).toEqual([{ n: 1 }]);
+    stranger.detach();
+  });
+
+  it("refuses a group whose approval could never travel in one frame", async () => {
+    const counter = countingTool();
+    // NUL escapes six times over: 45 KiB of them cannot fit a 256 KiB frame
+    // once the run and the catalogue travel with them.
+    const oversized = { pad: "\u0000".repeat(45 * 1024) };
+    const composed = await composeTestHost({
+      modelClient: scriptedModel([toolReply("call-1", "counter", oversized), textReply("never reached")]).client,
+      plugins: [testPlugin({ id: "tools", tools: [counter.tool] })],
+      toolPolicy: namePolicy({ requireApproval: ["counter"] }),
+    });
+    open.push(composed);
+
+    const { terminal } = await runSimple(composed);
+
+    // The prospective check runs before the step is declared, so the group is
+    // refused whole: nothing was recorded and nothing ran.
+    expect(terminal.status).toBe("failed");
+    expect(counter.executions).toEqual([]);
+    const records = composed.repository.readHistory(
+      composed.repository.listSessions(1, null).records[0]?.sessionId as string,
+      100,
+      50,
+    ).records;
+    expect(records.some((record) => record.type === "tool/call")).toBe(false);
+  });
+
+  it("asks nobody when no capable client is connected, and lets the approval expire", async () => {
+    const clock = testClock();
+    const counter = countingTool();
+    const { composed, approvals } = await runToApproval({
+      tool: counter.tool,
+      policy: namePolicy({ requireApproval: ["counter"] }),
+      clock,
+    });
+    await waitFor(() => approvals.length === 1, "the approval request");
+
+    // A capable connection that never subscribes gets nothing: the delivery
+    // lives on a stream, and there is no stream to ask on.
+    const capable = connect(composed.host, { reverseRequests: true });
+    await capable.describe();
+    await flush();
+    expect(approvals).toHaveLength(1);
+
+    await clock.advance(120_000);
+    expect(counter.executions).toEqual([]);
+    capable.detach();
   });
 
   it("keeps the execution lease while an approval is pending", async () => {

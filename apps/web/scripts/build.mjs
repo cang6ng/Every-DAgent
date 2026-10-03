@@ -40,6 +40,21 @@ export async function buildApp(options = {}) {
     logLevel: quiet ? "silent" : "info",
   });
 
+  // The M4 approval harness: a second browser entry, served next to the shell.
+  // It is not part of the shell bundle and the shell never imports it — M5 owns
+  // the real approval UX — but the browser gate drives this page as a real
+  // browser answering a real approval.
+  const harness = await build({
+    entryPoints: [join(root, "src", "browser", "approval-harness.ts")],
+    outfile: join(outDir, "public", "approval-harness.js"),
+    bundle: true,
+    format: "esm",
+    platform: "browser",
+    target: ["es2022"],
+    metafile: true,
+    logLevel: quiet ? "silent" : "info",
+  });
+
   const server = await build({
     entryPoints: [join(root, "src", "server", "main.ts")],
     outfile: join(outDir, "server.mjs"),
@@ -52,12 +67,18 @@ export async function buildApp(options = {}) {
   });
 
   await writeFile(join(outDir, "browser-metafile.json"), JSON.stringify(browser.metafile, null, 2));
+  await writeFile(join(outDir, "harness-metafile.json"), JSON.stringify(harness.metafile, null, 2));
   await writeFile(join(outDir, "server-metafile.json"), JSON.stringify(server.metafile, null, 2));
 
   // The page last: the bundles above live in the same folder.
   await cp(join(root, "public"), join(outDir, "public"), { recursive: true });
 
-  return { outDir, browserMetafile: browser.metafile, serverMetafile: server.metafile };
+  return {
+    outDir,
+    browserMetafile: browser.metafile,
+    harnessMetafile: harness.metafile,
+    serverMetafile: server.metafile,
+  };
 }
 
 const entry = process.argv[1] === undefined ? "" : pathToFileURL(process.argv[1]).href;

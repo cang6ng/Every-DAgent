@@ -43,6 +43,7 @@ const TRANSPORT_FILES = [
 /** The browser shell, as approved for P3.4. */
 const BROWSER_FILES = [
   "browser/App.tsx",
+  "browser/approval-harness.ts",
   "browser/Composer.tsx",
   "browser/ConnectionStatus.tsx",
   "browser/ConnectionPanel.tsx",

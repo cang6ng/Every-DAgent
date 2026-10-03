@@ -140,6 +140,17 @@ function decide(snapshot: ApprovalSnapshot, decision: "approve" | "reject"): Too
   return { approvalId: snapshot.approvalId, executionId: snapshot.executionId, decision };
 }
 
+describe("the generation the approvals travel in", () => {
+  it("is still v2, with the approvals capability claimed truthfully", async () => {
+    const harness = await approvalPlatform({});
+    const description = harness.client.getSnapshot().description;
+    expect(description?.protocolVersion).toBe("2");
+    expect(description?.capabilities.approvals).toBe(true);
+    expect(description?.capabilities.reverseRequests).toBe(true);
+    await waitFor(() => harness.snapshots.length === 1, { what: "the approval" });
+  });
+});
+
 describe("a tool approval over the wire", () => {
   it("runs nothing before the approval and exactly one thing after it", async () => {
     const harness = await approvalPlatform({});

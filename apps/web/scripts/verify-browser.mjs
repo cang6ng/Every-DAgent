@@ -65,6 +65,15 @@ const REQUIRED = [
       "treats a restarted host as a different host",
     ],
   },
+  {
+    // M4's own carrier acceptance: the browser answers a real tool approval.
+    file: "apps/web/tests/shell-approval.browser.test.ts",
+    titles: [
+      "runs nothing until the browser approves, then runs exactly once",
+      "runs nothing when the browser rejects, and says so",
+      "keeps the approval answerable across a reconnect, and runs it once after approving",
+    ],
+  },
 ];
 
 function findBrowser() {

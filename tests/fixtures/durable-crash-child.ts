@@ -25,6 +25,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { ModelClient, ModelEvent, ModelRequest, RuntimeContext, Tool } from "@every-dagent/agent-core";
 import { createClient } from "@every-dagent/client";
 import { createHost } from "@every-dagent/host";
+import type { ToolPolicy } from "@every-dagent/host";
 import type { ProtocolChannel, ProtocolChannelListener } from "@every-dagent/protocol";
 import type { Plugin } from "@every-dagent/plugin-system";
 
@@ -213,13 +214,36 @@ function countingTool(): Plugin {
 // The run.
 // ---------------------------------------------------------------------------
 
+/**
+ * The M4 phase: a run parked on a pending approval.
+ *
+ * No SQL boundary is armed — the interesting fact is not a transaction but
+ * what a kill leaves *without* one: the approval is memory the dying process
+ * held, the run is unfinished in the store, and nothing in the file may claim
+ * otherwise. The tool must never have run, which is what the journal shows.
+ */
+async function approvalPhase(): Promise<boolean> {
+  return phase === "approval-pending";
+}
+
 async function main(): Promise<void> {
-  armBoundary();
+  const parked = await approvalPhase();
+  if (!parked) armBoundary();
+
+  const policy: ToolPolicy | undefined = parked
+    ? {
+        revision: 1,
+        decide: () => "require-approval",
+      }
+    : undefined;
 
   const channel = channelPair();
   const host = await createHost({
     bootstrap: TEST_BOOTSTRAP,
-    composition: testComposition({ modelClient: crashModel() }),
+    composition: testComposition({
+      modelClient: crashModel(),
+      ...(policy === undefined ? {} : { toolPolicy: policy }),
+    }),
     plugins: [countingTool()],
     persistence: { kind: "sqlite", location: databasePath },
   });
@@ -239,6 +263,23 @@ async function main(): Promise<void> {
   journal({ kind: "session-created", sessionId: session.sessionId });
 
   await client.runs.start({ sessionId: session.sessionId, submissionId: SUBMISSION_ID, text: "hello" });
+
+  if (parked) {
+    // The host holds the approval in memory and waits. The parent kills the
+    // process from here: no transaction boundary is involved, and the journal's
+    // lack of a `tool-execution` entry is what proves nothing ran.
+    for (let attempt = 0; attempt < 2_000; attempt += 1) {
+      if (client.getSnapshot().presentation?.approval !== null) {
+        journal({ kind: "approval-pending" });
+        park("approval-pending");
+      }
+      await new Promise((resolve) => {
+        setTimeout(resolve, 5);
+      });
+    }
+    process.stderr.write("the approval never became pending\n");
+    process.exit(6);
+  }
 
   // The run is executing; the boundary (armed below the repository) is what
   // ends this process. Parking on a timer keeps it alive until the parent's

@@ -34,6 +34,8 @@ export const MARKER = {
   slow: "慢慢来",
   /** Call the calculator with an input that cannot be shown as JSON. */
   exotic: "奇怪输入",
+  /** Ask for the approval counter tool, then answer. */
+  counter: "计数",
   /** Anything else: echo a fixed sentence. */
 } as const;
 
@@ -189,6 +191,14 @@ export function offlineModel(): OfflineModel {
       return;
     }
 
+    if (text.includes(MARKER.counter) && !sawToolResult(request, "counter")) {
+      // The approval harness's tool: the host's trusted policy requires an
+      // approval for it, so this step parks in the Host until a browser answers.
+      yield { type: "tool-call", call: { callId: nextCallId(), name: "counter", input: { n: 1 } } };
+      yield { type: "done" };
+      return;
+    }
+
     if (text.includes(MARKER.calculator)) {
       const last = request.messages[request.messages.length - 1];
       const result = last !== undefined && last.role === "tool" ? last.results[0]?.content ?? "" : "";
@@ -201,6 +211,14 @@ export function offlineModel(): OfflineModel {
       const last = request.messages[request.messages.length - 1];
       const result = last !== undefined && last.role === "tool" ? last.results[0]?.content ?? "" : "";
       yield { type: "text-delta", text: `统计结果是 ${result}。` };
+      yield { type: "done" };
+      return;
+    }
+
+    if (text.includes(MARKER.counter)) {
+      const last = request.messages[request.messages.length - 1];
+      const result = last !== undefined && last.role === "tool" ? last.results[0]?.content ?? "" : "";
+      yield { type: "text-delta", text: `计数结果是 ${result}。` };
       yield { type: "done" };
       return;
     }

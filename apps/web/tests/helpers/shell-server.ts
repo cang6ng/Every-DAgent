@@ -233,6 +233,69 @@ function createWard(): Ward {
   };
 }
 
+export interface ApprovalAcceptance {
+  readonly host: Host;
+  readonly shell: ShellServer;
+  /** The page that answers approvals: the harness, not the shell. */
+  readonly harnessUrl: string;
+  /** Every value the counter tool was handed, in order. */
+  readonly executions: readonly unknown[];
+  close(): Promise<void>;
+}
+
+/**
+ * The M4 acceptance host: a tool the trusted policy will not run without an
+ * approval, and a browser to answer it.
+ *
+ * This is a *carrier* acceptance, not a UI one: the host runs a real loop with
+ * a real policy, the binding carries the `tool.approval` request to a real
+ * browser, and the page answers with the shipped client's typed handler. M5
+ * owns the shell's own approval experience, so the page here is deliberately
+ * the minimal harness rather than the shell.
+ */
+export async function startApprovalAcceptance(): Promise<ApprovalAcceptance> {
+  const outDir = await ensureShellBuild();
+  const model = offlineModel();
+  const executions: unknown[] = [];
+  const counter: Plugin = {
+    manifest: { id: "counter", name: "Counter", version: "1.0.0", description: "Counts one call per approval." },
+    activate(context: PluginContext): void {
+      context.tools.register({
+        name: "counter",
+        description: "Counts.",
+        inputSchema: { type: "object" },
+        execute: async (input: unknown): Promise<string> => {
+          executions.push(input);
+          return `count:${executions.length}`;
+        },
+      });
+    },
+  };
+
+  const host = await createHost({
+    bootstrap: TEST_BOOTSTRAP,
+    composition: testComposition({
+      modelClient: model.client,
+      // The trusted side decides: this tool is a side effect, and the Host will
+      // not run it without a client's approval.
+      toolPolicy: { revision: 1, decide: () => "require-approval" },
+    }),
+    plugins: [counter],
+  });
+  const shell = await startShellServer({ host, staticRoot: join(outDir, "public") });
+
+  return {
+    host,
+    shell,
+    harnessUrl: `${new URL(shell.pageUrl).origin}/approval-harness.html?binding=${encodeURIComponent(shell.bindingOrigin)}`,
+    executions,
+    async close(): Promise<void> {
+      await shell.close();
+      await host.shutdown();
+    },
+  };
+}
+
 export async function startShellAcceptance(options: ShellAcceptanceOptions = {}): Promise<ShellAcceptance> {
   const outDir = await ensureShellBuild();
   const model = offlineModel();

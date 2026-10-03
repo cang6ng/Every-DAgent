@@ -89,6 +89,7 @@ describe("the source tree is partitioned", () => {
     expect([...BROWSER_FILES].sort()).toEqual(
       [
         "browser/App.tsx",
+        "browser/approval-harness.ts",
         "browser/Composer.tsx",
         "browser/ConnectionStatus.tsx",
         "browser/ConnectionPanel.tsx",

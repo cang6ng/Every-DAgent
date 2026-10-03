@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Every-DAgent — approval harness</title>
+  </head>
+  <body>
+    <h1>Tool approval harness</h1>
+    <p>
+      This is not the Shell. It is the minimal carrier acceptance for M4: a real
+      client, in a real browser, answering a real tool approval with two clicks.
+      M5 owns the actual approval UX.
+    </p>
+
+    <section>
+      <button id="start" data-testid="start-run">开始一次运行</button>
+      <button id="reconnect" data-testid="reconnect">重连</button>
+      <dl>
+        <dt>harness</dt>
+        <dd><span id="harness" data-testid="harness-status">starting</span></dd>
+        <dt>connection</dt>
+        <dd><span id="connection-status" data-testid="connection-status">connecting</span></dd>
+        <dt>sessions</dt>
+        <dd><span id="sessions" data-testid="session-count">0</span></dd>
+        <dt>run</dt>
+        <dd><span id="run-status" data-testid="run-status">none</span></dd>
+        <dt>live items</dt>
+        <dd><span id="live-items" data-testid="live-items">0</span></dd>
+        <dt>tool result</dt>
+        <dd><span id="tool-result" data-testid="tool-result">none</span></dd>
+        <dt>can respond</dt>
+        <dd><span id="approval-can-respond" data-testid="approval-can-respond">false</span></dd>
+        <dt>reply state</dt>
+        <dd><span id="reply-state" data-testid="reply-state">none</span></dd>
+      </dl>
+    </section>
+
+    <section id="approval-card" data-testid="approval-card" data-visible="false">
+      <h2>Approval</h2>
+      <p>tool: <span id="approval-name" data-testid="approval-name"></span></p>
+      <p>status: <span id="approval-status" data-testid="approval-status"></span></p>
+      <pre id="approval-input" data-testid="approval-input"></pre>
+      <button id="approve" data-testid="approve">批准</button>
+      <button id="reject" data-testid="reject">拒绝</button>
+    </section>
+
+    <script type="module" src="/approval-harness.js"></script>
+  </body>
+</html>

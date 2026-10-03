@@ -138,6 +138,10 @@ describe("the shell when things go wrong, in a real browser", () => {
       const { session } = await openShell();
 
       await createSession(session);
+      // The tool has to exist: a managed step that names a tool the registry
+      // does not have is refused before anything runs, which is a different
+      // outcome than the step budget this case is about.
+      await enablePlugin(session, "calculator");
       await sendText(session, "一直做");
 
       await session.waitFor(runStatus, (value) => value.includes("达到步数上限"), 30000, "the limited run");
