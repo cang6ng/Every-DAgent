@@ -602,6 +602,7 @@ describe("the host panel and the whole shell", () => {
         getSnapshot: () => disconnected,
         getState: () => disconnected,
         subscribe: () => () => undefined,
+        registerToolApprovalHandler: () => undefined,
         sessions: {
           list: async () => ({ sessions: presentation().sessions }),
           create: async () => ({ session: session() }),

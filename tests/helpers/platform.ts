@@ -44,6 +44,13 @@ export interface HostPlatformOptions extends Omit<HostOptions, "bootstrap" | "co
   readonly catalog?: readonly TestCatalogEntry[];
   /** What the fixture composition decides about tool calls; absent allows every tool. */
   readonly toolPolicy?: import("@every-dagent/host").ToolPolicy;
+  /**
+   * The monotonic clock approval deadlines are measured against.
+   *
+   * Absent, the host uses the system clock — which is what every test except an
+   * expiry test wants, because the approval profile is a fixed 120 seconds.
+   */
+  readonly clock?: import("../../packages/host/src/execution.js").HostClock;
   /** The defaults a store with no configuration is initialized from. */
   readonly bootstrap?: BootstrapSettings;
   /** A trusted composition of the test's own, replacing the fixture one. */
@@ -65,7 +72,7 @@ export interface HostPlatform {
 /** The host plus a memory-carrier channel source. */
 export async function createHostPlatform(options: HostPlatformOptions): Promise<HostPlatform> {
   const attached: AttachedConnection[] = [];
-  const { modelClient, catalog, bootstrap, composition, toolPolicy, reverseProfiles, ...hostOptions } = options;
+  const { modelClient, catalog, bootstrap, composition, toolPolicy, reverseProfiles, clock, ...hostOptions } = options;
   const composed = await composeHost(
     {
       ...hostOptions,
@@ -80,6 +87,7 @@ export async function createHostPlatform(options: HostPlatformOptions): Promise<
     },
     {
       ...(reverseProfiles === undefined ? {} : { reverseProfiles }),
+      ...(clock === undefined ? {} : { clock }),
       onAttach: (connection) => {
         attached.push(connection);
       },

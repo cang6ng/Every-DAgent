@@ -38,9 +38,10 @@ describe("host description", () => {
         sessionMutations: true,
         // Reads and CAS writes by namespace, wired end to end in this build.
         settings: true,
-        // In the frozen v2 inventory but not implemented by this milestone,
-        // reported as `false` rather than left out.
-        approvals: false,
+        // Wired end to end in this build: prepared execution, trusted policy,
+        // the in-memory approval with its deadline, the `tool.approval`
+        // profile and the dispatch guard.
+        approvals: true,
       },
       clientCapabilities: { reverseRequests: false },
       limits: { maxActiveRuns: 1 },

@@ -10,6 +10,8 @@
  */
 
 export { createClient } from "./client.js";
+export type { ToolApprovalHandler } from "./client.js";
+export type { ApprovalReplyState } from "./store.js";
 export type { Client, ClientOptions } from "./client.js";
 
 export { ClientError } from "./errors.js";

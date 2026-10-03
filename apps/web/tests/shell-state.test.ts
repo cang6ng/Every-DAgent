@@ -171,6 +171,11 @@ interface FakeCall {
 }
 
 class FakeClient implements Client {
+  registerToolApprovalHandler(): void {
+    // The shell never answers approvals; the browser acceptance drives that
+    // through a real client.
+  }
+
   readonly calls: FakeCall[] = [];
   onConnect: (() => Promise<void>) | undefined;
   onReconnect: (() => Promise<void>) | undefined;

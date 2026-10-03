@@ -16,6 +16,8 @@ import type { JsonValue, ProtocolError } from "@every-dagent/protocol";
 
 /** What a handler is told about the request it is answering. */
 export interface ReverseHandlerContext {
+  /** The host's own request id; an answer for it must carry this id. */
+  readonly requestId: string;
   readonly method: string;
   /** The host's own communication deadline; the local wait is bounded by it too. */
   readonly timeoutMs: number;

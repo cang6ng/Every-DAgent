@@ -100,6 +100,7 @@ export type FakeEvent =
     }
   | { readonly type: "plugin.updated"; readonly plugin: PluginSummary }
   | { readonly type: "collection.invalidated"; readonly collections: CollectionRevisions }
+  | { readonly type: "approval.updated"; readonly approval: ApprovalSnapshot | null }
   | {
       readonly type: "host.request.cancelled";
       readonly requestId: string;
@@ -431,6 +432,14 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
     };
 
     switch (event.type) {
+      case "approval.updated":
+        sendEvent({
+          ...base,
+          type: "approval.updated",
+          scope: { kind: "host" },
+          payload: { approval: event.approval },
+        });
+        return;
       case "settings.updated":
         sendEvent({
           ...base,

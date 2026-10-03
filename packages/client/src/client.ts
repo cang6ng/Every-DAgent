@@ -13,12 +13,12 @@
 import type { OperationMap, ProtocolChannel } from "@every-dagent/protocol";
 
 import { ClientConnection } from "./connection.js";
-import type { ClientOptions } from "./connection.js";
-import { createReverseTable } from "./reverse.js";
+
+import type { ClientOptions, ToolApprovalHandler } from "./connection.js";
 import type { ReverseHandlerRegistration } from "./reverse.js";
 import type { ClientSnapshot } from "./store.js";
 
-export type { ClientOptions } from "./connection.js";
+export type { ClientOptions, ToolApprovalHandler } from "./connection.js";
 
 /**
  * Compose-only inputs, and the reason the package index does not export them.
@@ -32,6 +32,15 @@ export interface ClientInternals {
 }
 
 export interface Client {
+  /**
+   * Registers (or clears, with `undefined`) the handler that answers tool
+   * approvals.
+   *
+   * This is the only approval-facing entry point on a client: the profile is
+   * fixed, the payload is the Host's own snapshot, and the answer is one of two
+   * decisions about the execution the request named.
+   */
+  registerToolApprovalHandler(handler: ToolApprovalHandler | undefined): void;
   /** Establishes the connection and completes `describe` → `open`. Merges while one is in flight. */
   connect(): Promise<void>;
   /** Ends the current connection, if any, and establishes a fresh one. */
@@ -104,9 +113,12 @@ export function createClient(options: ClientOptions): Client {
 
 /** The real composition: `createClient` is this with no internals. */
 export function createClientWith(options: ClientOptions, internals: ClientInternals): Client {
-  const connection = new ClientConnection(options, createReverseTable(internals.reverseHandlers ?? []));
+  const connection = new ClientConnection(options, internals.reverseHandlers ?? []);
 
   return {
+    registerToolApprovalHandler: (handler: ToolApprovalHandler | undefined): void => {
+      connection.setToolApprovalHandler(handler);
+    },
     connect: (): Promise<void> => connection.connect(),
     reconnect: (): Promise<void> => connection.reconnect(),
     disconnect: (): void => connection.disconnect(),

@@ -100,9 +100,11 @@ const HOST_CAPABILITIES: HostCapabilities = Object.freeze({
   // them, a mutation is refused while the host is busy or its store unconfirmed,
   // and a subscriber is told which revisions moved.
   settings: true,
-  // Not implemented by this milestone, and said so rather than left out: a
-  // client can tell "not supported" from "not asked".
-  approvals: false,
+  // Real, end to end: the Core prepared the execution, this host decides with
+  // a trusted policy, an approval is held in memory with a deadline, the
+  // `tool.approval` profile asks a capable client, and the dispatch guard runs
+  // on the answer. Claimed only because every one of those is wired.
+  approvals: true,
 });
 
 /**

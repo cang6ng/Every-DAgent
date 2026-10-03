@@ -34,6 +34,7 @@
  */
 
 import type {
+  ApprovalSnapshot,
   ClientCapabilities,
   DecodedEnvelope,
   HostCapabilities,
@@ -44,6 +45,7 @@ import type {
   OperationMap,
   OperationName,
   ProtocolChannel,
+  ToolApprovalResponse,
   Watermark,
 } from "@every-dagent/protocol";
 import {
@@ -52,15 +54,18 @@ import {
   encodeFrame,
   validateJsonValue,
   validateMessage,
+  validateReverseParams,
+  validateReverseResult,
 } from "@every-dagent/protocol";
 
 import type { ClientMisuseReason, ConnectionLostReason, ProtocolViolationReason } from "./errors.js";
 import { ClientError, clientMisuse, connectionLost, protocolViolation, remoteError } from "./errors.js";
 import { applyHistoryPage, deepFreeze, foldEvent, foldHistoryEvent, foldLiveEvent, liveRefreshExtends } from "./fold.js";
 import { applySettingsSnapshot, foldSettingsEvent, forgetSettings, markSettingsStale } from "./settings.js";
-import type { ReverseHandlerContext, ReverseHandlerOutcome, ReverseTable } from "./reverse.js";
-import type { ClientSnapshot, ConnectionStatus, PresentationStore } from "./store.js";
-import { createStore } from "./store.js";
+import type { ReverseHandlerContext, ReverseHandlerOutcome, ReverseHandlerRegistration, ReverseTable } from "./reverse.js";
+import { createReverseTable } from "./reverse.js";
+import type { ApprovalReplyState, ClientSnapshot, ConnectionStatus, PresentationStore } from "./store.js";
+import { createStore, NO_APPROVAL_REPLY } from "./store.js";
 
 type ResponseEnvelope = Extract<DecodedEnvelope, { kind: "host-response" }>;
 type EventEnvelope = Extract<DecodedEnvelope, { kind: "host-event" }>;
@@ -216,6 +221,25 @@ export interface ClientOptions {
   /** How this client names itself to the host. */
   readonly client?: { readonly name: string; readonly version: string };
 }
+
+/**
+ * What this client does when a host asks it about one tool execution.
+ *
+ * The handler is handed the Host's own approval snapshot — immutable, complete,
+ * and exactly what the execution will run with — plus the delivery's abort
+ * signal. It answers about that one execution: the approval id and execution id
+ * it was given, and one of two decisions. Nothing else is expressible, which is
+ * the point: a client never modifies arguments and never invents an approval.
+ *
+ * A handler may take as long as the delivery lives (the Host's own deadline is
+ * the bound). If the delivery ends first — the stream replaced, the connection
+ * dropped, the request cancelled — the signal aborts and any answer the handler
+ * still returns is read and dropped.
+ */
+export type ToolApprovalHandler = (
+  snapshot: ApprovalSnapshot,
+  signal: AbortSignal,
+) => ToolApprovalResponse | Promise<ToolApprovalResponse>;
 
 const DEFAULT_CLIENT = Object.freeze({ name: "@every-dagent/client", version: "0.1.0" });
 
@@ -377,9 +401,129 @@ export class ClientConnection {
    */
   private lifecycle = 0;
 
-  constructor(options: ClientOptions, reverseTable: ReverseTable) {
+  private toolApprovalHandler: ToolApprovalHandler | undefined;
+
+  constructor(options: ClientOptions, reverseHandlers: readonly ReverseHandlerRegistration[]) {
     this.options = options;
-    this.reverseTable = reverseTable;
+    // The production table is built here, not handed in: `tool.approval` is a
+    // frozen profile this client implements, and a registration that could
+    // shadow it would be a second, differently-contracted answer to the same
+    // question. A duplicate name is refused where the table is built.
+    this.reverseTable = createReverseTable([
+      {
+        method: "tool.approval",
+        accepts: (params: JsonValue): boolean => validateReverseParams("tool.approval", params).success,
+        resultIsValid: (result: JsonValue): boolean => validateReverseResult("tool.approval", result).success,
+        handle: (params: JsonValue, context: ReverseHandlerContext): Promise<ReverseHandlerOutcome> =>
+          this.handleToolApproval(params as unknown as ApprovalSnapshot, context),
+      },
+      ...reverseHandlers,
+    ]);
+  }
+
+  /**
+   * The one typed seam for answering a tool approval, or clears it.
+   *
+   * There is deliberately no way to answer a raw reverse request, to pick a
+   * method, or to send arbitrary JSON: an approval answer is a statement about
+   * one execution, and this is the only shape that statement has.
+   */
+  setToolApprovalHandler(handler: ToolApprovalHandler | undefined): void {
+    this.toolApprovalHandler = handler;
+  }
+
+  /**
+   * Runs the registered handler for one `tool.approval` request.
+   *
+   * Every ending is safe and explicit. With no handler, the host is told the
+   * capability is not supported — the delivery ends and the Host's business
+   * approval is untouched. A handler that throws answers with a fixed internal
+   * error and never with its own words. An answer that names a different
+   * approval or execution than the request carried is refused the same way: a
+   * handler does not get to decide which execution it is answering about.
+   */
+  private async handleToolApproval(
+    snapshot: ApprovalSnapshot,
+    context: ReverseHandlerContext,
+  ): Promise<ReverseHandlerOutcome> {
+    const handler = this.toolApprovalHandler;
+    if (handler === undefined) {
+      return {
+        error: Object.freeze({
+          code: "CAPABILITY_NOT_SUPPORTED" as const,
+          message: "this client has no tool approval handler",
+        }),
+      };
+    }
+
+    this.setApprovalReply({
+      state: "pending",
+      requestId: context.requestId,
+      approvalId: snapshot.approvalId,
+      executionId: snapshot.executionId,
+    });
+
+    let answer: unknown;
+    try {
+      answer = await handler(snapshot, context.signal);
+    } catch {
+      this.setApprovalReply({
+        state: "failed",
+        approvalId: snapshot.approvalId,
+        executionId: snapshot.executionId,
+      });
+      return {
+        error: Object.freeze({
+          code: "INTERNAL_ERROR" as const,
+          message: "the tool approval handler failed",
+        }),
+      };
+    }
+
+    const validated = validateReverseResult("tool.approval", answer);
+    if (
+      !validated.success ||
+      validated.output.approvalId !== snapshot.approvalId ||
+      validated.output.executionId !== snapshot.executionId
+    ) {
+      this.setApprovalReply({
+        state: "failed",
+        approvalId: snapshot.approvalId,
+        executionId: snapshot.executionId,
+      });
+      return {
+        error: Object.freeze({
+          code: "INTERNAL_ERROR" as const,
+          message: "the tool approval handler answered about a different execution",
+        }),
+      };
+    }
+
+    // An answer for a delivery that already ended — the stream was replaced
+    // while the handler ran — never travels, and this client does not pretend
+    // it did. Whether a *sent* answer decides anything is the Host's to say:
+    // this client knows it sent a decision, and nothing more, until the Host's
+    // own approval state moves.
+    if (context.signal.aborted) {
+      this.setApprovalReply({
+        state: "closed",
+        approvalId: snapshot.approvalId,
+        executionId: snapshot.executionId,
+      });
+      return { result: validated.output as unknown as JsonValue };
+    }
+    this.setApprovalReply({
+      state: "sent",
+      approvalId: snapshot.approvalId,
+      executionId: snapshot.executionId,
+      decision: validated.output.decision,
+    });
+    return { result: validated.output as unknown as JsonValue };
+  }
+
+  /** One reply-state transition, published as its own fact. */
+  private setApprovalReply(reply: ApprovalReplyState): void {
+    this.store.update({ approvalReply: reply });
   }
 
   // -------------------------------------------------------------------------
@@ -869,6 +1013,10 @@ export class ClientConnection {
             presentationHost: "current",
             live: Object.freeze({}),
             history: Object.freeze({}),
+            // A cut is a new delivery world: whatever this client had in flight
+            // belonged to the previous stream, and the new one will ask again if
+            // there is still something to answer.
+            approvalReply: NO_APPROVAL_REPLY,
             stale: false,
             status: "ready",
             error: null,
@@ -1333,6 +1481,20 @@ export class ClientConnection {
     }
     const event = validated.output;
 
+    if (event.type === "approval.updated") {
+      // The Host has spoken about the approval this client answered about — or
+      // about none at all. Either way the local delivery is over, and the
+      // business snapshot is what says what was decided.
+      const current = this.store.get().approvalReply;
+      const approval = event.payload.approval;
+      if (
+        (current.state === "pending" || current.state === "sent") &&
+        (approval === null || approval.approvalId === current.approvalId)
+      ) {
+        this.setApprovalReply({ state: "closed", approvalId: current.approvalId, executionId: current.executionId });
+      }
+    }
+
     if (event.type === "host.request.cancelled") {
       // The host stopped waiting: the local handler must stop too, and no
       // answer may travel for this request any more.
@@ -1529,6 +1691,7 @@ export class ClientConnection {
     });
 
     const context: ReverseHandlerContext = {
+      requestId: request.requestId,
       method: request.method,
       timeoutMs: request.timeoutMs,
       hostInstanceId: identity.hostInstanceId,
@@ -1595,6 +1758,22 @@ export class ClientConnection {
     pending.timer?.cancel();
     pending.timer = undefined;
     pending.controller.abort();
+    this.closeApprovalReply();
+  }
+
+  /**
+   * Marks the local delivery over, keeping the business snapshot alone.
+   *
+   * A delivery that ended — cancelled, timed out, its stream replaced — is a
+   * fact about *this client*, and it never becomes an approval or a denial:
+   * what the Host decided arrives as the Host's own approval state, and a
+   * client that turned its own closed delivery into a decision would be
+   * answering for the Host.
+   */
+  private closeApprovalReply(): void {
+    const reply = this.store.get().approvalReply;
+    if (reply.state !== "pending" && reply.state !== "sent") return;
+    this.setApprovalReply({ state: "closed", approvalId: reply.approvalId, executionId: reply.executionId });
   }
 
   private abortReverseForStream(streamId: string): void {
@@ -1724,6 +1903,10 @@ export class ClientConnection {
     this.reversePendings.clear();
     this.reverseRequestIds.clear();
     this.sync = undefined;
+    // The connection this client had is gone, so its delivery is gone: the
+    // retained presentation may still show the Host's approval, and nothing
+    // here may still claim it can be answered.
+    this.store.update({ approvalReply: NO_APPROVAL_REPLY });
 
     // Everything local is finished before any foreign code runs: the attempt's
     // waiters, then the listeners, then the transport.

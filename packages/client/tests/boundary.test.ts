@@ -167,6 +167,7 @@ describe("public surface", () => {
       "getState",
       "plugins",
       "reconnect",
+      "registerToolApprovalHandler",
       "resync",
       "runs",
       "sessions",
