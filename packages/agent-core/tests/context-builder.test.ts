@@ -61,7 +61,7 @@ describe("createDefaultContextBuilder", () => {
     expect(request.systemPrompt).toBeUndefined();
   });
 
-  it("projects the loaded log into messages", async () => {
+  it("projects the current turn's log into messages", async () => {
     const builder = createDefaultContextBuilder();
     const session = framedSession();
 
@@ -123,5 +123,25 @@ describe("createDefaultContextBuilder", () => {
         { name: "calculator", description: "The calculator tool.", inputSchema: { type: "object" } },
       ],
     });
+  });
+
+  it("refuses a session whose turn is not open", async () => {
+    const builder = createDefaultContextBuilder();
+    const tools = createToolRegistry();
+
+    await expect(builder.build(inputFor(builder, createSession("s"), tools))).rejects.toThrow(
+      /no open turn/,
+    );
+  });
+
+  it("refuses a turn that is already closed", async () => {
+    const builder = createDefaultContextBuilder();
+    const tools = createToolRegistry();
+    const session = createSession("s");
+    session.append({ type: "turn/start", turnId: TURN, data: {} });
+    session.append({ type: "message/user", turnId: TURN, data: { text: "hi" } });
+    session.append({ type: "turn/end", turnId: TURN, data: { reason: "completed" } });
+
+    await expect(builder.build(inputFor(builder, session, tools))).rejects.toThrow(/already closed/);
   });
 });

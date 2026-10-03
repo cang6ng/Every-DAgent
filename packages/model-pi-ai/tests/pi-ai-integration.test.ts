@@ -23,11 +23,13 @@ import type {
   ToolRegistry,
 } from "@every-dagent/agent-core";
 import {
+  DEFAULT_MODEL_FRAMING,
   createAgentLoop,
   createAgentRuntime,
   createDefaultContextBuilder,
   createSession,
   createToolRegistry,
+  defineModelBudget,
 } from "@every-dagent/agent-core";
 
 import { createPiAiModelClient } from "../src/pi-ai-client.js";
@@ -35,6 +37,17 @@ import type { PiAiStreamSource } from "../src/pi-ai-client.js";
 import { TEST_MODEL } from "./helpers/fake-pi-ai-stream.js";
 
 const SYSTEM_PROMPT = "You are a calculator.";
+
+/**
+ * The API the faux registry declares.
+ *
+ * pi-ai's faux provider names its own protocol `faux`, which is deliberately
+ * outside the profiles this adapter can enforce an output cap for. The model's
+ * declared `api` is metadata the adapter reads — the transport stays faux's own —
+ * so a scripted provider that says it speaks an audited protocol is exactly the
+ * seam these tests are about.
+ */
+const AUDITED_API = "openai-completions" as const;
 
 /**
  * The DoD tool in test shape: it records the arguments it was given, so a test can
@@ -82,7 +95,7 @@ function runtimeWithFaux(responses: AssistantMessage[]): {
   readonly calculator: { readonly inputs: unknown[] };
   readonly faux: ReturnType<typeof fauxProvider>;
 } {
-  const faux = fauxProvider();
+  const faux = fauxProvider({ api: AUDITED_API });
   const models = createModels();
   models.setProvider(faux.provider);
   faux.setResponses(responses);
@@ -141,7 +154,7 @@ describe("pi-ai adapter inside the real Core", () => {
   });
 
   it("sends the tool round trip back to the provider as pi-ai messages", async () => {
-    const faux = fauxProvider();
+    const faux = fauxProvider({ api: AUDITED_API });
     const models = createModels();
     models.setProvider(faux.provider);
 
@@ -324,6 +337,31 @@ function anthropicTextBody(text: string): string {
   ].join("");
 }
 
+/** The real serializer, with the socket stubbed: the shape the wire tests share. */
+function openAiSource(socket: { readonly fetch: PiAiFetch }): PiAiStreamSource {
+  return {
+    stream: (model, context, options) =>
+      openAiCompletionsStream(
+        // The source is only ever handed an openai-completions model; the port's
+        // signature is protocol-blind, this adapter is not.
+        model as Model<"openai-completions">,
+        normalizeContext(context),
+        { ...options, fetch: socket.fetch },
+      ),
+  };
+}
+
+function anthropicSource(socket: { readonly fetch: PiAiFetch }): PiAiStreamSource {
+  return {
+    stream: (model, context, options) =>
+      anthropicMessagesStream(
+        model as Model<"anthropic-messages">,
+        normalizeContext(context),
+        { ...options, fetch: socket.fetch },
+      ),
+  };
+}
+
 /**
  * Answers each request with the next recorded body, and keeps what was sent.
  *
@@ -445,6 +483,115 @@ describe("pi-ai wire adapter with a stubbed socket", () => {
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
     expect(JSON.stringify(messages[2])).toContain("toolu_1");
     expect(JSON.stringify(messages[2])).toContain("42");
+  });
+});
+
+/**
+ * The one claim about a provider that cannot be made from the Core: that the
+ * body which really leaves this process carries the output cap the request
+ * reserved, and carries no other.
+ *
+ * The evidence is the serialized body itself — the string the real pi-ai
+ * adapter handed to the transport — parsed and read back field by field. A
+ * stub that accepted whatever it was given would prove nothing here, which is
+ * why these cases run the real serializers.
+ */
+describe("the output cap the provider really receives", () => {
+  const CAP = defineModelBudget({
+    contextWindow: TEST_MODEL.contextWindow,
+    maxOutputTokens: TEST_MODEL.maxTokens,
+    framing: DEFAULT_MODEL_FRAMING,
+  }).reservedOutput;
+
+  /** The request's own reserve, as the Core derived it for this test model. */
+  it("derives a reserve worth checking", () => {
+    expect(CAP).toBe(1024);
+  });
+
+  it("sends the reserve as the single cap of an openai-completions body", async () => {
+    const socket = stubSockets([sseBody([openAiChunk({ role: "assistant", content: "ok" }), openAiChunk({}, "stop")])]);
+    const runtime = runtimeFor(
+      createPiAiModelClient({ models: openAiSource(socket), model: TEST_MODEL, apiKey: "unused" }),
+      createToolRegistry(),
+    );
+
+    await runtime.run({ session: createSession("s-1"), text: "hi" });
+
+    expect(socket.sent).toHaveLength(1);
+    const body = socket.sent[0] as Record<string, unknown>;
+    expect(body.max_completion_tokens).toBe(CAP);
+    expect(body.max_tokens).toBeUndefined();
+    expect(body.max_output_tokens).toBeUndefined();
+  });
+
+  it("uses the field a DeepSeek-compatible server expects, and only it", async () => {
+    const deepseek: Model<"openai-completions"> = {
+      ...TEST_MODEL,
+      provider: "deepseek",
+      baseUrl: "https://api.deepseek.com/v1",
+    };
+    const socket = stubSockets([sseBody([openAiChunk({ role: "assistant", content: "ok" }), openAiChunk({}, "stop")])]);
+    const runtime = runtimeFor(
+      createPiAiModelClient({ models: openAiSource(socket), model: deepseek, apiKey: "unused" }),
+      createToolRegistry(),
+    );
+
+    await runtime.run({ session: createSession("s-1"), text: "hi" });
+
+    const body = socket.sent[0] as Record<string, unknown>;
+    expect(body.max_tokens).toBe(CAP);
+    expect(body.max_completion_tokens).toBeUndefined();
+    expect(body.max_output_tokens).toBeUndefined();
+  });
+
+  it("sends the reserve as anthropic's max_tokens, and nothing else named like a cap", async () => {
+    const socket = stubSockets([anthropicTextBody("ok")]);
+    const runtime = runtimeFor(
+      createPiAiModelClient({ models: anthropicSource(socket), model: TEST_MODEL, apiKey: "unused" }),
+      createToolRegistry(),
+    );
+
+    await runtime.run({ session: createSession("s-1"), text: "hi" });
+
+    const body = socket.sent[0] as Record<string, unknown>;
+    expect(body.max_tokens).toBe(CAP);
+    expect(body.max_completion_tokens).toBeUndefined();
+    expect(body.max_output_tokens).toBeUndefined();
+  });
+
+  it("sends the reserve the request carried, not the profile's ceiling", async () => {
+    const socket = stubSockets([sseBody([openAiChunk({ role: "assistant", content: "ok" }), openAiChunk({}, "stop")])]);
+    const client = createPiAiModelClient({
+      models: openAiSource(socket),
+      model: TEST_MODEL,
+      apiKey: "unused",
+      // A ceiling the profile is allowed to promise, which no request has to use.
+      maxTokens: 512,
+    });
+
+    const failure = await (async (): Promise<unknown> => {
+      try {
+        for await (const _event of client.stream(
+          {
+            messages: [{ role: "user", text: "hi" }],
+            tools: [],
+            maxOutputTokens: 128,
+          },
+          { sessionId: "s-1", signal: new AbortController().signal },
+        )) {
+          // drained
+        }
+        return undefined;
+      } catch (error) {
+        return error;
+      }
+    })();
+
+    // The request reached the provider at all — the payload guard accepted the
+    // body — and the cap it carried is the request's own, not the ceiling.
+    expect(failure).toBeUndefined();
+    const body = socket.sent[0] as Record<string, unknown>;
+    expect(body.max_completion_tokens).toBe(128);
   });
 });
 

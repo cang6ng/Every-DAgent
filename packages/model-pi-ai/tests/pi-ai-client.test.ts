@@ -5,9 +5,10 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_MODEL_FRAMING, defineModelBudget } from "@every-dagent/agent-core";
 import type { ModelClient, ModelEvent, ModelRequest, RuntimeContext } from "@every-dagent/agent-core";
 
-import { createPiAiModelClient } from "../src/pi-ai-client.js";
+import { UnsupportedPiAiProfileError, createPiAiModelClient } from "../src/pi-ai-client.js";
 import {
   abortedScript,
+  createRewriteSource,
   createScriptedPiAiStream,
   errorScript,
   TEST_MODEL as MODEL,
@@ -175,10 +176,20 @@ describe("PiAiModelClient failures", () => {
     await expect(collect(client, request())).rejects.toThrow(/truncated/);
   });
 
-  it("throws when the provider reports an error terminal", async () => {
+  it("reports a provider error terminal without quoting the provider", async () => {
     const { client } = clientFor([errorScript("upstream is on fire")]);
 
-    await expect(collect(client, request())).rejects.toThrow(/upstream is on fire/);
+    // What the provider said is not what a caller sees: the failure is this
+    // adapter's own fixed classification, and the provider's bytes stay out of it.
+    await expect(collect(client, request())).rejects.toThrow("the provider request failed");
+  });
+
+  it("keeps a credential that a provider echoed out of the failure", async () => {
+    const { client } = clientFor([errorScript("bad key sk-secret-token rejected")]);
+
+    const failure = await collect(client, request()).catch((error: unknown) => error);
+
+    expect(String(failure)).not.toContain("sk-secret-token");
   });
 
   it("throws when the request was aborted", async () => {
@@ -301,11 +312,12 @@ describe("PiAiModelClient requests", () => {
       models: source,
       model: MODEL,
       apiKey: "test-key",
-      maxTokens: 256,
       timeoutMs: 30_000,
     });
 
-    await collect(client, request());
+    const sent = request();
+
+    await collect(client, sent);
 
     // pi-ai's own default is already zero retries; the adapter states it so the
     // property cannot change under the Core without this test noticing.
@@ -313,29 +325,29 @@ describe("PiAiModelClient requests", () => {
       signal: context.signal,
       maxRetries: 0,
       apiKey: "test-key",
-      maxTokens: 256,
+      // The request's own reserve — never a profile ceiling.
+      maxTokens: sent.maxOutputTokens,
       timeoutMs: 30_000,
     });
   });
 
-  it("refuses to replay a recorded call whose input is not an object", async () => {
-    const { client } = clientFor([textScript("ok")]);
+  it("sends the request's own cap, not the profile's ceiling", async () => {
+    const source = createScriptedPiAiStream([textScript("ok")]);
+    const client = createPiAiModelClient({ models: source, model: MODEL, maxTokens: 512 });
 
-    const replay = collect(
-      client,
-      request({
-        messages: [
-          {
-            role: "assistant",
-            text: "",
-            toolCalls: [{ callId: "call-1", name: "calculator", input: "twenty-one" }],
-          },
-        ],
-      }),
+    await collect(client, request({ maxOutputTokens: 128 }));
+
+    expect(source.options[0]?.maxTokens).toBe(128);
+  });
+
+  it("refuses a request whose reserve is larger than the profile allows", async () => {
+    const source = createScriptedPiAiStream([textScript("ok")]);
+    const client = createPiAiModelClient({ models: source, model: MODEL });
+
+    await expect(collect(client, request({ maxOutputTokens: MODEL.maxTokens + 1 }))).rejects.toThrow(
+      /larger than this profile allows/,
     );
-
-    // Better a local message than the provider's rejection of a malformed request.
-    await expect(replay).rejects.toThrow(/not a JSON object/);
+    expect(source.contexts).toHaveLength(0);
   });
 
   it("declares the model's own finite capability", () => {
@@ -360,6 +372,86 @@ describe("PiAiModelClient requests", () => {
     expect(() =>
       createPiAiModelClient({ models: createScriptedPiAiStream([]), model: broken }),
     ).toThrow(/context window/);
+  });
+
+  it("refuses a model API whose output cap it cannot enforce", async () => {
+    const source = createScriptedPiAiStream([textScript("ok")]);
+    const unaudited = { ...MODEL, api: "openai-responses" as typeof MODEL.api };
+    const client = createPiAiModelClient({ models: source, model: unaudited });
+
+    await expect(collect(client, request())).rejects.toThrow(UnsupportedPiAiProfileError);
+    // No provider call, and above all no provider payload.
+    expect(source.contexts).toHaveLength(0);
+  });
+
+  it("refuses a payload whose cap is not the one the request reserved", async () => {
+    // The provider client is handed the request's cap; a source that rewrites it
+    // before sending is exactly what the payload guard exists to catch, and no
+    // request may reach the network on a body the Core did not reserve.
+    const source = createRewriteSource((payload) => ({ ...payload, max_tokens: 7 }));
+
+    await expect(collect(createPiAiModelClient({ models: source, model: MODEL }), request())).rejects.toThrow(
+      /output cap/,
+    );
+    expect(source.sent).toBe(0);
+  });
+
+  it("refuses a payload that carries two caps", async () => {
+    const cap = request().maxOutputTokens;
+    const source = createRewriteSource((payload) => ({
+      ...payload,
+      max_tokens: cap,
+      max_completion_tokens: cap,
+    }));
+
+    await expect(collect(createPiAiModelClient({ models: source, model: MODEL }), request())).rejects.toThrow(
+      /exactly one enforceable output cap/,
+    );
+    expect(source.sent).toBe(0);
+  });
+
+  it("refuses a payload that dropped the cap", async () => {
+    const source = createRewriteSource((payload) => {
+      const { max_tokens: _cap, max_completion_tokens: _other, ...rest } = payload;
+      void _cap;
+      void _other;
+      return rest;
+    });
+
+    await expect(collect(createPiAiModelClient({ models: source, model: MODEL }), request())).rejects.toThrow(
+      /exactly one enforceable output cap/,
+    );
+    expect(source.sent).toBe(0);
+  });
+
+  it("lets an audited payload through untouched", async () => {
+    const source = createRewriteSource((payload) => payload);
+
+    await expect(collect(createPiAiModelClient({ models: source, model: MODEL }), request())).resolves.toEqual([
+      { type: "text-delta", text: "ok" },
+      { type: "done" },
+    ]);
+    expect(source.sent).toBe(1);
+  });
+
+  it("refuses to replay a recorded call whose input is not an object", async () => {
+    const { client } = clientFor([textScript("ok")]);
+
+    const replay = collect(
+      client,
+      request({
+        messages: [
+          {
+            role: "assistant",
+            text: "",
+            toolCalls: [{ callId: "call-1", name: "calculator", input: "twenty-one" }],
+          },
+        ],
+      }),
+    );
+
+    // Better a local message than the provider's rejection of a malformed request.
+    await expect(replay).rejects.toThrow(/not a JSON object/);
   });
 
   it("leaves the credential to pi-ai when none is given", async () => {

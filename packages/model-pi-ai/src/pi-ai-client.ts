@@ -23,7 +23,12 @@ import type {
   ToolCall,
   ToolSchema,
 } from "@every-dagent/agent-core";
-import { DEFAULT_MODEL_FRAMING, ModelLimitsError, validateModelLimits } from "@every-dagent/agent-core";
+import {
+  DEFAULT_MODEL_FRAMING,
+  ModelLimitsError,
+  NonRetryableModelError,
+  validateModelLimits,
+} from "@every-dagent/agent-core";
 
 /**
  * The slice of pi-ai's model registry this adapter calls: one streaming request.
@@ -55,9 +60,11 @@ export interface PiAiModelClientOptions {
   /**
    * The output ceiling this profile is allowed to declare.
    *
-   * It is a *ceiling*, not the cap of any request, and it may only be smaller than
-   * what the model itself offers — `0 < configured <= native maxTokens`. Left out,
-   * the model's own maximum is the ceiling.
+   * It is a *ceiling*, not the cap of any request: every request carries its own
+   * `maxOutputTokens` from the Core's budget, and that is what is sent. This
+   * number only bounds what the Core may reserve — `0 < configured <= native
+   * maxTokens` — so a composition can promise less than the model offers and
+   * cannot promise more.
    */
   readonly maxTokens?: number;
   /**
@@ -68,24 +75,35 @@ export interface PiAiModelClientOptions {
 }
 
 /**
- * The pi-ai-backed ModelClient — the only place where the Core's provider-neutral
- * vocabulary meets a real provider.
+ * A model API whose request body this adapter cannot prove carries the right cap.
  *
- * It owns no protocol: pi-ai speaks OpenAI-compatible and Anthropic, assembles
- * tool-call argument deltas, and merges the consecutive tool results a provider
- * expects. What is left to do here is the part pi-ai leaves to its caller:
- *
- * - turn a `ModelRequest` into the request shape pi-ai asks for;
- * - report text and *finished* tool calls as `ModelEvent`s;
- * - turn every failure into a throw, including the ones pi-ai reports as an
- *   ordinary terminal (a truncated answer most of all) — so that a stream that
- *   merely ends can only ever mean a step that completed;
- * - retry nothing: retry is the AgentLoop's decision and would otherwise multiply.
+ * It is refused before the network, never negotiated down: the contract is that
+ * the provider's own output cap equals the request's reserve, and an API this
+ * adapter has no serializer evidence for is one where it cannot say that.
  */
-export function createPiAiModelClient(options: PiAiModelClientOptions): ModelClient {
-  const limits = capabilityOf(options);
-  return { limits, stream: (request, context) => stream(options, request, context) };
-}
+export class UnsupportedPiAiProfileError extends NonRetryableModelError {}
+
+/**
+ * The provider APIs this adapter has serializer evidence for.
+ *
+ * For each one: the field names its request body may carry an output cap in, and
+ * the set of names that would be a *different* cap if they appeared. The check
+ * below is written against these two lists rather than against a predicted
+ * `compat` decision, so a pi-ai that changes which field it writes is caught by
+ * comparing the body it really built — not by re-deriving its logic here.
+ */
+const AUDITED_PROFILES: Readonly<
+  Record<string, { readonly capFields: readonly string[]; readonly conflicting: readonly string[] }>
+> = Object.freeze({
+  "anthropic-messages": {
+    capFields: ["max_tokens"],
+    conflicting: ["max_tokens", "max_completion_tokens", "max_output_tokens"],
+  },
+  "openai-completions": {
+    capFields: ["max_tokens", "max_completion_tokens"],
+    conflicting: ["max_tokens", "max_completion_tokens", "max_output_tokens"],
+  },
+});
 
 /** A positive whole number of tokens, which is the only usable cap. */
 function positiveInteger(value: unknown): value is number {
@@ -118,30 +136,94 @@ function capabilityOf({ model, maxTokens }: PiAiModelClientOptions): ModelLimits
   });
 }
 
+/**
+ * The pi-ai-backed ModelClient — the only place where the Core's provider-neutral
+ * vocabulary meets a real provider.
+ *
+ * It owns no protocol: pi-ai speaks OpenAI-compatible and Anthropic, assembles
+ * tool-call argument deltas, and merges the consecutive tool results a provider
+ * expects. What is left to do here is the part pi-ai leaves to its caller:
+ *
+ * - turn a `ModelRequest` into the request shape pi-ai asks for;
+ * - send the request's own output cap, and prove the body the provider is handed
+ *   really carries it;
+ * - report text and *finished* tool calls as `ModelEvent`s;
+ * - turn every failure into a throw, including the ones pi-ai reports as an
+ *   ordinary terminal (a truncated answer most of all) — so that a stream that
+ *   merely ends can only ever mean a step that completed;
+ * - retry nothing: retry is the AgentLoop's decision and would otherwise multiply.
+ */
+export function createPiAiModelClient(options: PiAiModelClientOptions): ModelClient {
+  const limits = capabilityOf(options);
+  return { limits, stream: (request, context) => stream(options, limits, request, context) };
+}
+
 async function* stream(
-  { models, model, apiKey, maxTokens, timeoutMs }: PiAiModelClientOptions,
+  { models, model, apiKey, timeoutMs }: PiAiModelClientOptions,
+  limits: ModelLimits,
   request: ModelRequest,
   context: RuntimeContext,
 ): AsyncGenerator<ModelEvent> {
-  const events = models.stream(
-    model,
-    {
-      systemPrompt: request.systemPrompt,
-      messages: toPiAiMessages(request.messages, model),
-      tools: request.tools.map(toPiAiTool),
-    },
-    {
-      signal: context.signal,
-      apiKey,
-      maxTokens,
-      timeoutMs,
-      // The request layer must not retry: the AgentLoop retries whole steps, and two
-      // layers retrying the same failure would multiply the attempts while hiding
-      // the decision from the turn's own record. pi-ai's own default is already zero
-      // retries; saying it here keeps that property from changing under the Core.
-      maxRetries: 0,
-    },
-  );
+  const profile = AUDITED_PROFILES[model.api as string];
+  if (profile === undefined) {
+    throw new UnsupportedPiAiProfileError(
+      `the model API "${model.api}" is not one whose output cap this adapter can enforce`,
+    );
+  }
+
+  const cap = request.maxOutputTokens;
+  if (!positiveInteger(cap) || cap > limits.maxOutputTokens) {
+    // This request reserved more output than this profile may ever send. It never
+    // reaches the provider, and no attempt can change the answer.
+    throw new NonRetryableModelError("the request's output reserve is larger than this profile allows");
+  }
+
+  // A pi-ai payload guard that fails does not fail quietly: pi-ai reports the
+  // hook's exception as an ordinary `error` terminal, whose message is the SDK's
+  // own text. The typed failure is kept here, in the closure that produced it, so
+  // the stream's end can be classified by what actually happened rather than by
+  // reading the SDK's words back.
+  let refusal: NonRetryableModelError | undefined;
+  const onPayload = (payload: unknown): undefined => {
+    try {
+      assertEnforcedCap(payload, profile, cap);
+    } catch (error) {
+      refusal =
+        error instanceof NonRetryableModelError
+          ? error
+          : new NonRetryableModelError("the provider request could not be inspected");
+      throw error;
+    }
+    return undefined;
+  };
+
+  let events: AsyncIterable<AssistantMessageEvent>;
+  try {
+    events = models.stream(
+      model,
+      {
+        systemPrompt: request.systemPrompt,
+        messages: toPiAiMessages(request.messages, model),
+        tools: request.tools.map(toPiAiTool),
+      },
+      {
+        signal: context.signal,
+        apiKey,
+        // The request's own cap, never the profile ceiling: what the Core
+        // reserved for this request is what the provider is allowed to produce.
+        maxTokens: cap,
+        timeoutMs,
+        onPayload,
+        // The request layer must not retry: the AgentLoop retries whole steps, and two
+        // layers retrying the same failure would multiply the attempts while hiding
+        // the decision from the turn's own record. pi-ai's own default is already zero
+        // retries; saying it here keeps that property from changing under the Core.
+        maxRetries: 0,
+      },
+    );
+  } catch (error) {
+    throw refusal ?? localFailure(error);
+  }
 
   const reported = new Set<string>();
 
@@ -160,13 +242,14 @@ async function* stream(
         // A `done` is not automatically a usable answer: it may be a truncation or a
         // deferred response, which the Core has no way to represent and must not
         // mistake for an answer that finished.
+        if (refusal !== undefined) throw refusal;
         assertUsableEnd(event.message);
         yield* unreportedCalls(event.message, reported);
         yield { type: "done" };
         return;
 
       case "error":
-        throw requestFailure(event.reason, event.error);
+        throw refusal ?? providerFailure(event.reason);
 
       case "start":
       case "text_start":
@@ -185,7 +268,7 @@ async function* stream(
         // variant is handled, so a new pi-ai event stops the build instead of being
         // dropped at runtime.
         const unhandled: never = event;
-        throw new Error(`pi-ai event this adapter does not know: ${JSON.stringify(unhandled)}`);
+        throw new NonRetryableModelError(`pi-ai event this adapter does not know: ${describe(unhandled)}`);
       }
     }
   }
@@ -193,7 +276,95 @@ async function* stream(
   // pi-ai reports every failure through a terminal event, so a stream that ends
   // without one is broken — and the Core reads a silent end as a completed step,
   // which makes this the one failure it must never be handed.
-  throw new Error("pi-ai stream ended without a done or error event");
+  throw refusal ?? new NonRetryableModelError("the provider stream ended without a done or error event");
+}
+
+/**
+ * The decision this adapter exists to make, taken on the body pi-ai really built.
+ *
+ * A payload is acceptable only when exactly one cap field from the profile's list
+ * is present and its value is the request's own reserve. A missing cap means the
+ * provider picks its own; a second one means two numbers disagree about the
+ * answer; a different value means the reserve the Core enforced is not the
+ * reserve that was sent. All three are the same failure, and it happens before
+ * `fetch`.
+ */
+function assertEnforcedCap(
+  payload: unknown,
+  profile: { readonly capFields: readonly string[] },
+  cap: number,
+): void {
+  if (typeof payload !== "object" || payload === null) {
+    throw new NonRetryableModelError("the provider request is not a body this adapter can inspect");
+  }
+
+  const carried = profile.capFields.filter((field) => capabilityField(payload, field) !== undefined);
+  if (carried.length !== 1) {
+    throw new NonRetryableModelError("the provider request does not carry exactly one enforceable output cap");
+  }
+  if (capabilityField(payload, carried[0] as string) !== cap) {
+    throw new NonRetryableModelError("the provider request's output cap is not the one this request reserved");
+  }
+}
+
+/**
+ * One field of a payload, read only if reading it cannot run code.
+ *
+ * The payload is pi-ai's own object, built a moment ago — but the guard's whole
+ * value is that it checks the thing that is about to be sent, so it reads the way
+ * this codebase reads untrusted shapes: from the property's own data descriptor.
+ * An accessor is reported as present-and-not-the-cap, which is a refusal.
+ */
+function capabilityField(payload: object, name: string): unknown {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(payload, name);
+  } catch {
+    return UNREADABLE;
+  }
+  if (descriptor === undefined) return undefined;
+  if (descriptor.get !== undefined || descriptor.set !== undefined) return UNREADABLE;
+  return descriptor.value;
+}
+
+/** A payload property that would have to run to be read. */
+const UNREADABLE: unique symbol = Symbol("every-dagent.capability-unreadable");
+
+/**
+ * A local failure raised while building the request, in this adapter's own words.
+ *
+ * A recorded call whose arguments are not the JSON object every wire format
+ * requires is a request this adapter cannot send — deterministically, whatever the
+ * provider would have said. It is reported as such instead of being retried, and
+ * the provider's rejection is never what a caller sees.
+ */
+function localFailure(error: unknown): NonRetryableModelError {
+  if (error instanceof NonRetryableModelError) return error;
+  return new NonRetryableModelError("the request could not be sent to the provider");
+}
+
+/**
+ * A provider failure, in fixed words.
+ *
+ * Nothing of the provider's own report travels: no body, header, cause,
+ * credential, URL or stack. The reason is classified by the terminal pi-ai
+ * reported — an abort is an abort — and everything else is one safe failure.
+ * Whether a failure may be retried is not decided here: this adapter has no
+ * trusted transient signal to offer, so it offers the Core the safe default.
+ */
+function providerFailure(reason: "aborted" | "error"): NonRetryableModelError {
+  return new NonRetryableModelError(
+    reason === "aborted" ? "the provider request was aborted" : "the provider request failed",
+  );
+}
+
+/** A short, provider-free description of an event shape this adapter does not know. */
+function describe(value: unknown): string {
+  if (typeof value === "object" && value !== null) {
+    const type = Object.getOwnPropertyDescriptor(value, "type")?.value;
+    if (typeof type === "string") return JSON.stringify(type);
+  }
+  return typeof value;
 }
 
 /**
@@ -238,6 +409,9 @@ function finishedCall(call: PiAiToolCall): ToolCall {
  * `length` is the truncation case: the model was cut off, and a partial answer that
  * looks like a finished one is worse than no answer. The rest cannot reach a `done`
  * in a well-behaved stream; if one does, it is reported rather than swallowed.
+ *
+ * Every message here is written by this adapter. The terminal message's own
+ * `errorMessage` is provider text and is never quoted, however useful it looks.
  */
 function assertUsableEnd(message: AssistantMessage): void {
   switch (message.stopReason) {
@@ -245,20 +419,20 @@ function assertUsableEnd(message: AssistantMessage): void {
     case "toolUse":
       return;
     case "length":
-      throw new Error("pi-ai response was truncated: the model hit its output token limit");
+      throw new NonRetryableModelError("pi-ai response was truncated: the model hit its output token limit");
     case "pending":
-      throw new Error("pi-ai response ended while its stop reason was still pending");
+      throw new NonRetryableModelError("pi-ai response ended while its stop reason was still pending");
     case "deferred":
-      throw new Error("pi-ai returned a deferred response, which Phase 1 does not support");
+      throw new NonRetryableModelError("pi-ai returned a deferred response, which this Core does not support");
     case "aborted":
-      throw new Error(`pi-ai response was aborted: ${errorDetail(message)}`);
+      throw new NonRetryableModelError("pi-ai response was aborted");
     case "error":
-      throw new Error(`pi-ai response failed: ${errorDetail(message)}`);
+      throw new NonRetryableModelError("pi-ai response failed");
     default: {
       // Exhaustive on purpose: a stop reason this adapter has never seen must not be
       // read as a usable answer, and a new one has to stop the build to be noticed.
       const unhandled: never = message.stopReason;
-      throw new Error(`pi-ai stop reason this adapter does not know: ${JSON.stringify(unhandled)}`);
+      throw new NonRetryableModelError(`pi-ai stop reason this adapter does not know: ${describe(unhandled)}`);
     }
   }
 }
@@ -266,15 +440,6 @@ function assertUsableEnd(message: AssistantMessage): void {
 /** Whether a value is the JSON object a tool call's arguments have to be. */
 function isArgumentsObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function requestFailure(reason: "aborted" | "error", message: AssistantMessage): Error {
-  if (reason === "aborted") return new Error(`pi-ai request was aborted: ${errorDetail(message)}`);
-  return new Error(`pi-ai request failed: ${errorDetail(message)}`);
-}
-
-function errorDetail(message: AssistantMessage): string {
-  return message.errorMessage ?? "the provider gave no error message";
 }
 
 /** The session projection, in the shape pi-ai sends to a provider. */
@@ -334,7 +499,7 @@ function toPiAiMessages(messages: readonly ModelMessage[], model: Model<Api>): M
  */
 function toArguments(call: ToolCall): JsonObject {
   if (isArgumentsObject(call.input)) return call.input;
-  throw new Error(`tool call "${call.name}" has input that is not a JSON object`);
+  throw new NonRetryableModelError(`tool call "${call.name}" has input that is not a JSON object`);
 }
 
 /** pi-ai wants usage on a replayed assistant message; a replay has none to report. */

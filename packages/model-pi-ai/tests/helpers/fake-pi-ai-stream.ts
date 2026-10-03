@@ -144,3 +144,61 @@ export function abortedScript(): AssistantMessageEvent[] {
     },
   ];
 }
+
+/**
+ * A provider client that builds a body, runs the caller's `onPayload` hook, and
+ * only then "sends" it — which is what pi-ai's own adapters do.
+ *
+ * `sent` counts the requests that got past the hook, so a test can prove that a
+ * refused cap stopped the request before the network rather than after it. A hook
+ * that throws is reported the way pi-ai reports one: as an ordinary `error`
+ * terminal quoting the thrown text, which is why the adapter has to keep its own
+ * typed failure in a closure instead of reading the SDK's words back.
+ */
+export interface RewriteSource extends PiAiStreamSource {
+  /** How many requests got past the payload hook. */
+  readonly sent: number;
+}
+
+export function createRewriteSource(
+  rewrite: (payload: Record<string, unknown>) => Record<string, unknown>,
+): RewriteSource {
+  const source = {
+    sent: 0,
+    async *stream(
+      model: Model<Api>,
+      _context: Context,
+      streamOptions?: StreamOptions,
+    ): AsyncGenerator<AssistantMessageEvent> {
+      const built = rewrite({
+        model: model.id,
+        messages: [],
+        stream: true,
+        max_tokens: streamOptions?.maxTokens,
+      });
+
+      try {
+        await streamOptions?.onPayload?.(built, model);
+      } catch (error) {
+        yield {
+          type: "error",
+          reason: "error",
+          error: fauxAssistantMessage("", {
+            stopReason: "error",
+            errorMessage: error instanceof Error ? error.message : String(error),
+          }),
+        };
+        return;
+      }
+
+      source.sent += 1;
+      const answer = fauxAssistantMessage("ok");
+      yield { type: "start", partial: answer };
+      yield { type: "text_delta", contentIndex: 0, delta: "ok", partial: answer };
+      yield { type: "text_end", contentIndex: 0, content: "ok", partial: answer };
+      yield { type: "done", reason: "stop", message: answer };
+    },
+  };
+
+  return source as RewriteSource;
+}
