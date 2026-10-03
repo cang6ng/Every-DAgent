@@ -186,3 +186,165 @@ R20 R21 R22 R24 R26 R27
 M1 最终采用 **project-owner acceptance** 流程。Batch 1 有 implementation / regression / mutation 及既有 review chain（含一轮 closure re-review FAIL 与随后 repair）。Batch 2 基于 public-path reproducers、shared-invariant implementation、regression suite、targeted mutations（8/8 KILLED）与 real Chrome acceptance，由 project owner 接受关闭。
 
 **没有发生“外部 Sol 最终独立审查 PASS”**，本节不作此表述。`.zcode/` 内的 probe / mutation / agent scratch 是过程证据，**不是** contract authority，也不构成本文档的组成部分；它们保持有意 untracked、不 stage、不 commit。
+
+## M2 Final Closeout / Seal
+
+> 本节为 seal 轮追加，只记录 M2 关闭与该轮之后的事实；以上 P4.0 冻结、Batch 1 closeout 与 M1 seal 的历史事实不被追溯改写。本节由独立 docs-only commit（`docs: seal phase 4 m2`）记录；文档不引用该提交自身的 SHA。
+
+### Current State
+
+| Milestone | 状态 |
+| --- | --- |
+| P4.0 | COMPLETE / FROZEN |
+| M1 | COMPLETE / SEALED |
+| M2 | **COMPLETE / SEALED** |
+| M3 | NOT STARTED |
+| M4 | NOT STARTED |
+| M5 | NOT STARTED |
+
+M2 不再重新打开，除非后续真实 regression 证明 Frozen M2 contract violation。
+
+### M2 Final Implementation Baseline
+
+`f0c00f79a11847dad105f4218b7493c49619a1c7` — `fix(model-pi-ai): reject unsupported bounded profiles at construction`
+
+它由 M2 的 4 个 semantic implementation commits 与 1 个 owner repair commit 组成（自 `0dfe829` 起，未 amend/squash/rebase）：
+
+| SHA | Subject |
+| --- | --- |
+| `3b8d08afec0957946a7be0cfb1e81208317e0238` | `feat(core): define bounded model context contract` |
+| `1902cfb300162824b92362d38befb39f9011b47e` | `feat(core): select and guard bounded model requests` |
+| `ea468dce072ec55f96e4412aed8f55bc1d799d77` | `fix(host): reject impossible runs before admission` |
+| `f3cc7a2c862fc9fa037cc1813e05e146b602b107` | `feat(model-pi-ai): enforce request output caps` |
+| `f0c00f79a11847dad105f4218b7493c49619a1c7` | `fix(model-pi-ai): reject unsupported bounded profiles at construction`（owner repair） |
+
+seal commit 只更新本 HANDOFF。
+
+### Frozen Contract Authority
+
+- `docs/PHASE4_PLATFORM_SPEC.md`
+- `docs/PHASE4_M1_CONTRACT_ERRATA.md`（冻结于 `4a1ea52 docs: freeze phase 4 m1 contract errata`）
+
+两者共同构成契约权威；两份冻结文档自冻结以来未被修改。Protocol generation 保持 `"2"`：M2 implementation 与 owner repair **未修改 Frozen Contract**，未新增 wire operation/event/error/DTO，未引入 schema migration，未新增 production dependency，未改变 Protocol generation。
+
+### M2 Delivered Capabilities
+
+1. provider-neutral `ModelLimits`（adapter 声明，Core 校验、冻结、拒绝不可信值）
+2. finite `ModelBudget`（由 limits 唯一推导，无调用方可自定义的 reserve）
+3. required per-request `maxOutputTokens`
+4. deterministic conservative UTF-8 estimator（stable JSON 语义成本）
+5. dynamic arguments escaping accounting（tool arguments 的二次转义）
+6. complete historical Turn suffix selection（whole turn only）
+7. no-skip historical selection（放不下即结束选择）
+8. current `ToolResult` model-only truncation（显式 marker、UTF-8 安全）
+9. canonical context immutability（模型副本不写回 session/repository/canonical）
+10. owned immutable `ModelRequest`（深拷贝 + 冻结 + cap 由 Core 写定）
+11. independent per-attempt final guard（不信任 builder 自报，不用调用方给的 budget）
+12. same-step retry request reuse（同一 frozen request）
+13. follow-up step rebuild（每 step 重新读取 current ToolRegistry）
+14. pre-admission context feasibility check（Host：lease 后、admit 前、零 durable 事实）
+15. shared finite `LoopResourceLimits`（Core 与 Host wrapper 同一 profile）
+16. whole-batch tool-call validation before first execution
+17. post-side-effect resource-fault honesty（穿透 tool catch，不伪造 turn/end）
+18. actual pi-ai output-cap enforcement（每次 invocation 前 payload guard）
+19. supported bounded profiles：OpenAI-compatible、DeepSeek-compatible、Anthropic raw messages
+20. unsupported output-cap profile fail-closed at adapter construction
+
+### Budget Contract
+
+```text
+estimatedInput + R + S <= C
+R = min(4096, modelMaxOutputTokens)
+S = max(1024, ceil(0.1 * C))
+```
+
+首版 estimator 为 **UTF-8 conservative estimate + framing + dynamic escaping**，不是精确 tokenizer，也不宣称
+`1 byte == 1 token`；保证的是有限请求、确定性估算与真实 output cap。模型 limits 由 adapter/composition 从
+native metadata 解析并校验，Core 不按 model name 联网或猜测；未知/不可信 limits 不默认为无限。
+
+### Context Selection Semantics
+
+- M1 execution window（storage/read bounded candidate window）与 M2 model context（model-request bounded
+  selection）是两个不同边界；M1 的 `16 turns / 256 KiB / real seq / whole turns` 未因 M2 改变。
+- 历史上下文取 **recent complete-turn suffix**，whole Turn only：第一个旧 Turn 不 fit 即 `break`，
+  不继续搜索更老 Turn；历史 Turn 内容不做任何截断。
+- 只有当前 open Turn 的 `ToolResult.content` 允许 **model-only truncation**（显式 marker、确定性、
+  code point 边界安全）；保留 call identity / tool identity / ok / pairing。
+- canonical 永远不修改：session、repository、history page 与 durable commit 保留 tool 实际产生的字节。
+
+### Runtime / Retry Semantics
+
+- 每 model step：重新读取 current ToolRegistry，重新 build / estimate / select / guard；无 per-turn registry snapshot。
+- same-step retry：复用同一个 owned immutable `ModelRequest`；每 attempt 重新执行 final budget guard。
+- 保留既有语义：`MAX_STEPS = 12`、`MAX_MODEL_ATTEMPTS = 3`、retry only if no text、abort priority、
+  staged tool call 在失败 attempt 中不执行、每 completed model step 恰好一个 assistant declaration。
+- deterministic 失败（budget / limits / candidate / unsupported cap / managed declaration）一律 nonretryable；
+  未知 provider 错误默认 safe nonretryable，不从 raw message 猜测 transient。
+
+### Resource Profile
+
+当前 M2 默认 runtime profile：`maxToolCallsPerStep = 16`、`maxNeutralItemBytes = 64 KiB`、
+`maxCurrentTurnBytes = 1 MiB`、`maxJsonDepth = 32`。
+
+这些是当前 **execution profile defaults**，不是 Protocol 永久法律；Core neutral item 上限与 Host durable
+record 上限仍是两把不同的尺子，两道 guard 都保留。若未来将其配置化（M3），需要另行授权。
+
+### Provider Profile Boundary
+
+| 项目 | 事实 |
+| --- | --- |
+| SUPPORTED | OpenAI-compatible、DeepSeek-compatible、Anthropic raw messages |
+| Unsupported / unaudited API profile | 在 **ModelClient construction** 确定性 fail closed；不得先形成 executable ready profile 再等第一次 ModelRequest 失败 |
+| real provider | **NOT RUN**（未运行，不记为 PASS） |
+
+证据分三类且禁止混淆：Core deterministic tests；real pi-ai serializer/body tests（真实 serializer + stubbed
+transport，证明实际请求体 cap === R）；real provider **NOT RUN**。
+
+### M2 Evidence
+
+| 项目 | 结果 |
+| --- | --- |
+| full offline | **1355 passed / 0 failed / 0 skipped / 1355 total**（114 files；排除 `real-provider` 与 `.zcode/**`；本机有 Chrome，浏览器用例实际执行） |
+| real Chrome strict | **17 passed / 0 failed / 0 skipped**（`pnpm test:web:browser`，required cases 全通过、无 SKIP） |
+| adapter（`packages/model-pi-ai`） | **119 passed / 0 failed / 0 skipped** |
+| repair integration/composition | **131 passed / 0 failed / 0 skipped** |
+| typecheck | root 与 browser project **PASS** |
+| `build:web` | **PASS** |
+| `git diff --check` | clean |
+| negative controls（原 M2） | **NC1–NC7 = 7/7 KILLED**（均业务断言失败，restore 一致、无 residue） |
+| negative control（owner repair） | **NC8（construction→stream-time mutant）= KILLED** |
+| real provider | **NOT RUN** |
+
+全部 gate 在最终 implementation baseline `f0c00f7` 上通过；seal 轮为 docs-only，未重跑上述 suite。
+
+### M2 Hardening Backlog
+
+非阻塞项，记录但不属于 M2 blocker：
+
+1. 未来 tokenizer-aware estimator 可替换 conservative estimator，但不得绕过 final guard。
+2. 未来更多 pi-ai API profile 需各自 serializer/body cap evidence 才能进入 supported 集合。
+3. provider transient retry classification 只能来自 typed trusted signal；不得 regex raw provider message。
+4. selection / local diagnostic report 未来可增强，不新增 wire tracing。
+5. `LoopResourceLimits` 的持久 settings 属 M3；未经授权不改公开签名。
+6. M1 backlog 保持原状态，M2 seal 不重开 M1。
+
+### M3 Boundary
+
+下一个 milestone 为 **M3 — Configuration**，状态 **NOT STARTED**。既有 Frozen Phase 4 边界记录如下（本轮不
+定义实现）：persistent non-secret settings、desired/effective state、credential seam、plugin
+desired/config persistence、settings-driven composition readiness。本轮不 Plan、不 Implement、不改任何
+settings production code。
+
+### Review / Acceptance Policy
+
+M2 采用：ChatGPT architecture research → Sol 6.1 Implementation Plan → DSFlash implementation →
+project-owner acceptance → 一次 targeted owner repair → project-owner closeout。
+
+**实施后没有发生“外部 Sol 最终独立 implementation review PASS”**，本节不作此表述。
+
+Owner Repair 原因（精炼）：unaudited output-cap profile 原先在 **first request** 才 fail，owner 要求提升为
+**adapter construction-time fail closed**，使 known-invalid execution profile 不能形成可执行 ready
+composition，也不能先 admit durable Run 再暴露。Repair 完成后 full gates green、NC8 KILLED。
+
+`.zcode/` 内的 probe / mutation / scratch 是过程证据，**不是** contract authority，也不构成本文档的组成
+部分；它们保持有意 untracked、不 stage、不 commit。
