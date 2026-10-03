@@ -25,6 +25,18 @@ export interface AgentRuntimeInput {
   readonly signal?: AbortSignal;
 }
 
+/**
+ * What a preflight knows about a turn that has not been admitted yet.
+ *
+ * No session is loaded and nothing durable exists, which is precisely the point:
+ * the answer has to come from the profile and the input alone.
+ */
+export interface AgentRuntimePreflightInput {
+  readonly sessionId: string;
+  readonly text: string;
+  readonly userId?: string;
+}
+
 export interface TurnResult {
   readonly turnId: string;
   readonly text: string;
@@ -46,6 +58,11 @@ export interface AgentRuntime {
   /**
    * Runs exactly one turn: one user input in, the closed turn out. A failed turn
    * is a result with `reason: "error"`, not a rejection.
+   *
+   * The one rejection is a `TurnResourceFault`: a tool has run whose result the
+   * turn can no longer hold, so there is no honest `turn/end` to write. The turn
+   * is left framed and unclosed on purpose — the caller records the run as a
+   * failure and must not treat the log as a conversation.
    */
   run(input: AgentRuntimeInput): Promise<TurnResult>;
   /**
@@ -55,12 +72,25 @@ export interface AgentRuntime {
    * produced it, which is before the step it belongs to is complete.
    */
   stream(input: AgentRuntimeInput): AsyncIterable<RuntimeEvent>;
+  /**
+   * Whether a turn with this input could be sent at all, without a session, a
+   * durable run, a builder call or a provider call.
+   *
+   * Throws when it could not; returns normally when it could.
+   */
+  preflight(input: AgentRuntimePreflightInput): void;
 }
 
 export function createAgentRuntime(deps: AgentRuntimeDeps): AgentRuntime {
   return {
     run: (input: AgentRuntimeInput): Promise<TurnResult> => driveTurn(deps, input, () => {}),
     stream: (input: AgentRuntimeInput): AsyncIterable<RuntimeEvent> => streamTurn(deps, input),
+    preflight: ({ sessionId, text, userId }: AgentRuntimePreflightInput): void => {
+      deps.loop.preflight({
+        text,
+        context: { sessionId, userId, signal: new AbortController().signal },
+      });
+    },
   };
 }
 
@@ -104,6 +134,7 @@ async function driveTurn(
  * The redundancy is deliberate: the loop is an injected dependency, and the Runtime
  * is the one that promised the turn would be closed. A loop that rejects still gets
  * its turn written down as one that ended.
+ *
  */
 async function runLoop(deps: AgentRuntimeDeps, input: AgentLoopInput): Promise<TurnOutcome> {
   try {

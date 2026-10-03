@@ -1,11 +1,12 @@
 import type { ContextBuilder, FixedContext } from "../context/context-builder.js";
+import { assertModelRequestFits, ownFixedContext, ownModelRequest } from "../context/context-guard.js";
 import { defineModelBudget, validateModelLimits, type ModelBudget, type ModelLimits } from "../context/model-budget.js";
 import { NonRetryableModelError, errorMessageOf } from "../errors.js";
 import type { ToolCall } from "../model/message.js";
 import type { ModelClient, ModelRequest } from "../model/model-client.js";
 import type { RuntimeContext } from "../runtime/runtime-context.js";
 import type { Session } from "../session/session.js";
-import type { TurnEndReason } from "../session/session-event.js";
+import type { SessionEventInput, TurnEndReason } from "../session/session-event.js";
 import type { ToolExecutionResult } from "../tools/tool.js";
 import type { ToolRegistry } from "../tools/tool-registry.js";
 
@@ -61,6 +62,12 @@ export interface AgentLoopInput {
   readonly emit?: (event: AgentLoopEvent) => void;
 }
 
+/** What the admission preflight knows: one input, and the profile it would run under. */
+export interface AgentPreflightInput {
+  readonly text: string;
+  readonly context: RuntimeContext;
+}
+
 /**
  * How a turn ended, in the same vocabulary the Runtime writes as `turn/end`.
  *
@@ -79,9 +86,11 @@ export interface TurnOutcome {
  * none of them.
  *
  * It owns everything inside a turn — one `message/assistant` per completed model
- * step, the `tool/call` dispatch record and the `tool/result` observation. The
- * turn boundary itself (`turn/start`, `message/user`, `turn/end`) belongs to the
- * AgentRuntime, which is also the only producer of `turnId`.
+ * step, the `tool/call` dispatch record and the `tool/result` observation — and
+ * it owns the turn's *resources*: what the turn has spent, what each step was
+ * allowed to stage, and which facts may still be written. The turn boundary
+ * itself (`turn/start`, `message/user`, `turn/end`) belongs to the AgentRuntime,
+ * which is also the only producer of `turnId`.
  */
 export interface AgentLoop {
   /**
@@ -93,9 +102,20 @@ export interface AgentLoop {
    * source of truth.
    */
   runTurn(input: AgentLoopInput): Promise<TurnOutcome>;
+  /**
+   * Whether a turn with this input could be sent at all.
+   *
+   * Synchronous, and it reads nothing but the live registry and the composed
+   * builder: no session is loaded, no history is selected, no provider is
+   * reached. It exists so a host can refuse an input that could never run
+   * *before* it records anything durable about it — the smallest legal request
+   * is the one thing such a decision can honestly be based on, because history
+   * may legitimately be empty.
+   */
+  preflight(input: AgentPreflightInput): void;
 }
 
-/** The Core's own view of one step: validated limits and the budget they carry. */
+/** The Core's own fixed view of one step: validated limits, budget, and context. */
 interface ComposedStep {
   readonly limits: ModelLimits;
   readonly budget: ModelBudget;
@@ -106,17 +126,46 @@ export function createAgentLoop(deps: AgentLoopDeps): AgentLoop {
   // cannot state a usable capability, or a profile that leaves no room for
   // input, is refused here rather than discovered per request.
   const modelLimits = validateModelLimits(deps.modelClient.limits);
-  const composed: ComposedStep = { limits: modelLimits, budget: defineModelBudget(modelLimits) };
+  const budget = defineModelBudget(modelLimits);
+  const composed: ComposedStep = { limits: modelLimits, budget };
 
   return {
     runTurn: (input: AgentLoopInput): Promise<TurnOutcome> => runTurn(deps, composed, input),
+    preflight: (input: AgentPreflightInput): void => preflight(deps, composed, input),
   };
+}
+
+/**
+ * The smallest legal request this profile could ever send, held to the budget.
+ *
+ * It is deliberately not a prediction of what the real request will cost: it is
+ * the *floor*, and the one thing that can be proven before anything durable
+ * exists. A turn of history can always be absent, so if the floor does not fit,
+ * no run under this profile can.
+ */
+function preflight(deps: AgentLoopDeps, composed: ComposedStep, { text, context }: AgentPreflightInput): void {
+  const fixed = ownFixedContext(deps.contextBuilder.getFixedContext({ tools: deps.tools, context }));
+  const candidate: ModelRequest = {
+    ...(fixed.systemPrompt === undefined ? {} : { systemPrompt: fixed.systemPrompt }),
+    messages: [{ role: "user", text }],
+    tools: fixed.tools,
+    maxOutputTokens: composed.budget.reservedOutput,
+  };
+  assertModelRequestFits(ownModelRequest(candidate, composed.budget.reservedOutput), {
+    limits: composed.limits,
+    fixed,
+  });
 }
 
 /**
  * The turn's guard rail. Whatever happens inside, the caller gets an outcome
  * instead of an exception, so the Runtime can always close the turn it opened: no
  * turn is left open in the log, whatever the model or a tool does.
+ *
+ * The one exception is deliberate. A `TurnResourceFault` says a tool has already
+ * run and its result can no longer be part of an honest turn, and turning that
+ * into a `turn/end` would record a conversation the host could not keep. It
+ * travels out unchanged, and the host records the run as the failure it is.
  */
 async function runTurn(
   deps: AgentLoopDeps,
@@ -126,9 +175,9 @@ async function runTurn(
   try {
     return await runSteps(deps, composed, input);
   } catch (error) {
-    // Anything that escaped the step itself came from the Core (context building,
-    // the log, the loop's own code) rather than from the model, and is reported the
-    // same way: as a turn that ends.
+    // Anything else that escaped the step itself came from the Core (context
+    // building, the log, the loop's own code) rather than from the model, and is
+    // reported the same way: as a turn that ends.
     if (input.context.signal.aborted) return { reason: "cancelled", text: "" };
     return { reason: "error", text: "", error: errorMessageOf(error) };
   }
@@ -154,8 +203,10 @@ async function runSteps(
     // The fixed context is read from the live registry on every step, never
     // snapshotted for the turn: a tool that appears between two steps is a tool
     // the next request must be budgeted for.
-    const fixed: FixedContext = deps.contextBuilder.getFixedContext({ tools: deps.tools, context });
-    const request: ModelRequest = await deps.contextBuilder.build({
+    const fixed: FixedContext = ownFixedContext(
+      deps.contextBuilder.getFixedContext({ tools: deps.tools, context }),
+    );
+    const candidate = await deps.contextBuilder.build({
       session,
       tools: deps.tools,
       context,
@@ -164,8 +215,20 @@ async function runSteps(
       budget: composed.budget,
       fixed,
     });
+    // The Core's own copy, with the Core's own output cap: a builder proposes,
+    // and what travels is this frozen request or nothing at all.
+    const request = ownModelRequest(candidate, composed.budget.reservedOutput);
 
-    const outcome = await runModelStep(deps.modelClient, request, context, emit);
+    const outcome = await runModelStep({
+      modelClient: deps.modelClient,
+      request,
+      limits: composed.limits,
+      fixed,
+      session,
+      turnId,
+      context,
+      emit,
+    });
 
     if (outcome.status === "cancelled") return { reason: "cancelled", text: "" };
     if (outcome.status === "failed") return { reason: "error", text: "", error: outcome.message };
@@ -221,6 +284,7 @@ const CANCELLED_TOOL_RESULT = "tool not executed: the turn was cancelled";
  * message whose tool calls are never answered is exactly the history a provider
  * rejects on the next request, and the loop's promise not to produce one cannot
  * depend on every injected ToolRegistry keeping its own.
+ *
  */
 async function dispatchTool(
   tools: ToolRegistry,
@@ -241,6 +305,17 @@ type ModelStepResult =
   | { readonly status: "cancelled" }
   | { readonly status: "failed"; readonly message: string };
 
+interface ModelStepInput {
+  readonly modelClient: ModelClient;
+  readonly request: ModelRequest;
+  readonly limits: ModelLimits;
+  readonly fixed: FixedContext;
+  readonly session: Session;
+  readonly turnId: string;
+  readonly context: RuntimeContext;
+  readonly emit: ((event: AgentLoopEvent) => void) | undefined;
+}
+
 /**
  * Consumes one model step, retrying only while nothing has reached the audience.
  *
@@ -253,16 +328,16 @@ type ModelStepResult =
  * The same rule keeps a retry invisible: it happens before anything is emitted.
  * A failure is never a `ModelEvent`: it arrives as a throw, which is also how a
  * cancellation (`signal.aborted`) is told apart from a model that broke. What a
- * retry may never do is reconsider a failure that is deterministic — a budget or
- * a provider cap that would decide the same way again — so those arrive as
- * `NonRetryableModelError` and end the turn on the first attempt.
+ * retry may never do is reconsider a failure that is deterministic — a budget, a
+ * declaration or a provider cap that would decide the same way again — so those
+ * arrive as `NonRetryableModelError` and end the turn on the first attempt.
+ *
+ * The guard runs here, once per attempt, on the very request this attempt will
+ * send: a retry re-uses one frozen semantic request, and re-proves that it still
+ * fits rather than trusting the proof it was built with.
  */
-async function runModelStep(
-  modelClient: ModelClient,
-  request: ModelRequest,
-  context: RuntimeContext,
-  emit: ((event: AgentLoopEvent) => void) | undefined,
-): Promise<ModelStepResult> {
+async function runModelStep(step: ModelStepInput): Promise<ModelStepResult> {
+  const { modelClient, request, limits, fixed, session, turnId, context, emit } = step;
   const failures: string[] = [];
   // Consecutive identical causes collapse into one, so a broken transport reads as
   // one reason instead of three, and no attempt's cause hides another's.
@@ -273,6 +348,8 @@ async function runModelStep(
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     if (context.signal.aborted) return { status: "cancelled" };
+
+    assertModelRequestFits(request, { limits, fixed, turn: { events: session.events(), turnId } });
 
     let text = "";
     const toolCalls: ToolCall[] = [];

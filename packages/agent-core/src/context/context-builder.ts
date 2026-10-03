@@ -1,3 +1,4 @@
+import { selectBoundedContext } from "./context-selection.js";
 import type { ModelBudget, ModelLimits } from "./model-budget.js";
 import type { ModelRequest, ToolSchema } from "../model/model-client.js";
 import type { RuntimeContext } from "../runtime/runtime-context.js";
@@ -37,7 +38,7 @@ export interface ContextBuilderInput extends FixedContextInput {
  *
  * Two methods, because a request is built twice in a turn's life. `build` may do
  * anything a context source needs to — await a retrieval, consult the session —
- * and returns the candidate the Core will then take over. `getFixedContext` is
+ * and returns the candidate the guard will then take over. `getFixedContext` is
  * the part that must be available synchronously and without side effects: the
  * system prompt and the tools the session currently offers, which is all the
  * admission preflight needs to decide whether a run can be sent at all, before
@@ -49,8 +50,8 @@ export interface ContextBuilder {
 }
 
 /**
- * v0.2 does three things: system prompt, the loaded window's messages, and the
- * current registry's tool schemas.
+ * v0.2 does three things: system prompt, a bounded suffix of complete turns, and
+ * the current registry's tool schemas.
  *
  * The `async` signature is part of the contract, not an accident — a future
  * builder awaits retrieval here without any call site changing.
@@ -63,13 +64,14 @@ export function createDefaultContextBuilder(systemPrompt?: string): ContextBuild
 
   return {
     getFixedContext: fixedContext,
-    async build({ session, budget, fixed }: ContextBuilderInput): Promise<ModelRequest> {
-      return {
-        ...(fixed.systemPrompt === undefined ? {} : { systemPrompt: fixed.systemPrompt }),
-        messages: session.deriveMessages(),
-        tools: fixed.tools,
-        maxOutputTokens: budget.reservedOutput,
-      };
+    async build({ session, turnId, limits, budget, fixed }: ContextBuilderInput): Promise<ModelRequest> {
+      return selectBoundedContext({
+        events: session.events(),
+        turnId,
+        fixed,
+        limits,
+        budget,
+      });
     },
   };
 }

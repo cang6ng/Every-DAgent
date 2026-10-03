@@ -226,6 +226,7 @@ describe("AgentRuntime.stream", () => {
         async runTurn() {
           throw new Error("loop exploded");
         },
+        preflight() {},
       },
     });
 

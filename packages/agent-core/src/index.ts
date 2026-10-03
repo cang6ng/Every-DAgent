@@ -35,6 +35,19 @@ export type { ModelClient, ModelEvent, ModelRequest, ToolSchema } from "./model/
 
 export { DEFAULT_MODEL_FRAMING, defineModelBudget, validateModelLimits } from "./context/model-budget.js";
 export type { ModelBudget, ModelFramingCost, ModelLimits } from "./context/model-budget.js";
+export { estimateRequestCost } from "./context/context-estimator.js";
+export { jsonDepthOf, neutralBytes, stableJSON, utf8Bytes } from "./context/stable-json.js";
+export {
+  isLegalTruncation,
+  projectSessionTurns,
+  projectTurn,
+  selectBoundedContext,
+  truncationMarker,
+} from "./context/context-selection.js";
+export type { ResultSlot, SelectionInput, SessionTurn } from "./context/context-selection.js";
+export { assertModelRequestFits, ownFixedContext, ownModelRequest } from "./context/context-guard.js";
+export type { GuardInput, GuardTurn } from "./context/context-guard.js";
+
 export type { Tool, ToolExecutionResult } from "./tools/tool.js";
 export { createToolRegistry } from "./tools/tool-registry.js";
 export type { ToolRegistry } from "./tools/tool-registry.js";
@@ -53,6 +66,7 @@ export type {
   AgentLoopDeps,
   AgentLoopEvent,
   AgentLoopInput,
+  AgentPreflightInput,
   TurnOutcome,
 } from "./loop/agent-loop.js";
 
@@ -61,5 +75,6 @@ export type {
   AgentRuntime,
   AgentRuntimeDeps,
   AgentRuntimeInput,
+  AgentRuntimePreflightInput,
   TurnResult,
 } from "./runtime/agent-runtime.js";
