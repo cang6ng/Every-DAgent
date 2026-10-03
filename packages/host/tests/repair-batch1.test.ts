@@ -251,7 +251,7 @@ describe("R01 durable location", () => {
   it("recovers storage, session, run, history and submission across a normal restart", async () => {
     await withTempDir(async (dir) => {
       const path = join(dir, "state.db");
-      const first = composeTestHost({ modelClient: MODEL().client, location: path });
+      const first = await composeTestHost({ modelClient: MODEL().client, location: path });
       const client = connect(first.host);
       await client.describe();
       await client.call("plugins.enable", { pluginId: "missing" }).catch(() => undefined);
@@ -269,7 +269,7 @@ describe("R01 durable location", () => {
       await first.host.shutdown();
 
       // The same configuration, a new process's worth of state.
-      const second = composeTestHost({ modelClient: MODEL().client, location: path });
+      const second = await composeTestHost({ modelClient: MODEL().client, location: path });
       expect(second.repository.storageId).toBe(storageId);
       expect(second.repository.getSession(session.sessionId)?.committedSeq).toBe(4);
       expect(second.repository.readHistory(session.sessionId, 100, 50).records).toHaveLength(4);
@@ -293,12 +293,12 @@ describe("R01 durable location", () => {
 
   it("refuses an empty sqlite location instead of announcing a durable host", async () => {
     for (const location of ["", "   "]) {
-      expect(() => composeTestHost({ modelClient: MODEL().client, location })).toThrow(/location/i);
+      await expect(composeTestHost({ modelClient: MODEL().client, location })).rejects.toThrow(/location/i);
     }
   });
 
   it("keeps the explicit ephemeral mode honest about its retention", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     expect(composed.repository.retention).toBe("ephemeral");
 
     const client = connect(composed.host);
@@ -317,7 +317,7 @@ describe("R01 durable location", () => {
 
 describe("R02 commit outcome reconciliation", () => {
   it("publishes the committed terminal when the commit landed but its receipt was lost", async () => {
-    const composed = composeTestHost({ modelClient: scriptedModel([textReply("answer")]).client });
+    const composed = await composeTestHost({ modelClient: scriptedModel([textReply("answer")]).client });
     const client = connect(composed.host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -349,7 +349,7 @@ describe("R02 commit outcome reconciliation", () => {
 
   it("retries the same storage batch when the commit was discarded, without re-running anything", async () => {
     const model = scriptedModel([textReply("answer")]);
-    const composed = composeTestHost({ modelClient: model.client });
+    const composed = await composeTestHost({ modelClient: model.client });
     const client = connect(composed.host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -376,7 +376,7 @@ describe("R02 commit outcome reconciliation", () => {
   });
 
   it("publishes no terminal it cannot prove, and stops new execution, when the evidence is unreadable", async () => {
-    const composed = composeTestHost({ modelClient: scriptedModel([textReply("answer")]).client });
+    const composed = await composeTestHost({ modelClient: scriptedModel([textReply("answer")]).client });
     const client = connect(composed.host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -431,7 +431,7 @@ describe("R02 commit outcome reconciliation", () => {
 describe("R05 corruption is refused", () => {
   /** Seeds one completed turn on a durable file and returns the ids. */
   async function seed(path: string, withTool = false): Promise<{ sessionId: string; runId: string }> {
-    const composed = composeTestHost({ modelClient: MODEL().client, location: path });
+    const composed = await composeTestHost({ modelClient: MODEL().client, location: path });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     const runId = withTool
       ? writeToolTurn(composed.repository, "s-1", 1)
@@ -480,7 +480,7 @@ describe("R05 corruption is refused", () => {
       database.close();
 
       const model = scriptedModel([textReply("later")]);
-      const composed = composeTestHost({ modelClient: model.client, location: path });
+      const composed = await composeTestHost({ modelClient: model.client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -506,7 +506,7 @@ describe("R05 corruption is refused", () => {
       client.detach();
       await composed.host.shutdown();
 
-      const restarted = composeTestHost({ modelClient: model.client, location: path });
+      const restarted = await composeTestHost({ modelClient: model.client, location: path });
       const again = connect(restarted.host);
       await again.describe();
       const stillRefused = await again.call("runs.start", {
@@ -539,7 +539,7 @@ describe("R05 corruption is refused", () => {
       // window the run would execute against, and the run ends as a host
       // failure rather than executing against a history it cannot trust.
       const model = scriptedModel([textReply("later")]);
-      const composed = composeTestHost({ modelClient: model.client, location: path });
+      const composed = await composeTestHost({ modelClient: model.client, location: path });
       const client = connect(composed.host);
       await client.describe();
       const started = await client.call("runs.start", {
@@ -565,7 +565,7 @@ describe("R05 corruption is refused", () => {
       database.prepare("UPDATE runs SET committed_from_seq = 888, committed_to_seq = 999 WHERE run_id = ?").run(ids.runId);
       database.close();
 
-      const composed = composeTestHost({ modelClient: MODEL().client, location: path });
+      const composed = await composeTestHost({ modelClient: MODEL().client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -612,7 +612,7 @@ describe("R06 safe persisted errors", () => {
   const SENTINEL = "M1_REPAIR_SECRET authorization=Bearer SECRET raw-provider-body";
 
   it("keeps a model's raw failure text out of storage, the wire and the replica", async () => {
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([
         replyThenFail([], new Error(SENTINEL)),
       ]).client,
@@ -653,7 +653,7 @@ describe("R06 safe persisted errors", () => {
 
 describe("R25 cancel durability", () => {
   it("re-checks the durable intent on a repeated request instead of answering from memory", async () => {
-    const composed = composeTestHost({ modelClient: scriptedModel([abortAwareReply()]).client });
+    const composed = await composeTestHost({ modelClient: scriptedModel([abortAwareReply()]).client });
     const client = connect(composed.host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -708,7 +708,7 @@ describe("R03 encoded record preflight", () => {
     const model = scriptedModel([textReply("unused")]);
     let effects = 0;
     const tool = { ...constantTool("effect"), execute: async (): Promise<string> => (effects += 1, "effect") };
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: model.client,
       plugins: [testPlugin({ id: "tools", tools: [tool] })],
     });
@@ -750,7 +750,7 @@ describe("R03 encoded record preflight", () => {
     // A step whose assistant record is over the durable bound: 70 KiB of
     // argument text encodes past 64 KiB.
     const huge = "x".repeat(70 * 1024);
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([toolReply("c1", "big", { text: huge })], { repeatLast: true }).client,
       plugins: [testPlugin({ id: "tools", tools: [tool] })],
     });
@@ -785,7 +785,7 @@ describe("R04 non-JSON tool input", () => {
     ["a Map", { lookup: new Map([["a", 1]]) }],
   ])("refuses %s before the executor is reached, with no canonical call", async (_name, input) => {
     const seen: unknown[] = [];
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([toolReply("c1", "observer", input)], { repeatLast: true }).client,
       plugins: [testPlugin({ id: "tools", tools: [recordingTool("observer", seen)] })],
     });
@@ -822,12 +822,8 @@ describe("R04 non-JSON tool input", () => {
 describe("R09 terminal run retention", () => {
   it("keeps only live runs in the host, and answers a deleted run from the store", async () => {
     let state: HostState | undefined;
-    const composed = composeHost(
-      {
-        modelClient: MODEL().client,
-        plugins: [],
-        persistence: { kind: "ephemeral" },
-      },
+    const composed = await composeTestHost(
+      { modelClient: MODEL().client, plugins: [] },
       { onState: (observed) => (state = observed) },
     );
     const client = connect(composed.host);
@@ -886,7 +882,7 @@ describe("R10 window byte budget", () => {
     ["中文", () => "汉".repeat(8 * 1024)],
     ["emoji", () => "🙂".repeat(8 * 1024)],
   ])("keeps the loaded window inside the budget with %s content", async (_name, makeAnswer) => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     for (let index = 1; index <= 24; index += 1) {
       writeTurn(composed.repository, "s-1", index, `q${index}`, makeAnswer());
@@ -900,7 +896,7 @@ describe("R10 window byte budget", () => {
   });
 
   it("stops at a turn that does not fit instead of forcing it in", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     writeTurn(composed.repository, "s-1", 1, "old", "old answer");
     writeTurn(composed.repository, "s-1", 2, "newer", "newer answer");
@@ -928,7 +924,7 @@ describe("R10 window byte budget", () => {
 
 describe("R13 run page byte bound", () => {
   it("stops a run page at the encoded byte bound and points its cursor at the last item", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     // Escaping-heavy inputs: each run's summary is far larger than its text.
     const escaped = "\u0000".repeat(6 * 1024);
@@ -969,7 +965,7 @@ describe("R13 run page byte bound", () => {
 
 describe("R14 snapshot hasMore truth", () => {
   async function snapshotFor(runCount: number, textBytes: number): Promise<{ items: number; hasMore: boolean }> {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     for (let index = 1; index <= runCount; index += 1) {
       writeTurn(composed.repository, "s-1", index, "x".repeat(textBytes) + index, `a${index}`);
@@ -1026,7 +1022,7 @@ describe("R15 active live encoded size", () => {
         return big;
       },
     };
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([
         [
           { type: "tool-call", call: { callId: "c1", name: "big", input: { n: 1 } } },
@@ -1081,7 +1077,7 @@ describe("R16 live truncation cannot control canonical truth", () => {
     for (let index = 0; index < 12; index += 1) {
       calls.push({ type: "tool-call", call: { callId: `c${index}`, name: "big", input: { n: index } } });
     }
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([calls, textReply("done")]).client,
       plugins: [testPlugin({ id: "tools", tools: [tool] })],
     });
@@ -1132,7 +1128,7 @@ describe("R16 live truncation cannot control canonical truth", () => {
     // records than one page carries: the newest page begins mid-turn, and the
     // traversal has to reconstruct the same conversation the run committed.
     const tool = constantTool("calc", { ok: true, value: 5 });
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([toolReply("c1", "calc", { a: 2, b: 3 })], { repeatLast: true }).client,
       plugins: [testPlugin({ id: "tools", tools: [tool] })],
     });
@@ -1183,7 +1179,7 @@ describe("R16 live truncation cannot control canonical truth", () => {
 
 describe("R28 combined snapshot frame", () => {
   it("shrinks its windows honestly so an escaping-heavy snapshot still travels", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     // Seven runs whose accepted inputs escape to ~39 KiB each: the composed
     // snapshot would be far past one frame if every window were kept whole.
@@ -1209,12 +1205,12 @@ describe("R28 combined snapshot frame", () => {
     await composed.host.shutdown();
   });
 
-  it("refuses to start with a static configuration that could never be published", () => {
+  it("refuses to start with a static configuration that could never be published", async () => {
     const huge = "d".repeat(300 * 1024);
     const plugin: Plugin = {
       manifest: { id: "huge", name: "Huge", version: "1.0.0", description: huge },
       activate: (): void => undefined,
     };
-    expect(() => composeTestHost({ modelClient: MODEL().client, plugins: [plugin] })).toThrow(/frame|publish/i);
+    await expect(composeTestHost({ modelClient: MODEL().client, plugins: [plugin] })).rejects.toThrow(/frame|publish/i);
   });
 });

@@ -36,6 +36,7 @@ import { openRepository, submissionHash } from "../../packages/host/src/reposito
 import type { Repository } from "../../packages/host/src/repository.js";
 
 import { TEST_MODEL_LIMITS } from "../helpers/model-limits.js";
+import { TEST_BOOTSTRAP, testComposition } from "../helpers/test-composition.js";
 
 const MAX_RECORD_BYTES = 64 * 1024;
 
@@ -376,8 +377,9 @@ describe("process crashes at the durable boundaries", () => {
       // A real host over the same file, with a model that would be called if
       // anything resumed: nothing resumes.
       const calls = { count: 0 };
-      const host = createHost({
-        modelClient: countingModel(calls),
+      const host = await createHost({
+        bootstrap: TEST_BOOTSTRAP,
+        composition: testComposition({ modelClient: countingModel(calls) }),
         plugins: [],
         persistence: { kind: "sqlite", location: databasePath },
       });

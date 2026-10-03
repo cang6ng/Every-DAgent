@@ -8,4 +8,13 @@
  */
 
 export { createHost } from "./host.js";
-export type { Host, HostOptions } from "./host.js";
+export type { Host, HostOptions, PersistenceOptions } from "./host.js";
+export type {
+  BootstrapSettings,
+  ComposeInput,
+  ComposedExecution,
+  ModelSettingsCheck,
+  SettingsRevisions,
+  TrustedComposition,
+} from "./composition.js";
+export type { HostSettings } from "./settings.js";

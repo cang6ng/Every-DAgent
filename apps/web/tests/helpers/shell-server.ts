@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createHost, type Host } from "@every-dagent/host";
+import { TEST_BOOTSTRAP, testComposition } from "../../../../tests/helpers/test-composition.js";
 import { createCalculatorPlugin } from "@every-dagent/plugin-calculator";
 import type { Plugin, PluginContext } from "@every-dagent/plugin-system";
 import type { ProtocolChannel } from "@every-dagent/protocol";
@@ -238,8 +239,9 @@ export async function startShellAcceptance(options: ShellAcceptanceOptions = {})
   const textStats = textStatsPlugin();
   const ward = createWard();
 
-  const host = createHost({
-    modelClient: model.client,
+  const host = await createHost({
+    bootstrap: TEST_BOOTSTRAP,
+    composition: testComposition({ modelClient: model.client }),
     plugins: [createCalculatorPlugin(), textStats.plugin, failingPlugin()],
   });
   const shell = await startShellServer({

@@ -31,7 +31,7 @@ describe("a lost runs.start answer", () => {
     const model = scriptedModel([toolReply("call-1", TOOL_NAME, {}), textReply("all done")]);
 
     let armed = false;
-    const platform = createHostPlatform({
+    const platform = await createHostPlatform({
       modelClient: model.client,
       plugins: [demo.plugin],
       carriers: {
@@ -102,7 +102,7 @@ describe("a lost runs.start answer", () => {
       release = resolve;
     });
     const model = scriptedModel([gatedReply(gate, textReply("finished while away"))]);
-    const platform = createHostPlatform({ modelClient: model.client, plugins: [] });
+    const platform = await createHostPlatform({ modelClient: model.client, plugins: [] });
     const client = createClientOn(platform);
     await client.connect();
 
@@ -142,7 +142,7 @@ describe("a lost runs.start answer", () => {
 
   it("does not claim anything about a submission on a different host", async () => {
     const model = scriptedModel([textReply("unused")]);
-    const platform = createHostPlatform({ modelClient: model.client, plugins: [] });
+    const platform = await createHostPlatform({ modelClient: model.client, plugins: [] });
     const client = createClientOn(platform);
     await client.connect();
 
@@ -151,7 +151,7 @@ describe("a lost runs.start answer", () => {
     await waitFor(() => client.getSnapshot().presentation?.runs.items.length === 1, { what: "the run to appear" });
 
     // A second host: a different instance, with its own lifetime.
-    const other = createHostPlatform({ modelClient: scriptedModel([textReply("other")]).client, plugins: [] });
+    const other = await createHostPlatform({ modelClient: scriptedModel([textReply("other")]).client, plugins: [] });
     const onOther = createClientOn(other);
     await onOther.connect();
 
@@ -172,7 +172,7 @@ describe("a lost runs.start answer", () => {
       release = resolve;
     });
     const model = scriptedModel([partialThenGatedReply("the beginning", gate, " and the end")]);
-    const platform = createHostPlatform({ modelClient: model.client, plugins: [] });
+    const platform = await createHostPlatform({ modelClient: model.client, plugins: [] });
     const client = createClientOn(platform);
     await client.connect();
 
@@ -219,7 +219,7 @@ describe("a lost runs.start answer", () => {
 
   it("never runs a cancelled turn's draft into history after a reconnect", async () => {
     const model = scriptedModel([partialThenAbortReply("a draft nobody should keep")]);
-    const platform = createHostPlatform({ modelClient: model.client, plugins: [] });
+    const platform = await createHostPlatform({ modelClient: model.client, plugins: [] });
     const client = createClientOn(platform);
     await client.connect();
 

@@ -76,7 +76,7 @@ interface Seeded {
  * second holds one plain run whose facts must survive whatever happens.
  */
 async function seed(path: string): Promise<Seeded> {
-  const composed = composeTestHost({
+  const composed = await composeTestHost({
     modelClient: scriptedModel(
       [
         toolReply("c-1", "observer", { n: 1 }),
@@ -197,7 +197,7 @@ describe("R05 history is held to the ownership proof", () => {
       database.close();
       const damaged = canonicalFingerprint(path, seeded.damagedSession);
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -235,7 +235,7 @@ describe("R05 history is held to the ownership proof", () => {
 
       // A restart reconciles nothing here: the block is durable, the ownership
       // damage is durable, and the history is still refused.
-      const restarted = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const restarted = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const reader = connect(restarted.host);
       await reader.describe();
       const again = await reader.call("sessions.history", { sessionId: seeded.damagedSession, limit: 5 });
@@ -263,7 +263,7 @@ describe("R05 history is held to the ownership proof", () => {
       database.close();
       const damaged = canonicalFingerprint(path, seeded.damagedSession);
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -284,7 +284,7 @@ describe("R05 history is held to the ownership proof", () => {
       const path = join(dir, "valid.db");
       const seeded = await seed(path);
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -423,7 +423,7 @@ describe("R05 legacy history fails closed", () => {
       writeV1Store(path);
       const before = canonicalFingerprint(path, "s-legacy");
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       expect(composed.repository.schemaVersion).toBe(SCHEMA_VERSION);
       const client = connect(composed.host);
       await client.describe();
@@ -504,7 +504,7 @@ async function runAwaitingLostReceipt(
   path: string,
   damage: ((database: DatabaseSync, runId: string) => void) | undefined,
 ): Promise<{
-  readonly composed: ReturnType<typeof composeTestHost>;
+  readonly composed: Awaited<ReturnType<typeof composeTestHost>>;
   readonly model: ReturnType<typeof scriptedModel>;
   readonly client: ReturnType<typeof connect>;
   readonly sessionId: string;
@@ -512,7 +512,7 @@ async function runAwaitingLostReceipt(
   readonly interference: { injected(): number; restore(): void };
 }> {
   const model = scriptedModel([textReply("answer")]);
-  const composed = composeTestHost({ modelClient: model.client, location: path });
+  const composed = await composeTestHost({ modelClient: model.client, location: path });
   const client = connect(composed.host);
   await client.describe();
   await client.call("subscriptions.open", {});
@@ -638,7 +638,7 @@ describe("R05 lost commit receipts are confirmed by the ownership proof", () => 
 
         // And the damaged evidence is refused wherever it is read: the run and
         // the history of its turn are both corruption now, never a payload.
-        const restarted = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+        const restarted = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
         const reader = connect(restarted.host);
         await reader.describe();
         const got = await reader.call("runs.get", { runId: damaged.runId });

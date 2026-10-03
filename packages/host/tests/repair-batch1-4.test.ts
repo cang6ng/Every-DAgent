@@ -89,7 +89,7 @@ function interfereWithEndingTheTransaction(): { injected(): number; restore(): v
  * never be confirmed: the state every residual below starts from.
  */
 async function faultedHost(path: string): Promise<{
-  readonly composed: ReturnType<typeof composeTestHost>;
+  readonly composed: Awaited<ReturnType<typeof composeTestHost>>;
   readonly model: ReturnType<typeof scriptedModel>;
   readonly sessionId: string;
   readonly committed: string;
@@ -98,7 +98,7 @@ async function faultedHost(path: string): Promise<{
   readonly client: ReturnType<typeof connect>;
 }> {
   const model = scriptedModel([textReply("first answer"), textReply("second answer")]);
-  const composed = composeTestHost({ modelClient: model.client, location: path });
+  const composed = await composeTestHost({ modelClient: model.client, location: path });
   const client = connect(composed.host);
   await client.describe();
   await client.call("subscriptions.open", {});
@@ -207,7 +207,7 @@ describe("R02 dedup cannot bypass the fault boundary", () => {
       // Restart is the only reconciliation: interrupted/unknown, blocked —
       // and still no re-execution.
       const readerModel = scriptedModel([textReply("unused")]);
-      const restarted = composeTestHost({ modelClient: readerModel.client, location: path });
+      const restarted = await composeTestHost({ modelClient: readerModel.client, location: path });
       const reader = connect(restarted.host);
       await reader.describe();
       const after = await reader.call("runs.get", { runId: faulted.runId });
@@ -230,7 +230,7 @@ describe("R02 plugin lifecycle respects the fault boundary", () => {
       const path = join(dir, "plugins.db");
       const activations: string[] = [];
       const model = scriptedModel([textReply("first answer"), textReply("second answer")]);
-      const composed = composeTestHost({
+      const composed = await composeTestHost({
         modelClient: model.client,
         plugins: [
           testPlugin({

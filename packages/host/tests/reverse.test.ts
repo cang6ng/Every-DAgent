@@ -18,10 +18,10 @@ import { describe, expect, it } from "vitest";
 
 import { decodeFrame, validateMessage } from "@every-dagent/protocol";
 
-import { composeHost, type AttachedConnection, type Host } from "../src/host.js";
+import type { AttachedConnection, Host } from "../src/host.js";
 import type { ReverseProfile } from "../src/reverse.js";
 
-import { connect, flush, scriptedModel, textReply } from "./helpers/harness.js";
+import { composeTestHost, connect, flush, scriptedModel, textReply } from "./helpers/harness.js";
 import {
   ECHO_METHOD,
   echoAnswerOf,
@@ -31,12 +31,12 @@ import {
   echoedOf,
 } from "./helpers/reverse-fixture.js";
 
-function composed(profiles: readonly ReverseProfile[] = [echoProfile()]): {
+async function composed(profiles: readonly ReverseProfile[] = [echoProfile()]): Promise<{
   readonly attached: AttachedConnection[];
   readonly host: Host;
-} {
+}> {
   const attached: AttachedConnection[] = [];
-  const composedHost = composeHost(
+  const composedHost = await composeTestHost(
     { modelClient: scriptedModel([textReply("unused")]).client, plugins: [] },
     {
       reverseProfiles: profiles,
@@ -54,7 +54,7 @@ async function subscribed(answer: "value" | "error" | "ignore" = "value"): Promi
   readonly client: ReturnType<typeof connect>;
   readonly host: Host;
 }> {
-  const { attached, host } = composed();
+  const { attached, host } = await composed();
   const client = connect(host, {
     reverseRequests: true,
     onReverse: (request, response) => {
@@ -109,7 +109,7 @@ describe("reverse capability", () => {
   });
 
   it("refuses to send to a client that did not declare the capability", async () => {
-    const { attached, host } = composed();
+    const { attached, host } = await composed();
     const client = connect(host, { reverseRequests: false });
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -142,7 +142,7 @@ describe("reverse capability", () => {
   });
 
   it("cannot send before the connection has a stream", async () => {
-    const { attached, host } = composed();
+    const { attached, host } = await composed();
     const client = connect(host, { reverseRequests: true });
     await client.describe();
     await flush();
@@ -179,7 +179,7 @@ describe("answers", () => {
   });
 
   it("ends the connection when an answer does not satisfy the profile", async () => {
-    const { attached, host } = composed();
+    const { attached, host } = await composed();
     const client = connect(host, {
       reverseRequests: true,
       onReverse: (_request, response) => {
@@ -200,7 +200,7 @@ describe("answers", () => {
   });
 
   it("ends the connection when the answer names another instance", async () => {
-    const { attached, host } = composed();
+    const { attached, host } = await composed();
     const client = connect(host, {
       reverseRequests: true,
       onReverse: (request, response) => {
@@ -231,7 +231,7 @@ describe("answers", () => {
   });
 
   it("ends the connection when the answer names another stream", async () => {
-    const { attached, host } = composed();
+    const { attached, host } = await composed();
     const client = connect(host, {
       reverseRequests: true,
       onReverse: (request, response) => {
@@ -262,7 +262,7 @@ describe("answers", () => {
   });
 
   it("drops a duplicate answer without settling anything twice", async () => {
-    const { attached, host } = composed();
+    const { attached, host } = await composed();
     const answers: (() => void)[] = [];
     const client = connect(host, {
       reverseRequests: true,
@@ -322,7 +322,7 @@ describe("wait lifecycle", () => {
   });
 
   it("ignores a late answer after its own cancellation", async () => {
-    const { attached, host } = composed();
+    const { attached, host } = await composed();
     const answers: (() => void)[] = [];
     const client = connect(host, {
       reverseRequests: true,
@@ -377,7 +377,7 @@ describe("wait lifecycle", () => {
   });
 
   it("ends the wait when the host shuts down, and still resolves shutdown", async () => {
-    const { attached, host } = composed();
+    const { attached, host } = await composed();
     const client = connect(host, { reverseRequests: true, onReverse: (_request, response) => response.ignore() });
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -395,7 +395,7 @@ describe("wait lifecycle", () => {
 
 describe("addressing", () => {
   it("tells only the connection that made the request", async () => {
-    const { attached, host } = composed();
+    const { attached, host } = await composed();
     const first = connect(host, { reverseRequests: true, onReverse: (_request, response) => response.ignore() });
     const second = connect(host, { reverseRequests: true });
     await first.describe();
@@ -432,7 +432,7 @@ describe("addressing", () => {
 
 describe("the deadline is armed against an entry that already exists", () => {
   it("never sends a request whose deadline passed during setup", async () => {
-    const { attached, host } = composed();
+    const { attached, host } = await composed();
     const client = connect(host, { reverseRequests: true, onReverse: (_request, response) => response.ignore() });
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -476,7 +476,7 @@ describe("the deadline is armed against an entry that already exists", () => {
   });
 
   it("settles a request at most once when cancel and answer race", async () => {
-    const { attached, host } = composed();
+    const { attached, host } = await composed();
     const answers: (() => void)[] = [];
     const client = connect(host, {
       reverseRequests: true,

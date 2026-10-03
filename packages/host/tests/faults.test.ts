@@ -98,7 +98,7 @@ async function conversation(client: TestClient, sessionId: string): Promise<read
 }
 
 async function blockedSessionRun(text: string) {
-  const host = testHost({ modelClient: scriptedModel([textReply("the answer")]).client });
+  const host = await testHost({ modelClient: scriptedModel([textReply("the answer")]).client });
   const client = connect(host);
   await client.describe();
   await client.call("subscriptions.open", {});

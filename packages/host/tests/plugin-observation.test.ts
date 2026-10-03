@@ -180,7 +180,7 @@ describe("observation of a live plugin", () => {
 describe("plugin lifecycle announcements", () => {
   it("announces a later failure that adds a cleanup failure to the safe summary", async () => {
     let attempts = 0;
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [
         testPlugin({
@@ -224,7 +224,7 @@ describe("plugin lifecycle announcements", () => {
   });
 
   it("says nothing for a request that changes nothing", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [testPlugin({ id: "calm", tools: [] })],
     });

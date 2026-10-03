@@ -38,7 +38,7 @@ interface Outcome {
  * client's presentation, so the evidence is what a UI would see.
  */
 async function accept(modelClient: ModelClient, submissionId: string): Promise<Outcome> {
-  const platform = createHostPlatform({ modelClient, plugins: [createCalculatorPlugin()] });
+  const platform = await createHostPlatform({ modelClient, plugins: [createCalculatorPlugin()] });
   open.push({ close: () => platform.shutdown() });
 
   const client = createClient({ connect: () => platform.connect() });

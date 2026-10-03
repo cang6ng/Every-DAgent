@@ -65,7 +65,7 @@ describe("turn end versus settled execution", () => {
     control.reachedEnd = reachedEnd;
     control.hold = hold;
 
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("the answer")]).client,
       plugins: [testPlugin({ id: "alpha", tools: [] })],
     });

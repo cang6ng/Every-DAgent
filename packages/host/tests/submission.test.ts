@@ -16,7 +16,7 @@ import {
 describe("submission dedup", () => {
   it("answers a repeated submission with the original run and does not execute it twice", async () => {
     const model = scriptedModel([textReply("once only")]);
-    const host = testHost({ modelClient: model.client });
+    const host = await testHost({ modelClient: model.client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -32,7 +32,7 @@ describe("submission dedup", () => {
 
   it("answers the duplicate even while the host is occupied", async () => {
     const hold = gate();
-    const host = testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
+    const host = await testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -50,7 +50,7 @@ describe("submission dedup", () => {
 
   it("refuses the same submission id with different text", async () => {
     const hold = gate();
-    const host = testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
+    const host = await testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -76,7 +76,7 @@ describe("submission dedup", () => {
 
   it("refuses the same submission id from a different session", async () => {
     const hold = gate();
-    const host = testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
+    const host = await testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
     const client = connect(host);
     await client.describe();
     const first = await createSessionThrough(client);
@@ -94,7 +94,7 @@ describe("submission dedup", () => {
 
   it("creates one run when the same submission is sent twice without waiting", async () => {
     const model = scriptedModel([textReply("once")]);
-    const host = testHost({ modelClient: model.client });
+    const host = await testHost({ modelClient: model.client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -114,7 +114,7 @@ describe("submission dedup", () => {
 
   it("does not claim a submission id that was refused", async () => {
     const hold = gate();
-    const host = testHost({ modelClient: scriptedModel([gatedReply(hold), textReply("second")]).client });
+    const host = await testHost({ modelClient: scriptedModel([gatedReply(hold), textReply("second")]).client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -145,7 +145,7 @@ describe("submission dedup", () => {
 
   it("does not claim a submission id refused for an unknown session", async () => {
     const model = scriptedModel([textReply("answer")]);
-    const host = testHost({ modelClient: model.client });
+    const host = await testHost({ modelClient: model.client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -161,7 +161,7 @@ describe("submission dedup", () => {
   });
 
   it("keeps the dedup record after an accepted run fails", async () => {
-    const host = testHost({ modelClient: scriptedModel([]).client });
+    const host = await testHost({ modelClient: scriptedModel([]).client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -183,7 +183,7 @@ describe("response loss and reconnect", () => {
   it("finds the run by submission id from a new connection", async () => {
     const hold = gate();
     const model = scriptedModel([gatedReply(hold)]);
-    const host = testHost({ modelClient: model.client });
+    const host = await testHost({ modelClient: model.client });
 
     const first = connect(host);
     const firstDescription = await first.describe();
@@ -211,8 +211,8 @@ describe("response loss and reconnect", () => {
 
   it("does not know a submission from a different host instance", async () => {
     const model = scriptedModel([textReply("answer")]);
-    const first = testHost({ modelClient: model.client });
-    const second = testHost({ modelClient: model.client });
+    const first = await testHost({ modelClient: model.client });
+    const second = await testHost({ modelClient: model.client });
 
     const firstClient = connect(first);
     await firstClient.describe();

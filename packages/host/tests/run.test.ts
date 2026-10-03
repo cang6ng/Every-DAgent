@@ -62,7 +62,7 @@ async function conversation(client: TestClient, sessionId: string): Promise<read
 
 describe("run lifecycle", () => {
   it("announces accepted, then running, then the terminal publication", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("the answer")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("the answer")]).client });
     const client = connect(host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -85,7 +85,7 @@ describe("run lifecycle", () => {
   });
 
   it("binds the Core turn id once, and only after it is observed", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("hi")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("hi")]).client });
     const client = connect(host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -107,7 +107,7 @@ describe("run lifecycle", () => {
 
   it("points the session at its active run while it runs, and clears it at the end", async () => {
     const hold = gate();
-    const host = testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
+    const host = await testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
     const client = connect(host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -138,7 +138,7 @@ describe("run lifecycle", () => {
 
   it("refuses a second run aimed at a session that already has one", async () => {
     const hold = gate();
-    const host = testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
+    const host = await testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -165,7 +165,7 @@ describe("run lifecycle", () => {
 
   it("refuses a run on another session while the host is occupied", async () => {
     const hold = gate();
-    const host = testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
+    const host = await testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
     const client = connect(host);
     await client.describe();
     const busySession = await createSessionThrough(client);
@@ -190,7 +190,7 @@ describe("run lifecycle", () => {
   });
 
   it("answers runs.get by run id or by submission id", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("hi")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("hi")]).client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -208,7 +208,7 @@ describe("run lifecycle", () => {
   });
 
   it("reports a recorded turn as limited when the step budget runs out", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([toolReply("call-1", "echo", { value: 1 })], { repeatLast: true }).client,
       plugins: [pluginWith([constantTool("echo", "42")])],
     });
@@ -236,7 +236,7 @@ describe("run lifecycle", () => {
 describe("live timeline", () => {
   it("folds chunks into one text item and fills the tool occurrence", async () => {
     const hold = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([
         toolReply("call-1", "echo", { value: 7 }),
         gatedReply(hold, [{ type: "text-delta", text: "The " }, { type: "text-delta", text: "answer" }, { type: "done" }]),
@@ -299,7 +299,7 @@ describe("live timeline", () => {
 
   it("keeps a second text item after a tool call instead of appending to the first", async () => {
     const hold = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([
         textAndToolReply("before", "call-1", "echo", {}),
         gatedReply(hold, textReply("after")),
@@ -340,7 +340,7 @@ describe("live timeline", () => {
   });
 
   it("keeps an empty and a repeated call id as separate occurrences", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([
         [
           { type: "tool-call", call: { callId: "", name: "echo", input: { n: 1 } } },
@@ -379,7 +379,7 @@ describe("live timeline", () => {
 
 describe("cancellation", () => {
   it("records the request, announces it, and lets the Core decide the outcome", async () => {
-    const host = testHost({ modelClient: scriptedModel([abortAwareReply()]).client });
+    const host = await testHost({ modelClient: scriptedModel([abortAwareReply()]).client });
     const client = connect(host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -408,7 +408,7 @@ describe("cancellation", () => {
   });
 
   it("does not repeat the request, and returns the terminal state for a finished run", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("answer")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("answer")]).client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -421,7 +421,7 @@ describe("cancellation", () => {
   });
 
   it("answers an unknown run id with RUN_NOT_FOUND", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("hi")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("hi")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -431,7 +431,7 @@ describe("cancellation", () => {
   it("stays busy while an aborted run has not settled", async () => {
     const started = gate();
     const release = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([toolReply("call-1", "slow", {})]).client,
       plugins: [pluginWith([gatedTool("slow", release, started)])],
     });
@@ -477,7 +477,7 @@ describe("cancellation", () => {
 
 describe("terminal publication", () => {
   it("carries the terminal run and the settled session in one event", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("answer")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("answer")]).client });
     const client = connect(host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -506,7 +506,7 @@ describe("terminal publication", () => {
   });
 
   it("never publishes a terminal run with a live timeline, or an active one without it", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([toolReply("call-1", "echo", {}), textReply("done")]).client,
       plugins: [pluginWith([constantTool("echo", "42")])],
     });
@@ -530,7 +530,7 @@ describe("terminal publication", () => {
   });
 
   it("removes a failed step's draft and keeps only what the log recorded", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([
         replyThenFail([{ type: "text-delta", text: "half an answer" }], new Error("provider died")),
       ]).client,
@@ -549,7 +549,7 @@ describe("terminal publication", () => {
   });
 
   it("removes a cancelled step's draft without claiming anything about its tools", async () => {
-    const host = testHost({ modelClient: scriptedModel([partialThenAbortReply("thinking out loud")]).client });
+    const host = await testHost({ modelClient: scriptedModel([partialThenAbortReply("thinking out loud")]).client });
     const client = connect(host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -576,7 +576,7 @@ describe("terminal publication", () => {
   });
 
   it("announces an accepted run before its own response is written", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("done")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("done")]).client });
     const client = connect(host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -609,7 +609,7 @@ describe("terminal publication", () => {
   it("keeps previous turns published and appends the new one", async () => {
     const spoken = (item: CanonicalItem): string =>
       item.kind === "user" || item.kind === "assistant" ? item.text : item.kind;
-    const host = testHost({ modelClient: scriptedModel([textReply("first"), textReply("second")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("first"), textReply("second")]).client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);

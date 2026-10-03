@@ -118,6 +118,18 @@ function positiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
+/**
+ * Whether this adapter has serializer evidence for one pi-ai API.
+ *
+ * The composition uses this to refuse an un-audited profile at validation time,
+ * which is the same judgement `boundedProfileOf` makes at construction — one
+ * table, asked in both places, so a profile cannot be acceptable to a settings
+ * write and unacceptable to the client that would run it.
+ */
+export function isAuditedApi(api: string): boolean {
+  return Object.hasOwn(AUDITED_PROFILES, api);
+}
+
 /** What the adapter has to know to run: the capability, and the audited shape. */
 interface BoundedProfile {
   readonly limits: ModelLimits;

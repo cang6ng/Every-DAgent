@@ -61,7 +61,7 @@ async function twoTurns(client: TestClient, submissionPrefix: string): Promise<s
 
 describe("C2 cursor authority", () => {
   it("refuses a revision the fence never carried", async () => {
-    const host = composeTestHost({
+    const host = await composeTestHost({
       modelClient: scriptedModel([textReply("one"), textReply("two")]).client,
     });
     const client = connect(host.host);
@@ -95,7 +95,7 @@ describe("C2 cursor authority", () => {
   });
 
   it("refuses a fence inside a turn", async () => {
-    const host = composeTestHost({
+    const host = await composeTestHost({
       modelClient: scriptedModel([textReply("one"), textReply("two")]).client,
     });
     const client = connect(host.host);
@@ -121,7 +121,7 @@ describe("C2 cursor authority", () => {
   });
 
   it("serves a legal cursor — including one for an older boundary — and derives the identity itself", async () => {
-    const host = composeTestHost({
+    const host = await composeTestHost({
       modelClient: scriptedModel([textReply("one"), textReply("two")]).client,
     });
     const client = connect(host.host);
@@ -157,7 +157,7 @@ describe("C2 cursor authority", () => {
 
   it("keeps a legal cursor valid across a restart", async () => {
     const path = join(tempDir(), "cursor.db");
-    const first = composeTestHost({
+    const first = await composeTestHost({
       modelClient: scriptedModel([textReply("one"), textReply("two")]).client,
       location: path,
     });
@@ -169,7 +169,7 @@ describe("C2 cursor authority", () => {
     client.detach();
     await first.host.shutdown();
 
-    const second = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+    const second = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
     const reader = connect(second.host);
     try {
       await reader.describe();

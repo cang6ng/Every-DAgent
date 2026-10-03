@@ -107,7 +107,7 @@ async function runAndInspect(options: {
   readonly tools?: Parameters<typeof testPlugin>[0]["tools"];
   readonly before?: (client: Awaited<ReturnType<typeof connect>>, sessionId: string) => Promise<void>;
 }) {
-  const host = testHost({
+  const host = await testHost({
     modelClient: scriptedModel(options.replies, { repeatLast: true }).client,
     plugins:
       options.tools === undefined

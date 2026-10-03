@@ -19,6 +19,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createClient } from "@every-dagent/client";
 import { createHost } from "@every-dagent/host";
+import { TEST_BOOTSTRAP, testComposition } from "../../../tests/helpers/test-composition.js";
 
 import { connectHttpChannel } from "../src/index.js";
 import { parseCliArgs, runShellCli } from "../src/server/main.js";
@@ -77,7 +78,11 @@ async function waitFor(predicate: () => boolean, what: string, timeoutMs = 5000)
 beforeAll(async () => {
   outDir = await ensureShellBuild();
   pages = await startStaticServer({ root: join(outDir, "public") });
-  const host = createHost({ modelClient: offlineModel().client, plugins: [] });
+  const host = await createHost({
+    bootstrap: TEST_BOOTSTRAP,
+    composition: testComposition({ modelClient: offlineModel().client }),
+    plugins: [],
+  });
   shell = await startShellServer({ host, staticRoot: join(outDir, "public") });
   closers.push(async () => {
     await shell.close();
@@ -272,8 +277,19 @@ describe("the shell command line", () => {
       [
         'import { writeFileSync } from "node:fs";',
         'import { createHost } from "./server.mjs";',
-        "export function createShellHost() {",
-        `  const host = createHost({ modelClient: { limits: ${FIXTURE_LIMITS_JSON}, stream: async function* () { yield { type: "done" }; } }, plugins: [] });`,
+        "export async function createShellHost() {",
+        `  const modelClient = { limits: ${FIXTURE_LIMITS_JSON}, stream: async function* () { yield { type: "done" }; } };`,
+        `  const host = await createHost({`,
+        `    bootstrap: { host: { systemPrompt: "", loop: { maxSteps: 12, maxModelAttempts: 3 } }, model: { provider: "fixture", model: "fixture" } },`,
+        `    composition: {`,
+        `      validateModel: (value) =>`,
+        `        typeof value === "object" && value !== null && !Array.isArray(value) && value.provider === "fixture" && value.model === "fixture"`,
+        `          ? { ok: true }`,
+        `          : { ok: false, reason: "unknown-provider-model" },`,
+        `      compose: async () => ({ modelClient }),`,
+        `    },`,
+        `    plugins: [],`,
+        `  });`,
         "  return {",
         "    attach: (channel) => host.attach(channel),",
         `    shutdown: async () => { await host.shutdown(); writeFileSync(${JSON.stringify(marker)}, "released"); },`,
@@ -330,9 +346,17 @@ describe("the shell command line", () => {
       compositionPath,
       [
         'import { createHost } from "./server.mjs";',
-        "export function createShellHost() {",
+        "export async function createShellHost() {",
+        `  const modelClient = { limits: ${FIXTURE_LIMITS_JSON}, stream: async function* () { yield { type: "done" }; } };`,
         "  return createHost({",
-        `    modelClient: { limits: ${FIXTURE_LIMITS_JSON}, stream: async function* () { yield { type: "done" }; } },`,
+        '    bootstrap: { host: { systemPrompt: "", loop: { maxSteps: 12, maxModelAttempts: 3 } }, model: { provider: "fixture", model: "fixture" } },',
+        "    composition: {",
+        "      validateModel: (value) =>",
+        '        typeof value === "object" && value !== null && !Array.isArray(value) && value.provider === "fixture" && value.model === "fixture"',
+        "          ? { ok: true }",
+        '          : { ok: false, reason: "unknown-provider-model" },',
+        "      compose: async () => ({ modelClient }),",
+        "    },",
         "    plugins: [],",
         "  });",
         "}",

@@ -70,7 +70,7 @@ interface Seeded {
  * result, the closing assistant, `turn/end`.
  */
 async function seed(path: string): Promise<Seeded> {
-  const composed = composeTestHost({
+  const composed = await composeTestHost({
     modelClient: scriptedModel(
       [toolReply("c-1", "observer", { n: 1 }), textReply("one"), toolReply("c-2", "observer", { n: 2 }), textReply("two")],
       { repeatLast: true },
@@ -156,7 +156,7 @@ describe("R05 history binds every record to its own turn's committed range", () 
       // not about the page: the smallest page of this traversal is exactly the
       // second turn's closing assistant record — mid-turn, no boundary in it,
       // a fragment the page's own range rules deliberately cannot judge.
-      const intactHost = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const intactHost = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const intactClient = connect(intactHost.host);
       await intactClient.describe();
       const intact = await intactClient.call("sessions.history", { sessionId: seeded.session, limit: 1 });
@@ -174,7 +174,7 @@ describe("R05 history binds every record to its own turn's committed range", () 
       tamper.close();
       const damaged = canonicalFingerprint(path, seeded.session);
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -200,7 +200,7 @@ describe("R05 history binds every record to its own turn's committed range", () 
       expect(canonicalFingerprint(path, seeded.session)).toBe(damaged);
 
       // A restart reconciles nothing: the damage is durable and still refused.
-      const restarted = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const restarted = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const reader = connect(restarted.host);
       await reader.describe();
       const again = await reader.call("sessions.history", { sessionId: seeded.session, limit: 1 });
@@ -261,7 +261,7 @@ async function runAwaitingLostReceipt(
   path: string,
   damage: ((database: DatabaseSync, runId: string) => void) | undefined,
 ): Promise<{
-  readonly composed: ReturnType<typeof composeTestHost>;
+  readonly composed: Awaited<ReturnType<typeof composeTestHost>>;
   readonly model: ReturnType<typeof scriptedModel>;
   readonly client: ReturnType<typeof connect>;
   readonly sessionId: string;
@@ -269,7 +269,7 @@ async function runAwaitingLostReceipt(
   readonly interference: { injected(): number; restore(): void };
 }> {
   const model = scriptedModel([textReply("answer")]);
-  const composed = composeTestHost({ modelClient: model.client, location: path });
+  const composed = await composeTestHost({ modelClient: model.client, location: path });
   const client = connect(composed.host);
   await client.describe();
   await client.call("subscriptions.open", {});
@@ -342,7 +342,7 @@ describe("R05 commit confirmation holds the records to the run read's authority"
 
       // And the damaged evidence is refused wherever it is read: the run and
       // the history of its turn are both corruption now, never a payload.
-      const restarted = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const restarted = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const reader = connect(restarted.host);
       await reader.describe();
       const got = await reader.call("runs.get", { runId: damaged.runId });

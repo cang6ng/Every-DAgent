@@ -70,7 +70,7 @@ interface Seeded {
  * index's own owner binding can tell which run committed which.
  */
 async function seed(path: string): Promise<Seeded> {
-  const composed = composeTestHost({
+  const composed = await composeTestHost({
     modelClient: scriptedModel(
       [
         toolReply("c-1", "observer", { n: 1 }),
@@ -185,7 +185,7 @@ describe("E2 run/turn ownership", () => {
       const damaged = canonicalFingerprint(path, seeded.swapSession);
 
       const model = scriptedModel([textReply("unused")]);
-      const composed = composeTestHost({ modelClient: model.client, location: path });
+      const composed = await composeTestHost({ modelClient: model.client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -256,7 +256,7 @@ describe("E2 run/turn ownership", () => {
       database.close();
       const damaged = canonicalFingerprint(path, seeded.swapSession);
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -293,7 +293,7 @@ describe("E2 run/turn ownership", () => {
       database.close();
       const damaged = canonicalFingerprint(path, seeded.swapSession);
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -308,7 +308,7 @@ describe("E2 run/turn ownership", () => {
   });
 
   it("serves a run whose accepted input is verbatim, whitespace and Unicode included", async () => {
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([textReply("ok")], { repeatLast: true }).client,
     });
     const client = connect(composed.host);
@@ -344,7 +344,7 @@ describe("E2 run/turn ownership", () => {
       database.prepare("UPDATE runs SET committed_from_seq = committed_from_seq + 1 WHERE run_id = ?").run(seeded.first);
       database.close();
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
       const got = await client.call("runs.get", { runId: seeded.first });
@@ -369,7 +369,7 @@ describe("E2 run/turn ownership", () => {
         .run(seeded.bystanderSession, seeded.swapSession, turn);
       database.close();
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
       const got = await client.call("runs.get", { runId: seeded.first });
@@ -392,7 +392,7 @@ describe("E2 run/turn ownership", () => {
       database.prepare("UPDATE runs SET text = ? WHERE run_id = ?").run("TAMPERED", seeded.first);
       database.close();
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
       await client.call("runs.get", { runId: seeded.first });
@@ -424,7 +424,7 @@ describe("E2 run/turn ownership", () => {
   it("serves the settled turns that are not `completed` exactly as they were committed", async () => {
     await withTempDir(async (dir) => {
       const path = join(dir, "settled.db");
-      const composed = composeTestHost({
+      const composed = await composeTestHost({
         modelClient: scriptedModel([
           // One turn that spends the whole step budget on tool calls — twelve
           // model calls, one per step, and then the limit...
@@ -460,7 +460,7 @@ describe("E2 run/turn ownership", () => {
 
       // Both are read back from a fresh host: the binding holds for every
       // settled outcome, not only for `completed`.
-      const restarted = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const restarted = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const reader = connect(restarted.host);
       await reader.describe();
       const keptLimited = await reader.call("runs.get", { runId: limited.runId });
@@ -568,7 +568,7 @@ describe("E2 legacy stores", () => {
       const before = canonicalFingerprint(path, "s-legacy");
 
       const model = scriptedModel([textReply("unused")]);
-      const composed = composeTestHost({ modelClient: model.client, location: path });
+      const composed = await composeTestHost({ modelClient: model.client, location: path });
       expect(composed.repository.schemaVersion).toBe(SCHEMA_VERSION);
       const client = connect(composed.host);
       await client.describe();

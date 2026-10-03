@@ -62,44 +62,51 @@ const unreachable: PiAiStreamSource = {
  * the composition: `hostBuilt` is the evidence that the host factory was never
  * reached, and therefore that no ready host and no admitted run were possible.
  */
-function composeExecution(model: Model<never>): { readonly hostBuilt: boolean; readonly platform?: HostPlatform } {
-  let hostBuilt = false;
-  const modelClient = createPiAiModelClient({ models: unreachable, model, apiKey: "unused" });
+async function composeExecution(
+  model: Model<never>,
+): Promise<
+  | { readonly hostBuilt: false; readonly error: unknown }
+  | { readonly hostBuilt: true; readonly platform: HostPlatform }
+> {
+  let modelClient;
+  try {
+    modelClient = createPiAiModelClient({ models: unreachable, model, apiKey: "unused" });
+  } catch (error) {
+    return { hostBuilt: false, error };
+  }
 
-  hostBuilt = true;
-  const platform = createHostPlatform({ modelClient, plugins: [] });
+  const platform = await createHostPlatform({ modelClient, plugins: [] });
   open.push(platform);
-  return { hostBuilt, platform };
+  return { hostBuilt: true, platform };
 }
 
 describe("the execution profile a composition runs", () => {
-  it("cannot be composed at all when its API has no enforceable output cap", () => {
+  it("cannot be composed at all when its API has no enforceable output cap", async () => {
     const unsupported: Model<"openai-responses"> = {
       ...(BASE_MODEL as unknown as Model<"openai-responses">),
       api: "openai-responses",
     };
 
-    let hostBuilt = false;
-    expect(() => {
-      const composed = composeExecution(unsupported as unknown as Model<never>);
-      hostBuilt = composed.hostBuilt;
-    }).toThrow(UnsupportedPiAiProfileError);
+    const refused = await composeExecution(unsupported as unknown as Model<never>);
+    expect(refused.hostBuilt).toBe(false);
+    if (refused.hostBuilt) throw new Error("unreachable");
+    expect(refused.error).toBeInstanceOf(UnsupportedPiAiProfileError);
 
     // No host was built, so there is no `host.describe` to succeed and no
     // `runs.start` to accept anything: the refusal happened before the part of
     // the composition that a run could have gone through.
-    expect(hostBuilt).toBe(false);
   });
 
-  it("cannot be composed for an interface pi-ai does not even claim", () => {
+  it("cannot be composed for an interface pi-ai does not even claim", async () => {
     const undeclared: Model<"faux"> = {
       ...(BASE_MODEL as unknown as Model<"faux">),
       api: "faux",
     };
 
-    expect(() => composeExecution(undeclared as unknown as Model<never>)).toThrow(
-      /not one whose output cap this adapter can enforce/,
-    );
+    const refused = await composeExecution(undeclared as unknown as Model<never>);
+    expect(refused.hostBuilt).toBe(false);
+    if (refused.hostBuilt) throw new Error("unreachable");
+    expect(String(refused.error)).toContain("not one whose output cap this adapter can enforce");
   });
 
   it("still composes a ready host for an audited profile", async () => {
@@ -108,12 +115,13 @@ describe("the execution profile a composition runs", () => {
       api: "openai-completions",
     };
 
-    const composed = composeExecution(audited as unknown as Model<never>);
+    const composed = await composeExecution(audited as unknown as Model<never>);
 
     // The same helper, the same order: with a profile the adapter can enforce,
     // the composition exists and a client can reach it.
     expect(composed.hostBuilt).toBe(true);
-    const platform = composed.platform as HostPlatform;
+    if (!composed.hostBuilt) throw new Error("unreachable");
+    const platform = composed.platform;
     const client = createClient({ connect: () => platform.connect() });
 
     await client.connect();

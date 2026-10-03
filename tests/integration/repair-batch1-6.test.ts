@@ -43,7 +43,7 @@ describe("N1 the page is proven by the run read on the real platform", () => {
     await withTempDir(async (dir) => {
       const path = join(dir, "pair.db");
       const model = scriptedModel([textReply("A answer"), textReply("B answer")]);
-      const seedPlatform = createHostPlatform({
+      const seedPlatform = await createHostPlatform({
         modelClient: model.client,
         plugins: [],
         persistence: { kind: "sqlite", location: path },
@@ -75,7 +75,7 @@ describe("N1 the page is proven by the run read on the real platform", () => {
       database.prepare("UPDATE runs SET committed_to_seq = 8 WHERE run_id = ?").run(one.run.runId);
       database.close();
 
-      const platform = createHostPlatform({
+      const platform = await createHostPlatform({
         modelClient: scriptedModel([textReply("unused")]).client,
         plugins: [],
         persistence: { kind: "sqlite", location: path },
@@ -119,7 +119,7 @@ describe("N2 an unfinished owner run is not proof on the real platform", () => {
     await withTempDir(async (dir) => {
       const path = join(dir, "vacuous.db");
       const model = scriptedModel([textReply("A answer"), textReply("B answer")]);
-      const seedPlatform = createHostPlatform({
+      const seedPlatform = await createHostPlatform({
         modelClient: model.client,
         plugins: [],
         persistence: { kind: "sqlite", location: path },
@@ -157,7 +157,7 @@ describe("N2 an unfinished owner run is not proof on the real platform", () => {
         .run(one.run.runId);
       database.close();
 
-      const platform = createHostPlatform({
+      const platform = await createHostPlatform({
         modelClient: scriptedModel([textReply("unused")]).client,
         plugins: [],
         persistence: { kind: "sqlite", location: path },

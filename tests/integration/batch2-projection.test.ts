@@ -35,7 +35,7 @@ async function platformFor(
 ): Promise<{ readonly platform: HostPlatform; readonly model: ReturnType<typeof scriptedModel> }> {
   const model = scriptedModel(replies);
   let binding: HttpBinding | undefined;
-  const platform = createHostPlatform({
+  const platform = await createHostPlatform({
     modelClient: model.client,
     plugins,
     ...(carrier === "web"
@@ -309,7 +309,7 @@ for (const carrier of ["memory", "web"] as const) {
             yield { type: "done" as const };
           },
         ]);
-        const platform = createHostPlatform({ modelClient: model.client, plugins: [], source });
+        const platform = await createHostPlatform({ modelClient: model.client, plugins: [], source });
         open.push({ close: () => platform.shutdown() });
         const client = createClientOn(platform);
         try {
@@ -394,7 +394,7 @@ for (const carrier of ["memory", "web"] as const) {
         },
       ]);
       let binding: HttpBinding | undefined;
-      const platform = createHostPlatform({
+      const platform = await createHostPlatform({
         modelClient: model.client,
         plugins: [],
         ...(carrier === "web"

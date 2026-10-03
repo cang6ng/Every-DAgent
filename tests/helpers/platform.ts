@@ -8,7 +8,8 @@
  * and over the web binding.
  */
 
-import type { Host, HostOptions } from "@every-dagent/host";
+import type { ModelClient } from "@every-dagent/agent-core";
+import type { BootstrapSettings, Host, HostOptions, TrustedComposition } from "@every-dagent/host";
 // The host's composition seam: the only way to register a test-only reverse
 // profile. It is deliberately outside the package's public surface, so this
 // reaches the source file directly — a repository-relative path, not a package
@@ -23,16 +24,28 @@ import { createClient, type Client, type ClientSnapshot } from "@every-dagent/cl
 import { createClientWith, type ClientInternals } from "../../packages/client/src/client.js";
 
 import { createCarrierPair, type CarrierOptions, type CarrierPair } from "./protocol-carrier.js";
+import { TEST_BOOTSTRAP, testComposition, type TestCatalogEntry } from "./test-composition.js";
 
 /** How a client reaches a host: one logical connection per call. */
 export type ChannelSource = () => Promise<ProtocolChannel>;
 
-export interface HostPlatformOptions extends HostOptions {
+export interface HostPlatformOptions extends Omit<HostOptions, "bootstrap" | "composition"> {
   readonly carriers?: CarrierOptions;
   /** Test-only reverse profiles; the production catalog is empty. */
   readonly reverseProfiles?: readonly ReverseProfile[];
   /** Overrides the carrier entirely, e.g. to bind a real web transport. */
   readonly source?: ChannelSource;
+  /**
+   * The model this platform's fixture composition hands the host. Ignored when
+   * a whole composition is supplied instead.
+   */
+  readonly modelClient?: ModelClient;
+  /** A catalogue the fixture composition accepts; absent means "any shaped value". */
+  readonly catalog?: readonly TestCatalogEntry[];
+  /** The defaults a store with no configuration is initialized from. */
+  readonly bootstrap?: BootstrapSettings;
+  /** A trusted composition of the test's own, replacing the fixture one. */
+  readonly composition?: TrustedComposition;
 }
 
 export interface HostPlatform {
@@ -48,14 +61,27 @@ export interface HostPlatform {
 }
 
 /** The host plus a memory-carrier channel source. */
-export function createHostPlatform(options: HostPlatformOptions): HostPlatform {
+export async function createHostPlatform(options: HostPlatformOptions): Promise<HostPlatform> {
   const attached: AttachedConnection[] = [];
-  const composed = composeHost(options, {
-    ...(options.reverseProfiles === undefined ? {} : { reverseProfiles: options.reverseProfiles }),
-    onAttach: (connection) => {
-      attached.push(connection);
+  const { modelClient, catalog, bootstrap, composition, ...hostOptions } = options;
+  const composed = await composeHost(
+    {
+      ...hostOptions,
+      bootstrap: bootstrap ?? TEST_BOOTSTRAP,
+      composition:
+        composition ??
+        testComposition({
+          modelClient: requiredModel(modelClient),
+          ...(catalog === undefined ? {} : { catalog }),
+        }),
     },
-  });
+    {
+      ...(options.reverseProfiles === undefined ? {} : { reverseProfiles: options.reverseProfiles }),
+      onAttach: (connection) => {
+        attached.push(connection);
+      },
+    },
+  );
   const host = composed.host;
   const carriers: CarrierPair[] = [];
   let connections = 0;
@@ -78,6 +104,17 @@ export function createHostPlatform(options: HostPlatformOptions): HostPlatform {
     },
     shutdown: (): Promise<void> => host.shutdown(),
   };
+}
+
+/**
+ * The model a platform needs: either the scripted client a test supplied, or a
+ * composition of its own that does not need one.
+ */
+function requiredModel(modelClient: ModelClient | undefined): ModelClient {
+  if (modelClient === undefined) {
+    throw new Error("a test platform needs either a model client or a composition of its own");
+  }
+  return modelClient;
 }
 
 export interface ClientOnPlatformOptions {

@@ -2,24 +2,33 @@
  * The composition root: one host, owning its storage, its sessions, its runs,
  * its registry and its connections.
  *
- * The host builds everything it needs and hands out nothing. Composition — the
- * model client, the plugins, the grants — comes in; a channel goes in and only
- * ever causes protocol messages to come out. There is no second entry point
- * that could reach around the gate, and no registry, session or manager object
- * leaves this package.
+ * The host builds everything it needs and hands out nothing. Configuration
+ * comes in as trusted defaults and a persisted desired value; a trusted
+ * composition turns those into the execution the host will run; the plugins and
+ * the grants come in the same way. There is no second entry point that could
+ * reach around this one — no pre-built model client, no pre-built context
+ * builder — because either would be a way to run something the persisted
+ * configuration never approved.
  *
- * Startup is a sequence with an owner, not a checklist. Storage is opened and
- * its schema checked first, because nothing may run against a store this build
- * does not understand; the instance identity is minted next; the execution
- * dependencies are composed; and the previous instance's unfinished runs are
- * reconciled *before* the first frame can be accepted. A host that cannot
- * finish that sequence throws here — it does not come up in a degraded mode,
- * and a durable store that fails never turns into an in-memory one.
+ * Startup is an asynchronous sequence with an owner, not a checklist. Storage
+ * is opened and its schema checked first, because nothing may run against a
+ * store this build does not understand. Then the desired configuration is read
+ * — initialized once from the trusted defaults if the store has never held one
+ * — and every value that will become effective is validated *now*, whatever its
+ * history: a stored setting is trusted because it passed this check, never
+ * because it was once accepted. Only then does the trusted composition build
+ * execution, and only after that is the previous instance's unfinished work
+ * reconciled. A host that cannot finish the sequence rejects here — it does not
+ * come up in a degraded mode, and a durable store that fails never turns into
+ * an in-memory one.
  *
- * Shutdown is the same sequence backwards: stop accepting work, drop the
- * readers, ask the run to stop, wait for everything already accepted to settle,
- * release the plugins, and close the store last, after every execution that
- * could still write to it has ended.
+ * Shutdown is the same sequence backwards, in the order the resources were
+ * taken: stop accepting work, drop the readers, ask the run to stop, wait for
+ * everything already accepted to settle, release the plugins, dispose the
+ * execution the composition built, and close the store last, after every
+ * execution that could still write to it has ended. A startup that fails
+ * halfway runs the same tail in the same order, so a composition never outlives
+ * the store it was built against.
  */
 
 import {
@@ -27,13 +36,16 @@ import {
   createAgentRuntime,
   createDefaultContextBuilder,
   createToolRegistry,
+  LOOP_RESOURCE_LIMITS,
+  validateLoopResourceLimits,
 } from "@every-dagent/agent-core";
-import type { ContextBuilder, ModelClient } from "@every-dagent/agent-core";
 import { createPluginManager } from "@every-dagent/plugin-system";
 import type { Plugin, PluginPermission, PluginStorage } from "@every-dagent/plugin-system";
 import type { OperationMap, ProtocolChannel } from "@every-dagent/protocol";
 import { PROTOCOL_VERSION, validateMessage } from "@every-dagent/protocol";
 
+import type { BootstrapSettings, ComposedExecution, TrustedComposition } from "./composition.js";
+import { loadConfiguration } from "./configuration.js";
 import { closeConnection, createConnection, observePlugin } from "./connection.js";
 import { handleFrame } from "./dispatch.js";
 import { guardedModelClient, openTurnOf } from "./guard.js";
@@ -58,7 +70,7 @@ import {
 import { encodeFrame } from "@every-dagent/protocol";
 
 const HOST_NAME = "every-dagent-host";
-const HOST_VERSION = "0.2.0";
+const HOST_VERSION = "0.3.0";
 
 /**
  * Where the host's durable truth lives.
@@ -72,16 +84,27 @@ export type PersistenceOptions =
   | { readonly kind: "sqlite"; readonly location: string };
 
 /**
- * What the composition injects.
+ * What the trusted caller injects.
  *
  * Types come from the packages that own them, not from the protocol: the wire
- * contract never learns what a `ModelClient` or a `Plugin` is.
+ * contract never learns what a `ModelClient`, a `Plugin` or a `TrustedComposition`
+ * is. There is deliberately no `modelClient` or `contextBuilder` here: a
+ * pre-built execution would be a way to run something the persisted settings
+ * never approved, and the host would have no seam left to apply a restart to.
  */
 export interface HostOptions {
-  /** Required so a host always has a way to think; the adapter is the caller's choice. */
-  readonly modelClient: ModelClient;
-  /** Defaults to the Core's own builder; pass one to add a system prompt. */
-  readonly contextBuilder?: ContextBuilder;
+  /**
+   * The non-secret defaults a store with no configuration is initialized with,
+   * exactly once. They are validated before they are persisted, and never
+   * written again once a desired value exists.
+   */
+  readonly bootstrap: BootstrapSettings;
+  /**
+   * The trusted composition: what validates a model profile and what turns the
+   * effective settings into an executable `ModelClient`. Credentials are
+   * resolved inside it; the host never holds one.
+   */
+  readonly composition: TrustedComposition;
   /** Trusted plugins, registered once and disabled until a client enables them. */
   readonly plugins: readonly Plugin[];
   readonly grants?: Readonly<Record<string, readonly PluginPermission[]>>;
@@ -137,26 +160,52 @@ export interface ComposedHost {
   attach(channel: ProtocolChannel): AttachedConnection;
 }
 
-export function createHost(options: HostOptions): Host {
-  return composeHost(options, {}).host;
+export async function createHost(options: HostOptions): Promise<Host> {
+  return (await composeHost(options, {})).host;
 }
 
 /** The real composition: `createHost` is this with no internals. */
-export function composeHost(options: HostOptions, internals: HostInternals): ComposedHost {
-  const persistence = options.persistence ?? { kind: "ephemeral" };
+export async function composeHost(options: HostOptions, internals: HostInternals): Promise<ComposedHost> {
+  const persistence = options?.persistence ?? { kind: "ephemeral" };
   const repository = openRepository({
     location: persistence.kind === "sqlite" ? persistence.location : ":memory:",
     limits: { maxRecordBytes: HOST_LIMITS.maxRecordBytes },
   });
 
-  let state: HostState;
+  let state: HostState | undefined;
+  let execution: ComposedExecution | undefined;
+
   try {
     const hostInstanceId = newId();
 
-    // Reconciliation is part of coming up, not something that happens later: a
-    // previous instance's unfinished runs are settled here, before any frame
-    // can be accepted, so no client ever sees a run this host cannot explain.
-    repository.reconcileInterrupted(hostInstanceId, Date.now());
+    // The desired configuration first, and never rewritten: a store that holds
+    // one is read and validated; a store that holds none is initialized once
+    // from the trusted defaults, in one transaction that leaves nothing behind
+    // if it cannot finish.
+    const loaded = loadConfiguration({
+      repository,
+      bootstrap: options.bootstrap,
+      composition: options.composition,
+      at: Date.now(),
+    });
+
+    // Execution is built from the effective values, by the composition that
+    // vetted them. From the moment this returns, everything it took belongs to
+    // this host — including on the failure paths below.
+    execution = await options.composition.compose({
+      host: loaded.host,
+      model: loaded.model,
+      revisions: loaded.revisions,
+    });
+
+    // The loop's own profile: the approved resource bounds, tightened by the
+    // effective settings. `validateLoopResourceLimits` is the one reader, so a
+    // number that could not drive the loop is refused before the loop exists.
+    const loopLimits = validateLoopResourceLimits({
+      ...LOOP_RESOURCE_LIMITS,
+      maxSteps: loaded.host.loop.maxSteps,
+      maxModelAttempts: loaded.host.loop.maxModelAttempts,
+    });
 
     const registry = createToolRegistry();
     const manager = createPluginManager({
@@ -164,22 +213,33 @@ export function composeHost(options: HostOptions, internals: HostInternals): Com
       ...(options.grants === undefined ? {} : { grants: options.grants }),
       ...(options.storage === undefined ? {} : { storage: options.storage }),
     });
-    const contextBuilder = options.contextBuilder ?? createDefaultContextBuilder();
+    // The composition's own builder wins when it provides one; otherwise the
+    // Core's default builder applies the effective system prompt. An empty
+    // prompt is the same as none: it is what a store that was never configured
+    // with one holds.
+    const contextBuilder =
+      execution.contextBuilder ?? createDefaultContextBuilder(systemPromptOf(loaded.host.systemPrompt));
     const loop = createAgentLoop({
       // The composition's client, with the durable step guard in front of it:
       // a step that cannot be owned as JSON, or whose records could never be
       // stored at the turn's own identity, is refused before it can declare a
       // tool call — so nothing executes that could not be kept.
-      modelClient: guardedModelClient(options.modelClient, {
+      modelClient: guardedModelClient(execution.modelClient, {
         maxRecordBytes: HOST_LIMITS.maxRecordBytes,
-        turnOf: (): StepTurnIdentity | undefined => currentStepTurn(state),
+        turnOf: (): StepTurnIdentity | undefined => (state === undefined ? undefined : currentStepTurn(state)),
       }),
       tools: registry,
       contextBuilder,
+      limits: loopLimits,
     });
     const reverseProfiles = internals.reverseProfiles ?? [];
 
-    state = {
+    // Reconciliation is part of coming up, not something that happens later: a
+    // previous instance's unfinished runs are settled here, before any frame
+    // can be accepted, so no client ever sees a run this host cannot explain.
+    repository.reconcileInterrupted(hostInstanceId, Date.now());
+
+    const hostState: HostState = {
       hostInstanceId,
       name: HOST_NAME,
       version: HOST_VERSION,
@@ -189,6 +249,12 @@ export function composeHost(options: HostOptions, internals: HostInternals): Com
       gate: createRegistryGate(),
       repository,
       limits: HOST_LIMITS,
+      configuration: {
+        effective: loaded.effective,
+        host: loaded.host,
+        revisions: loaded.revisions,
+      },
+      disposeComposition: execution.dispose,
       plugins: new Map(),
       pluginOrder: [],
       runs: new Map(),
@@ -198,48 +264,98 @@ export function composeHost(options: HostOptions, internals: HostInternals): Com
       closing: false,
       shutdown: undefined,
     };
+    state = hostState;
 
     // Registration is configuration, and configuration mistakes stop the host
     // from existing: a host that cannot list a plugin it was given has no honest
     // way to announce itself as ready.
     for (const plugin of options.plugins) manager.register(plugin);
     for (const info of manager.list()) {
-      state.plugins.set(info.manifest.id, projectPluginInfo(info));
-      state.pluginOrder.push(info.manifest.id);
+      hostState.plugins.set(info.manifest.id, projectPluginInfo(info));
+      hostState.pluginOrder.push(info.manifest.id);
     }
 
-    assertSelfDescription(state);
+    assertSelfDescription(hostState);
+
+    internals.onRepository?.(repository);
+    internals.onState?.(hostState);
+
+    const attach = (channel: ProtocolChannel): AttachedConnection => {
+      const connection = attachConnection(hostState, channel, internals.reverseProfiles ?? []);
+      const attached: AttachedConnection = {
+        channel,
+        reverse: createReverseTrigger(hostState, connection),
+        detach: (): void => {
+          detachConnection(hostState, connection);
+        },
+      };
+      internals.onAttach?.(attached);
+      return attached;
+    };
+
+    return {
+      repository,
+      host: {
+        attach: (channel: ProtocolChannel): (() => void) => attach(channel).detach,
+        shutdown: (): Promise<void> => shutdownHost(hostState),
+      },
+      attach,
+    };
   } catch (error) {
-    // Nothing exists yet, so nothing is left behind: the store is released and
-    // the failure is the caller's to see.
-    repository.close();
+    // Whatever exists is released in the order it was taken — plugins settled,
+    // plugins released, execution disposed, store closed last — so a failure
+    // during startup cannot leave a composition holding a store the host has
+    // given up on.
+    await releaseStartup(state, execution, repository);
     throw error;
   }
+}
 
-  internals.onRepository?.(repository);
-  internals.onState?.(state);
+/**
+ * Releases whatever a failed startup had already taken, in the order the
+ * resources were acquired.
+ *
+ * The order is the contract, not a detail: a plugin lifecycle that is still
+ * settling must be waited for before its tools are released, the execution the
+ * composition built outlives neither, and the store is closed last because
+ * everything above it may still be writing. Nothing here throws — the failure
+ * being cleaned up after is the fact worth reporting.
+ */
+async function releaseStartup(
+  state: HostState | undefined,
+  execution: ComposedExecution | undefined,
+  repository: Repository,
+): Promise<void> {
+  if (state !== undefined) {
+    try {
+      while (state.pending.size > 0) await Promise.all([...state.pending]);
+      await state.gate.idle();
+    } catch {
+      // Nothing was running; there is nothing left to settle.
+    }
+    try {
+      await releasePlugins(state);
+    } catch {
+      // A plugin that could not be released is reported by the failed startup
+      // itself; the store still has to be closed.
+    }
+  }
 
-  const attach = (channel: ProtocolChannel): AttachedConnection => {
-    const connection = attachConnection(state, channel, internals.reverseProfiles ?? []);
-    const attached: AttachedConnection = {
-      channel,
-      reverse: createReverseTrigger(state, connection),
-      detach: (): void => {
-        detachConnection(state, connection);
-      },
-    };
-    internals.onAttach?.(attached);
-    return attached;
-  };
+  if (execution?.dispose !== undefined) {
+    try {
+      await execution.dispose();
+    } catch {
+      // The composition owns its own cleanup; a failing disposer does not stop
+      // the store from being released.
+    }
+  }
 
-  return {
-    repository,
-    host: {
-      attach: (channel: ProtocolChannel): (() => void) => attach(channel).detach,
-      shutdown: (): Promise<void> => shutdownHost(state),
-    },
-    attach,
-  };
+  repository.close();
+}
+
+/** The system prompt the default builder applies, or `undefined` for none. */
+function systemPromptOf(systemPrompt: string): string | undefined {
+  return systemPrompt === "" ? undefined : systemPrompt;
 }
 
 /**
@@ -444,6 +560,17 @@ async function executeShutdown(state: HostState): Promise<void> {
   await state.gate.idle();
 
   const unreleased = await releasePlugins(state);
+
+  // The execution the composition built goes with the plugins: a provider
+  // client that outlived the store it was configured from would be a live
+  // socket nobody owns.
+  if (state.disposeComposition !== undefined) {
+    try {
+      await state.disposeComposition();
+    } catch {
+      unreleased.push("composition");
+    }
+  }
 
   // The store is released last, and it is released even when a plugin could not
   // be: an execution that is over must not leave the file locked, and the

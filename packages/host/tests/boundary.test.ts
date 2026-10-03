@@ -56,6 +56,8 @@ describe("dependency boundary", () => {
   it("keeps the source tree to the planned modules", () => {
     expect([...srcRelative].sort()).toEqual(
       [
+        "composition.ts",
+        "configuration.ts",
         "connection.ts",
         "dispatch.ts",
         "errors.ts",
@@ -70,6 +72,7 @@ describe("dependency boundary", () => {
         "reverse.ts",
         "run.ts",
         "settings-profile.ts",
+        "settings.ts",
         "state.ts",
       ].sort(),
     );

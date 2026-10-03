@@ -111,14 +111,14 @@ async function seamPlatform(
   profiles: readonly ReverseProfile[],
   plugins: readonly Plugin[] = [],
 ): Promise<{
-  readonly platform: ReturnType<typeof createHostPlatform>;
+  readonly platform: Awaited<ReturnType<typeof createHostPlatform>>;
   readonly binding: HttpBinding | undefined;
   readonly open: (internals: ClientInternals) => Promise<ReturnType<typeof createClientOn>>;
 }> {
   const model = scriptedModel([textReply("unused")]);
   let binding: HttpBinding | undefined;
 
-  const platform = createHostPlatform({
+  const platform = await createHostPlatform({
     modelClient: model.client,
     plugins: [...plugins],
     reverseProfiles: profiles,
@@ -153,7 +153,7 @@ async function seam(
   carrier: "memory" | "web",
   profiles: readonly ReverseProfile[] = hostProfiles(),
 ): Promise<{
-  readonly platform: ReturnType<typeof createHostPlatform>;
+  readonly platform: Awaited<ReturnType<typeof createHostPlatform>>;
   readonly client: ReturnType<typeof createClientOn>;
   readonly binding: HttpBinding | undefined;
   readonly seam: Seam;
@@ -343,7 +343,7 @@ for (const carrier of ["memory", "web"] as const) {
 describe("the seam's own boundary", () => {
   it("ships no business method: the production catalog is empty", async () => {
     const model = scriptedModel([textReply("unused")]);
-    const platform = createHostPlatform({ modelClient: model.client, plugins: [] });
+    const platform = await createHostPlatform({ modelClient: model.client, plugins: [] });
     const client = createClientOn(platform);
     await client.connect();
 

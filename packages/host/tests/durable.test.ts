@@ -139,7 +139,7 @@ interface ScenarioResult {
  */
 async function runScenario(location: string | undefined): Promise<ScenarioResult> {
   const model = scriptedModel([textReply("first answer"), textReply("second answer")]);
-  const composed = composeTestHost({
+  const composed = await composeTestHost({
     modelClient: model.client,
     ...(location === undefined ? {} : { location }),
   });
@@ -184,7 +184,7 @@ describe("ephemeral and durable are the same host", () => {
   });
 
   it("declares which retention the composition actually got", async () => {
-    const ephemeral = testHost({ modelClient: MODEL().client });
+    const ephemeral = await testHost({ modelClient: MODEL().client });
     const ephemeralClient = connect(ephemeral);
     const described = await ephemeralClient.describe();
     expect(described.result?.storage.retention).toBe("ephemeral");
@@ -192,7 +192,7 @@ describe("ephemeral and durable are the same host", () => {
     await ephemeral.shutdown();
 
     await withTempDir(async (dir) => {
-      const composed = composeTestHost({ modelClient: MODEL().client, location: storePath(dir) });
+      const composed = await composeTestHost({ modelClient: MODEL().client, location: storePath(dir) });
       const client = connect(composed.host);
       const durable = await client.describe();
       expect(durable.result?.storage.retention).toBe("durable");
@@ -201,7 +201,7 @@ describe("ephemeral and durable are the same host", () => {
 
       // A stable identity across restarts, and one that was actually recorded:
       // a second host that invented its own id would still look consistent.
-      const again = composeTestHost({ modelClient: MODEL().client, location: storePath(dir) });
+      const again = await composeTestHost({ modelClient: MODEL().client, location: storePath(dir) });
       const second = connect(again.host);
       const restarted = await second.describe();
       expect(restarted.result?.storage.storageId).toBe(durable.result?.storage.storageId);
@@ -219,7 +219,7 @@ describe("what a crash leaves behind, and what the next start says about it", ()
   it("turns an accepted run with no start marker into interrupted / not-started", async () => {
     await withTempDir(async (dir) => {
       const path = storePath(dir);
-      const first = composeTestHost({ modelClient: MODEL().client, location: path });
+      const first = await composeTestHost({ modelClient: MODEL().client, location: path });
       const created = first.repository.createSession({ sessionId: "s-accepted", title: "t", createdAt: 1 });
       void created;
       // The durable state at "admission committed, start not committed".
@@ -235,7 +235,7 @@ describe("what a crash leaves behind, and what the next start says about it", ()
       expect(accepted.kind).toBe("admitted");
       await first.host.shutdown();
 
-      const second = composeTestHost({ modelClient: MODEL().client, location: path });
+      const second = await composeTestHost({ modelClient: MODEL().client, location: path });
       const client = connect(second.host);
       await client.describe();
       const run = await client.call("runs.get", { runId: "r-accepted" });
@@ -257,7 +257,7 @@ describe("what a crash leaves behind, and what the next start says about it", ()
   it("turns a running run with no terminal into interrupted / unknown and blocks the session", async () => {
     await withTempDir(async (dir) => {
       const path = storePath(dir);
-      const first = composeTestHost({ modelClient: MODEL().client, location: path });
+      const first = await composeTestHost({ modelClient: MODEL().client, location: path });
       first.repository.createSession({ sessionId: "s-running", title: "t", createdAt: 1 });
       first.repository.admitRun({
         runId: "r-running",
@@ -271,7 +271,7 @@ describe("what a crash leaves behind, and what the next start says about it", ()
       first.repository.markRunStarted("r-running", "first-host", 11);
       await first.host.shutdown();
 
-      const second = composeTestHost({ modelClient: MODEL().client, location: path });
+      const second = await composeTestHost({ modelClient: MODEL().client, location: path });
       const client = connect(second.host);
       await client.describe();
       const run = await client.call("runs.get", { runId: "r-running" });
@@ -299,12 +299,12 @@ describe("what a crash leaves behind, and what the next start says about it", ()
   it("keeps a committed terminal exactly as it was, whatever happened afterwards", async () => {
     await withTempDir(async (dir) => {
       const path = storePath(dir);
-      const first = composeTestHost({ modelClient: MODEL().client, location: path });
+      const first = await composeTestHost({ modelClient: MODEL().client, location: path });
       first.repository.createSession({ sessionId: "s-done", title: "t", createdAt: 1 });
       writeTurn(first.repository, "s-done", 1);
       await first.host.shutdown();
 
-      const second = composeTestHost({ modelClient: MODEL().client, location: path });
+      const second = await composeTestHost({ modelClient: MODEL().client, location: path });
       const client = connect(second.host);
       await client.describe();
       const run = await client.call("runs.get", { runId: "seed-run-1" });
@@ -325,7 +325,7 @@ describe("what a crash leaves behind, and what the next start says about it", ()
   it("reconciles idempotently: a second start finds nothing left to repair", async () => {
     await withTempDir(async (dir) => {
       const path = storePath(dir);
-      const first = composeTestHost({ modelClient: MODEL().client, location: path });
+      const first = await composeTestHost({ modelClient: MODEL().client, location: path });
       first.repository.createSession({ sessionId: "s-x", title: "t", createdAt: 1 });
       first.repository.createSession({ sessionId: "s-y", title: "t", createdAt: 2 });
       first.repository.admitRun({
@@ -349,7 +349,7 @@ describe("what a crash leaves behind, and what the next start says about it", ()
       first.repository.markRunStarted("r-b", "first", 12);
       await first.host.shutdown();
 
-      const second = composeTestHost({ modelClient: MODEL().client, location: path });
+      const second = await composeTestHost({ modelClient: MODEL().client, location: path });
       const firstPass = second.repository.reconcileInterrupted("second", 100);
       expect(firstPass.interrupted).toBe(0);
       const secondPass = second.repository.reconcileInterrupted("second", 200);
@@ -367,7 +367,7 @@ describe("what a crash leaves behind, and what the next start says about it", ()
   it("survives a crash during reconciliation: the next start finishes the same repair", async () => {
     await withTempDir(async (dir) => {
       const path = storePath(dir);
-      const first = composeTestHost({ modelClient: MODEL().client, location: path });
+      const first = await composeTestHost({ modelClient: MODEL().client, location: path });
       first.repository.createSession({ sessionId: "s-c", title: "t", createdAt: 1 });
       first.repository.admitRun({
         runId: "r-c",
@@ -383,9 +383,9 @@ describe("what a crash leaves behind, and what the next start says about it", ()
       // must find the same final state rather than repairing it again.
       await first.host.shutdown();
 
-      const second = composeTestHost({ modelClient: MODEL().client, location: path });
+      const second = await composeTestHost({ modelClient: MODEL().client, location: path });
       await second.host.shutdown();
-      const third = composeTestHost({ modelClient: MODEL().client, location: path });
+      const third = await composeTestHost({ modelClient: MODEL().client, location: path });
       const run = third.repository.getRun("r-c");
       expect(run?.status).toBe("interrupted");
       expect(run?.executionKnowledge).toBe("unknown");
@@ -418,7 +418,7 @@ describe("a live host's own crash points", () => {
       },
     };
 
-    const composed = composeTestHost({ modelClient: model });
+    const composed = await composeTestHost({ modelClient: model });
     let runId = "";
     probe = (): { readonly status?: string; readonly startedAt?: number | null } | undefined => {
       const record = composed.repository.listUnfinishedRuns()[0];
@@ -445,7 +445,7 @@ describe("a live host's own crash points", () => {
 
   it("does not run a tool or a model again when a terminal commit's answer is lost", async () => {
     const model = scriptedModel([textReply("only once")]);
-    const composed = composeTestHost({ modelClient: model.client });
+    const composed = await composeTestHost({ modelClient: model.client });
     const client = connect(composed.host);
     await client.describe();
     const session = await client.call("sessions.create", {});
@@ -473,7 +473,7 @@ describe("a live host's own crash points", () => {
     await withTempDir(async (dir) => {
       const path = storePath(dir);
       const model = scriptedModel([textReply("once")]);
-      const first = composeTestHost({ modelClient: model.client, location: path });
+      const first = await composeTestHost({ modelClient: model.client, location: path });
       const client = connect(first.host);
       await client.describe();
       const session = await client.call("sessions.create", {});
@@ -487,7 +487,7 @@ describe("a live host's own crash points", () => {
       await first.host.shutdown();
 
       const secondModel = scriptedModel([textReply("should never run")]);
-      const second = composeTestHost({ modelClient: secondModel.client, location: path });
+      const second = await composeTestHost({ modelClient: secondModel.client, location: path });
       const secondClient = connect(second.host);
       await secondClient.describe();
       const repeated = await secondClient.call("runs.start", { sessionId, submissionId, text: "hello" });
@@ -513,7 +513,7 @@ describe("a live host's own crash points", () => {
       const path = storePath(dir);
       const held = gate();
       const model = scriptedModel([gatedReply(held)]);
-      const first = composeTestHost({ modelClient: model.client, location: path });
+      const first = await composeTestHost({ modelClient: model.client, location: path });
       const client = connect(first.host);
       await client.describe();
       const session = await client.call("sessions.create", {});
@@ -533,7 +533,7 @@ describe("a live host's own crash points", () => {
       held.open();
       await flush();
 
-      const second = composeTestHost({ modelClient: MODEL().client, location: path });
+      const second = await composeTestHost({ modelClient: MODEL().client, location: path });
       const recovered = second.repository.getRun(runId);
       expect(recovered?.status).toBe("interrupted");
       expect(recovered?.executionKnowledge).toBe("unknown");
@@ -553,7 +553,7 @@ describe("a live host's own crash points", () => {
 
 describe("business transactions", () => {
   it("admits atomically: the run, the submission and the session pointer land together", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
 
     const admitted = composed.repository.admitRun({
@@ -586,7 +586,7 @@ describe("business transactions", () => {
   });
 
   it("refuses a submission reused for different work, and never rewrites the first", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     composed.repository.admitRun({
       runId: "r-1",
@@ -613,7 +613,7 @@ describe("business transactions", () => {
   });
 
   it("commits a settled turn and its run terminal together, or not at all", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     composed.repository.admitRun({
       runId: "r-1",
@@ -674,7 +674,7 @@ describe("business transactions", () => {
 
 describe("history pages", () => {
   it("reports coverage, boundaries and a continuation that never widens", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     for (let index = 1; index <= 4; index += 1) writeTurn(composed.repository, "s-1", index);
 
@@ -710,7 +710,7 @@ describe("history pages", () => {
   });
 
   it("keeps a cursor valid when a later turn is appended after the fence", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     for (let index = 1; index <= 3; index += 1) writeTurn(composed.repository, "s-1", index);
 
@@ -735,7 +735,7 @@ describe("history pages", () => {
   });
 
   it("does not invalidate a history cursor when the session is renamed", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     for (let index = 1; index <= 3; index += 1) writeTurn(composed.repository, "s-1", index);
 
@@ -762,7 +762,7 @@ describe("history pages", () => {
   });
 
   it("refuses a cursor whose session is gone, and refuses a malformed one", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     for (let index = 1; index <= 3; index += 1) writeTurn(composed.repository, "s-1", index);
 
@@ -791,7 +791,7 @@ describe("history pages", () => {
   });
 
   it("refuses a directory cursor from before a catalogue change", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     for (let index = 1; index <= 3; index += 1) {
       composed.repository.createSession({ sessionId: `s-${index}`, title: `t${index}`, createdAt: index });
     }
@@ -819,7 +819,7 @@ describe("history pages", () => {
   });
 
   it("retires the submission of a deleted session instead of releasing it", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     writeTurn(composed.repository, "s-1", 1);
 
@@ -847,7 +847,7 @@ describe("history pages", () => {
   });
 
   it("does not shrink canonical history when a session is renamed or read", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     writeTurn(composed.repository, "s-1", 1);
 
@@ -875,7 +875,7 @@ describe("history pages", () => {
 describe("bounded reads", () => {
   it("does not hand the model a whole conversation, however long it is", async () => {
     const model = scriptedModel([textReply("ok")]);
-    const composed = composeTestHost({ modelClient: model.client });
+    const composed = await composeTestHost({ modelClient: model.client });
     composed.repository.createSession({ sessionId: "s-long", title: "t", createdAt: 1 });
     for (let index = 1; index <= 120; index += 1) writeTurn(composed.repository, "s-long", index);
     expect(composed.repository.getSession("s-long")?.committedSeq).toBe(480);
@@ -903,7 +903,7 @@ describe("bounded reads", () => {
   });
 
   it("keeps the published snapshot bounded and says so", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     for (let index = 1; index <= 30; index += 1) {
       composed.repository.createSession({ sessionId: `s-${index}`, title: `t${index}`, createdAt: index });
     }
@@ -923,7 +923,7 @@ describe("bounded reads", () => {
   });
 
   it("splits a page inside a turn rather than overrunning the item bound", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     for (let index = 1; index <= 20; index += 1) writeTurn(composed.repository, "s-1", index);
 
@@ -947,30 +947,30 @@ describe("storage ownership and schema", () => {
   it("refuses a second host on the same file", async () => {
     await withTempDir(async (dir) => {
       const path = storePath(dir);
-      const first = composeTestHost({ modelClient: MODEL().client, location: path });
-      expect(() => composeTestHost({ modelClient: MODEL().client, location: path })).toThrow();
+      const first = await composeTestHost({ modelClient: MODEL().client, location: path });
+      await expect(composeTestHost({ modelClient: MODEL().client, location: path })).rejects.toThrow();
       await first.host.shutdown();
 
       // And releasing it lets the next host in: the lock is the host's, not the
       // file's.
-      const third = composeTestHost({ modelClient: MODEL().client, location: path });
+      const third = await composeTestHost({ modelClient: MODEL().client, location: path });
       await third.host.shutdown();
     });
   });
 
   it("refuses a schema newer than this build understands", async () => {
-    await withTempDir((dir) => {
+    await withTempDir(async (dir) => {
       const path = storePath(dir);
       const database = new DatabaseSync(path);
       database.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 7}`);
       database.close();
 
-      expect(() => composeTestHost({ modelClient: MODEL().client, location: path })).toThrow();
+      await expect(composeTestHost({ modelClient: MODEL().client, location: path })).rejects.toThrow();
     });
   });
 
   it("rolls a failed migration back instead of leaving half a schema", async () => {
-    await withTempDir((dir) => {
+    await withTempDir(async (dir) => {
       const path = storePath(dir);
       const database = new DatabaseSync(path);
       // Version 0 with a conflicting table: migration 1 cannot create its own
@@ -979,7 +979,7 @@ describe("storage ownership and schema", () => {
       database.exec("PRAGMA user_version = 0");
       database.close();
 
-      expect(() => composeTestHost({ modelClient: MODEL().client, location: path })).toThrow();
+      await expect(composeTestHost({ modelClient: MODEL().client, location: path })).rejects.toThrow();
 
       const check = new DatabaseSync(path);
       const tables = check
@@ -994,18 +994,18 @@ describe("storage ownership and schema", () => {
   });
 
   it("fails loudly rather than falling back to memory", async () => {
-    await withTempDir((dir) => {
+    await withTempDir(async (dir) => {
       // A directory is not a database file.
-      expect(() => composeTestHost({ modelClient: MODEL().client, location: dir })).toThrow();
+      await expect(composeTestHost({ modelClient: MODEL().client, location: dir })).rejects.toThrow();
     });
   });
 
   it("releases the store on shutdown, so the next host can take it", async () => {
     await withTempDir(async (dir) => {
       const path = storePath(dir);
-      const first = composeTestHost({ modelClient: MODEL().client, location: path });
+      const first = await composeTestHost({ modelClient: MODEL().client, location: path });
       await first.host.shutdown();
-      const second = composeTestHost({ modelClient: MODEL().client, location: path });
+      const second = await composeTestHost({ modelClient: MODEL().client, location: path });
       await second.host.shutdown();
     });
   });
@@ -1017,7 +1017,7 @@ describe("storage ownership and schema", () => {
 
 describe("run listings", () => {
   it("lists a session's runs newest first, with a revision and a cursor", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     for (let index = 1; index <= 3; index += 1) writeTurn(composed.repository, "s-1", index);
 
@@ -1045,7 +1045,7 @@ describe("run listings", () => {
 
 describe("admission limits", () => {
   it("refuses an input larger than the published bound, before admitting it", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     const client = connect(composed.host);
     const described = await client.describe();
     const bound = described.result?.limits.maxInputBytes ?? 0;
@@ -1067,7 +1067,7 @@ describe("admission limits", () => {
   });
 
   it("refuses a page larger than one page may carry, on both sides", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     const client = connect(composed.host);
     const described = await client.describe();
     const maximum = described.result?.limits.maxPageItems ?? 0;
@@ -1111,7 +1111,7 @@ describe("records the store cannot keep whole", () => {
       tools: [constantTool("big", oversized)],
     });
     const model = scriptedModel([toolReply("call-1", "big", {}), textReply("done")]);
-    const composed = composeTestHost({ modelClient: model.client, plugins: [plugin] });
+    const composed = await composeTestHost({ modelClient: model.client, plugins: [plugin] });
 
     const client = connect(composed.host);
     await client.describe();
@@ -1154,7 +1154,7 @@ describe("records the store cannot keep whole", () => {
 describe("catalogue revisions", () => {
   it("advances the plugin revision and announces it when a lifecycle change lands", async () => {
     const plugin = testPlugin({ id: "demo", tools: [constantTool("demo")] });
-    const composed = composeTestHost({ modelClient: MODEL().client, plugins: [plugin] });
+    const composed = await composeTestHost({ modelClient: MODEL().client, plugins: [plugin] });
     const client = connect(composed.host);
     await client.describe();
     await client.call("subscriptions.open", {});

@@ -85,7 +85,7 @@ describe("R02 a repeated submission is refused on a faulted platform", () => {
       const path = join(dir, "fault.db");
       const tools = demoPlugin("tools", "observer", "observed");
       const model = scriptedModel([toolReply("call-1", "observer", { n: 1 }), textReply("finished")]);
-      const platform = createHostPlatform({
+      const platform = await createHostPlatform({
         modelClient: model.client,
         plugins: [tools.plugin],
         persistence: { kind: "sqlite", location: path },
@@ -167,7 +167,7 @@ describe("R05 history is refused when its turn ownership cannot be proven", () =
 
       // Two settled conversations: the one that will be tampered with, and the
       // bystander whose facts must be served exactly as committed.
-      const seedPlatform = createHostPlatform({
+      const seedPlatform = await createHostPlatform({
         modelClient: scriptedModel([textReply("an answer"), textReply("bystander answer")]).client,
         plugins: [],
         persistence: { kind: "sqlite", location: path },
@@ -201,7 +201,7 @@ describe("R05 history is refused when its turn ownership cannot be proven", () =
         .run(JSON.stringify({ text: "TAMPERED" }), damaged.session.sessionId);
       database.close();
 
-      const platform = createHostPlatform({
+      const platform = await createHostPlatform({
         modelClient: scriptedModel([textReply("unused")]).client,
         plugins: [],
         persistence: { kind: "sqlite", location: path },

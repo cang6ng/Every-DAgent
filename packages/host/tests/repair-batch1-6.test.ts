@@ -65,7 +65,7 @@ interface Seeded {
 
 /** One session holding two plain committed turns: [0,4) and [4,8). */
 async function seed(path: string): Promise<Seeded> {
-  const composed = composeTestHost({
+  const composed = await composeTestHost({
     modelClient: scriptedModel([textReply("A answer"), textReply("B answer")]).client,
     location: path,
   });
@@ -102,7 +102,7 @@ describe("N1 a page is proven by the run read, not by a turn-side pair", () => {
 
       // The honest shape first: the smallest page of this traversal is the
       // second turn's closing assistant record — mid-turn, no boundary.
-      const intactHost = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const intactHost = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const intact = connect(intactHost.host);
       await intact.describe();
       const before = await intact.call("sessions.history", { sessionId: seeded.session, limit: 1 });
@@ -125,7 +125,7 @@ describe("N1 a page is proven by the run read, not by a turn-side pair", () => {
       pair.close();
       const damaged = canonicalFingerprint(path, seeded.session);
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -153,7 +153,7 @@ describe("N1 a page is proven by the run read, not by a turn-side pair", () => {
       expect(canonicalFingerprint(path, seeded.session)).toBe(damaged);
 
       // A restart reconciles nothing: the forged pair is durable and refused.
-      const restarted = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const restarted = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const reader = connect(restarted.host);
       await reader.describe();
       const again = await reader.call("sessions.history", { sessionId: seeded.session, limit: 1 });
@@ -181,7 +181,7 @@ describe("N1 a page is proven by the run read, not by a turn-side pair", () => {
       relabel.close();
       const damaged = canonicalFingerprint(path, seeded.session);
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -226,7 +226,7 @@ describe("N1 a page is proven by the run read, not by a turn-side pair", () => {
         .run(seeded.first);
       erase.close();
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -252,7 +252,7 @@ describe("N1 a page is proven by the run read, not by a turn-side pair", () => {
       const path = join(dir, "valid.db");
       const seeded = await seed(path);
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
 

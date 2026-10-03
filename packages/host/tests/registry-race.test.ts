@@ -32,7 +32,7 @@ function slowPlugin(id: string, activation: Promise<void>, cleanup?: Promise<voi
 describe("run versus plugin lifecycle", () => {
   it("gives the registry to whoever asks first, and answers the other HOST_BUSY", async () => {
     const hold = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([gatedReply(hold)]).client,
       plugins: [testPlugin({ id: "alpha", tools: [constantTool("alpha-tool")] })],
     });
@@ -58,7 +58,7 @@ describe("run versus plugin lifecycle", () => {
 
   it("refuses a run while a plugin lifecycle operation is in flight", async () => {
     const activation = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("hi")]).client,
       plugins: [slowPlugin("alpha", activation.promise)],
     });
@@ -94,7 +94,7 @@ describe("run versus plugin lifecycle", () => {
 
   it("refuses a run while a cleanup is still running", async () => {
     const cleanup = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("hi")]).client,
       plugins: [slowPlugin("alpha", Promise.resolve(), cleanup.promise)],
     });
@@ -128,7 +128,7 @@ describe("run versus plugin lifecycle", () => {
 
   it("refuses a second plugin mutation while one is in flight", async () => {
     const activation = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("hi")]).client,
       plugins: [slowPlugin("alpha", activation.promise), testPlugin({ id: "beta", tools: [] })],
     });
@@ -152,7 +152,7 @@ describe("run versus plugin lifecycle", () => {
 
   it("applies the busy policy to a plugin request that would be a no-op", async () => {
     const hold = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([gatedReply(hold)]).client,
       plugins: [testPlugin({ id: "alpha", tools: [] })],
     });
@@ -180,7 +180,7 @@ describe("run versus plugin lifecycle", () => {
   it("releases the registry only once the aborted run has settled", async () => {
     const started = gate();
     const release = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([toolReply("call-1", "slow", {})]).client,
       plugins: [testPlugin({ id: "alpha", tools: [gatedTool("slow", release, started)] })],
     });
@@ -212,7 +212,7 @@ describe("run versus plugin lifecycle", () => {
 
   it("never blocks reads, cancellation or subscription traffic behind the gate", async () => {
     const hold = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([gatedReply(hold)]).client,
       plugins: [testPlugin({ id: "alpha", tools: [] })],
     });

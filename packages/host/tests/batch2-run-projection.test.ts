@@ -112,7 +112,7 @@ const CASES: readonly TerminalCase[] = [
 describe("C5 every terminal run state is listable, readable and in the cut", () => {
   for (const testCase of CASES) {
     it(`serves ${testCase.name} through runs.list, runs.get and the snapshot`, async () => {
-      const host = composeTestHost({
+      const host = await composeTestHost({
         // The model script is per case; a repeat last keeps a run alive until
         // its own outcome applies.
         modelClient: scriptedModel(
@@ -169,7 +169,7 @@ describe("C5 every terminal run state is listable, readable and in the cut", () 
   }
 
   it("lists a terminal run whose session is blocked, alongside the session itself", async () => {
-    const host = composeTestHost({
+    const host = await composeTestHost({
       modelClient: scriptedModel([toolReply("c-1", "big", {}), textReply("done")]).client,
       plugins: [testPlugin({ id: "big", tools: [constantTool("big", "x".repeat(70 * 1024))] })],
     });

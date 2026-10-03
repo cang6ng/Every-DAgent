@@ -20,7 +20,7 @@ function streamOf(event: HostEvent): string {
 
 describe("subscriptions", () => {
   it("opens with a fresh stream and a zero watermark", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -38,7 +38,7 @@ describe("subscriptions", () => {
   });
 
   it("numbers events from one, per stream, without gaps", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
     const opened = await client.call("subscriptions.open", {});
@@ -53,7 +53,7 @@ describe("subscriptions", () => {
   });
 
   it("delivers the snapshot response before any event of that stream", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -69,7 +69,7 @@ describe("subscriptions", () => {
   });
 
   it("captures the state as one cut, with later changes arriving as events", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
     const before = await createSessionThrough(client);
@@ -84,7 +84,7 @@ describe("subscriptions", () => {
   });
 
   it("replaces the old stream on a second open, and never reuses a stream id", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -105,7 +105,7 @@ describe("subscriptions", () => {
   });
 
   it("closes the stream it was asked about and leaves others alone", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
     const opened = await client.call("subscriptions.open", {});
@@ -125,7 +125,7 @@ describe("subscriptions", () => {
   });
 
   it("keeps a run draining with no subscriber at all", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("finished alone")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("finished alone")]).client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -146,7 +146,7 @@ describe("subscriptions", () => {
 
   it("keeps running when the transport refuses to deliver", async () => {
     const hold = gate();
-    const host = testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
+    const host = await testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
     const client = connect(host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -175,7 +175,7 @@ describe("subscriptions", () => {
 
 describe("subscription cut under a racing mutation", () => {
   it("answers the open before the new stream's first event, even when a mutation is in flight", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 

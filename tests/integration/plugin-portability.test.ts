@@ -29,7 +29,7 @@ async function platformFor(carrier: "memory" | "web", replies: readonly ModelRep
   const model = scriptedModel(replies);
   const textStats = textStatsPlugin();
   let binding: HttpBinding | undefined;
-  const platform = createHostPlatform({
+  const platform = await createHostPlatform({
     modelClient: model.client,
     plugins: [createCalculatorPlugin(), textStats.plugin],
     ...(carrier === "web" ? { source: (): Promise<ProtocolChannel> => connectHttpChannel({ origin: binding?.origin ?? "" }) } : {}),

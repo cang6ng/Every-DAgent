@@ -31,9 +31,11 @@ import type {
 } from "@every-dagent/protocol";
 import { decodeFrame, encodeFrame, validateMessage } from "@every-dagent/protocol";
 
-import { composeHost, type ComposedHost } from "../../src/host.js";
+import { composeHost, type ComposedHost, type HostInternals } from "../../src/host.js";
 import { createHost, type Host } from "../../src/index.js";
+import type { BootstrapSettings, TrustedComposition } from "../../src/composition.js";
 import { TEST_MODEL_LIMITS } from "../../../../tests/helpers/model-limits.js";
+import { TEST_BOOTSTRAP, testComposition } from "../../../../tests/helpers/test-composition.js";
 import { createMemoryChannelPair } from "./memory-channel.js";
 
 // ---------------------------------------------------------------------------
@@ -80,10 +82,14 @@ export interface TestHostOptions {
   readonly grants?: Readonly<Record<string, readonly PluginPermission[]>>;
   /** A sqlite file to keep sessions and runs in; absent means this process's memory. */
   readonly location?: string;
+  /** A trusted composition to compose with instead of the scripted fixture. */
+  readonly composition?: TrustedComposition;
+  /** The defaults a store with no configuration is initialized from. */
+  readonly bootstrap?: BootstrapSettings;
 }
 
-export function testHost(options: TestHostOptions): Host {
-  return composeTestHost(options).host;
+export async function testHost(options: TestHostOptions): Promise<Host> {
+  return (await composeTestHost(options)).host;
 }
 
 /**
@@ -93,24 +99,32 @@ export function testHost(options: TestHostOptions): Host {
  * to tell a committed fact from a published one — so the composition seam hands
  * the repository out here rather than making a test reach into the store by path.
  */
-export function composeTestHost(options: TestHostOptions): ComposedHost {
+export async function composeTestHost(
+  options: TestHostOptions,
+  internals: HostInternals = {},
+): Promise<ComposedHost> {
   return composeHost(
     {
-      modelClient: options.modelClient,
+      bootstrap: options.bootstrap ?? TEST_BOOTSTRAP,
+      composition:
+        options.composition ??
+        testComposition({
+          modelClient: options.modelClient,
+          ...(options.contextBuilder === undefined ? {} : { contextBuilder: options.contextBuilder }),
+        }),
       plugins: options.plugins ?? [],
-      ...(options.contextBuilder === undefined ? {} : { contextBuilder: options.contextBuilder }),
       ...(options.grants === undefined ? {} : { grants: options.grants }),
       persistence:
         options.location === undefined
           ? { kind: "ephemeral" }
           : { kind: "sqlite", location: options.location },
     },
-    {},
+    internals,
   );
 }
 
 /** A second host over the same file: the shape a restart takes in a test. */
-export function restartTestHost(options: TestHostOptions): ComposedHost {
+export async function restartTestHost(options: TestHostOptions): Promise<ComposedHost> {
   return composeTestHost(options);
 }
 

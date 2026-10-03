@@ -33,7 +33,12 @@ export type { SessionStore } from "./session/session-store.js";
 export type { ModelMessage, ToolCall, ToolResult } from "./model/message.js";
 export type { ModelClient, ModelEvent, ModelRequest, ToolSchema } from "./model/model-client.js";
 
-export { DEFAULT_MODEL_FRAMING, defineModelBudget, validateModelLimits } from "./context/model-budget.js";
+export {
+  DEFAULT_MODEL_FRAMING,
+  DEFAULT_RESERVED_OUTPUT,
+  defineModelBudget,
+  validateModelLimits,
+} from "./context/model-budget.js";
 export type { ModelBudget, ModelFramingCost, ModelLimits } from "./context/model-budget.js";
 export { estimateRequestCost } from "./context/context-estimator.js";
 export { jsonDepthOf, neutralBytes, stableJSON, utf8Bytes } from "./context/stable-json.js";

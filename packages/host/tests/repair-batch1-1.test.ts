@@ -277,7 +277,7 @@ function interfereWithCommit(mode: "landed" | "discarded"): InstalledInterferenc
 
 describe("R02 transaction endings", () => {
   it("publishes the real terminal when the commit landed and only its receipt was lost", async () => {
-    const composed = composeTestHost({ modelClient: scriptedModel([textReply("answer")]).client });
+    const composed = await composeTestHost({ modelClient: scriptedModel([textReply("answer")]).client });
     const client = connect(composed.host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -306,7 +306,7 @@ describe("R02 transaction endings", () => {
 
   it("retries the same storage batch when the transaction was really rolled back", async () => {
     const model = scriptedModel([textReply("answer")]);
-    const composed = composeTestHost({ modelClient: model.client });
+    const composed = await composeTestHost({ modelClient: model.client });
     const client = connect(composed.host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -336,7 +336,7 @@ describe("R02 transaction endings", () => {
   it("reports an unknown outcome — never completed — when the transaction could not be ended", async () => {
     await withTempDir(async (dir) => {
       const path = join(dir, "stuck.db");
-      const composed = composeTestHost({
+      const composed = await composeTestHost({
         modelClient: scriptedModel([textReply("answer")]).client,
         location: path,
       });
@@ -412,7 +412,7 @@ describe("R02 transaction endings", () => {
       expect(highWater.committed_seq).toBe(0);
 
       // And a restart reconciles that unfinished run honestly.
-      const restarted = composeTestHost({ modelClient: MODEL().client, location: path });
+      const restarted = await composeTestHost({ modelClient: MODEL().client, location: path });
       const again = connect(restarted.host);
       await again.describe();
       const after = await again.call("runs.get", { runId });
@@ -427,7 +427,7 @@ describe("R02 transaction endings", () => {
   it("refuses every read rather than answer from a connection it cannot trust", async () => {
     // An in-memory store has no second connection to re-read from, so the only
     // honest answer to a read is that the store cannot be read.
-    const composed = composeTestHost({ modelClient: scriptedModel([textReply("answer")]).client });
+    const composed = await composeTestHost({ modelClient: scriptedModel([textReply("answer")]).client });
     const client = connect(composed.host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -488,7 +488,7 @@ describe("R03 step representability", () => {
         return "ran";
       },
     };
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([eofReply([{ type: "tool-call", call: { callId: "c1", name: "observer", input } }])], {
         repeatLast: true,
       }).client,
@@ -538,7 +538,7 @@ describe("R03 step representability", () => {
         return "ran";
       },
     };
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([eofReply([{ type: "tool-call", call: { callId: "c1", name: "observer", input: hostile } }])], {
         repeatLast: true,
       }).client,
@@ -594,7 +594,7 @@ describe("R03 step representability", () => {
         return "done";
       },
     };
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([toolReply("c1", "big", input), textReply("finished")]).client,
       plugins: [testPlugin({ id: "tools", tools: [tool] })],
     });
@@ -635,7 +635,7 @@ describe("R03 step representability", () => {
         return "done";
       },
     };
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([toolReply("c1", "big", input)], { repeatLast: true }).client,
       plugins: [testPlugin({ id: "tools", tools: [tool] })],
     });
@@ -684,7 +684,7 @@ describe("R04 owned tool input", () => {
       yield { type: "done" };
     };
 
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([reply, textReply("finished")]).client,
       plugins: [testPlugin({ id: "tools", tools: [recordingTool("observer", seen)] })],
     });
@@ -733,7 +733,7 @@ describe("R04 owned tool input", () => {
       yield { type: "done" };
     };
 
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([reply, textReply("finished")]).client,
       plugins: [testPlugin({ id: "tools", tools: [recordingTool("observer", seen)] })],
     });
@@ -762,7 +762,7 @@ describe("R04 owned tool input", () => {
 
 describe("R05 canonical corruption", () => {
   async function seed(path: string, withTool = false): Promise<{ sessionId: string; runId: string }> {
-    const composed = composeTestHost({ modelClient: MODEL().client, location: path });
+    const composed = await composeTestHost({ modelClient: MODEL().client, location: path });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     const runId = withTool ? writeToolTurn(composed.repository, "s-1", 1) : writeTurn(composed.repository, "s-1", 1, "q", "a");
     await composed.host.shutdown();
@@ -836,7 +836,7 @@ describe("R05 canonical corruption", () => {
       database.close();
 
       const model = scriptedModel([textReply("later")]);
-      const composed = composeTestHost({ modelClient: model.client, location: path });
+      const composed = await composeTestHost({ modelClient: model.client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -874,7 +874,7 @@ describe("R05 canonical corruption", () => {
         .run();
       database.close();
 
-      const composed = composeTestHost({ modelClient: MODEL().client, location: path });
+      const composed = await composeTestHost({ modelClient: MODEL().client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -924,7 +924,7 @@ describe("R10 window representation", () => {
     ["emoji", () => "🙂".repeat(8 * 1024)],
     ["escaping-heavy", () => "\u0000".repeat(4 * 1024)],
   ])("keeps the loaded window inside the budget with %s content", async (_name, makeAnswer) => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     for (let index = 1; index <= 24; index += 1) {
       writeTurn(composed.repository, "s-1", index, `q${index}`, makeAnswer());
@@ -939,7 +939,7 @@ describe("R10 window representation", () => {
   });
 
   it("stops exactly at the budget: one byte under, at, and one over", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     writeTurn(composed.repository, "s-1", 1, "q1", "a".repeat(4096));
 
@@ -965,7 +965,7 @@ describe("R10 window representation", () => {
   });
 
   it("bounds a window that carries tool calls and results, one byte either side", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     writeTurn(composed.repository, "s-1", 1, "old", "old answer");
     writeToolTurn(composed.repository, "s-1", 2);
@@ -1012,7 +1012,7 @@ describe("R10 window representation", () => {
   });
 
   it("takes whole turns only: an older turn that would exceed the budget is not forced in", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client });
+    const composed = await composeTestHost({ modelClient: MODEL().client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     writeTurn(composed.repository, "s-1", 1, "old", "old answer");
     writeTurn(composed.repository, "s-1", 2, "newer", "a".repeat(2048));
@@ -1038,7 +1038,7 @@ describe("R10 window representation", () => {
     let state: HostState | undefined;
     let windowBytes = 0;
     let windowTurns = 0;
-    const composed = composeHost(
+    const composed = await composeTestHost(
       {
         modelClient: scriptedModel([
           async function* (): AsyncGenerator<ModelEvent> {
@@ -1052,7 +1052,6 @@ describe("R10 window representation", () => {
           },
         ]).client,
         plugins: [],
-        persistence: { kind: "ephemeral" },
       },
       { onState: (observed) => (state = observed) },
     );
@@ -1095,7 +1094,7 @@ describe("R28 snapshot headroom", () => {
   }
 
   it("keeps the heaviest legal run subscribable under a large static configuration", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client, plugins: [bigPlugin(150 * 1024)] });
+    const composed = await composeTestHost({ modelClient: MODEL().client, plugins: [bigPlugin(150 * 1024)] });
     const client = connect(composed.host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -1131,7 +1130,7 @@ describe("R28 snapshot headroom", () => {
   });
 
   it("keeps a cut bounded with existing sessions and an active run", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client, plugins: [bigPlugin(120 * 1024)] });
+    const composed = await composeTestHost({ modelClient: MODEL().client, plugins: [bigPlugin(120 * 1024)] });
     composed.repository.createSession({ sessionId: "s-old", title: "t", createdAt: 1 });
     for (let index = 1; index <= 5; index += 1) {
       writeTurn(composed.repository, "s-old", index, "x".repeat(1024) + index, `a${index}`);
@@ -1162,16 +1161,16 @@ describe("R28 snapshot headroom", () => {
     await composed.host.shutdown();
   });
 
-  it("refuses a configuration that leaves no room for any legal run", () => {
+  it("refuses a configuration that leaves no room for any legal run", async () => {
     // The static catalogue alone fits, but nothing can be added to it: this is
     // the configuration the startup check exists to refuse.
-    expect(() => composeTestHost({ modelClient: MODEL().client, plugins: [bigPlugin(200 * 1024)] })).toThrow(
+    await expect(composeTestHost({ modelClient: MODEL().client, plugins: [bigPlugin(200 * 1024)] })).rejects.toThrow(
       /frame|room/i,
     );
   });
 
   it("refuses an input whose accepted run could never be published, before admission", async () => {
-    const composed = composeTestHost({ modelClient: MODEL().client, plugins: [bigPlugin(150 * 1024)] });
+    const composed = await composeTestHost({ modelClient: MODEL().client, plugins: [bigPlugin(150 * 1024)] });
     const client = connect(composed.host);
     await client.describe();
     const session = await createSessionThrough(client);

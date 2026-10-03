@@ -61,7 +61,7 @@ describe("cancel with an unbuildable announcement", () => {
   it("marks the run faulted, still aborts, keeps draining, and blocks the session", async () => {
     const started = gate();
     const release = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([toolReply("call-1", "stubborn", {})]).client,
       plugins: [testPlugin({ id: "tools", tools: [gatedTool("stubborn", release, started)] })],
     });

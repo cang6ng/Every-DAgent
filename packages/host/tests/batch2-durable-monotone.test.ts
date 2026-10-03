@@ -215,7 +215,7 @@ describe("R08 startup readiness", () => {
     });
     seeded.close();
 
-    const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+    const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
     const client = connect(composed.host);
     try {
       await client.describe();
@@ -236,27 +236,27 @@ describe("R08 startup readiness", () => {
     }
   });
 
-  it("does not produce a host when the durable store cannot be opened", () => {
+  it("does not produce a host when the durable store cannot be opened", async () => {
     const path = join(tempDir(), "newer.db");
     const database = new DatabaseSync(path);
     database.exec("PRAGMA user_version = 99");
     database.close();
 
-    expect(() =>
+    await expect(
       composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path }),
-    ).toThrow();
+    ).rejects.toThrow();
   });
 
   it("refuses a second host while another one holds the store", async () => {
     const path = join(tempDir(), "held.db");
-    const first = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+    const first = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
     const client = connect(first.host);
     await client.describe();
     await createSessionThrough(client);
 
-    expect(() =>
+    await expect(
       composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path }),
-    ).toThrow();
+    ).rejects.toThrow();
 
     client.detach();
     await first.host.shutdown();

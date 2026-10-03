@@ -185,6 +185,24 @@ export interface ConnectionState {
   closed: boolean;
 }
 
+/**
+ * The configuration this host instance is running from.
+ *
+ * `effective` holds what this instance actually consumed — one entry per
+ * managed namespace, with the revision it was read at. It is a fact about a
+ * running host and is never written to storage, never inherited from a previous
+ * instance, and never updated during this instance's life: a settings update
+ * changes the *desired* value the store holds, and only a restart can make a
+ * new revision effective.
+ */
+export interface HostConfiguration {
+  readonly effective: ReadonlyMap<string, import("./configuration.js").EffectiveNamespace>;
+  /** The effective host settings the runtime was built with. */
+  readonly host: import("./settings.js").HostSettings;
+  /** The desired revisions the effective execution was composed from. */
+  readonly revisions: import("./composition.js").SettingsRevisions;
+}
+
 export interface HostState {
   readonly hostInstanceId: string;
   readonly name: string;
@@ -195,6 +213,10 @@ export interface HostState {
   readonly gate: RegistryGate;
   readonly repository: Repository;
   readonly limits: HostLimits;
+  /** What this instance is running from; see the note on `HostConfiguration`. */
+  readonly configuration: HostConfiguration;
+  /** The composition's own release path, held from the moment it handed execution over. */
+  readonly disposeComposition: (() => void | Promise<void>) | undefined;
   /** The published plugin summaries, by id, in registration order. */
   readonly plugins: Map<string, PluginSummary>;
   readonly pluginOrder: string[];

@@ -104,7 +104,7 @@ describe("listener ownership", () => {
   });
 
   it("disposes a listener installed into a channel that closed during listen", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const disposals: number[] = [];
     const listener: { current: ProtocolChannelListener | undefined } = { current: undefined };
     const eager: ProtocolChannel = {
@@ -128,7 +128,7 @@ describe("listener ownership", () => {
   });
 
   it("does not treat a detached connection as a cancelled run", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("still here")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("still here")]).client });
     const client = connect(host);
     await client.describe();
     const session = await client.call("sessions.create", {});

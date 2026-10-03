@@ -69,7 +69,7 @@ async function runWithInput(input: unknown): Promise<{
     yield { type: "done" };
   };
   const model = scriptedModel([refusedStep, refusedStep, refusedStep]);
-  const platform = createHostPlatform({ modelClient: model.client, plugins: [fixture.plugin] });
+  const platform = await createHostPlatform({ modelClient: model.client, plugins: [fixture.plugin] });
   open.push({ close: () => platform.shutdown() });
 
   const client = createClient({ connect: () => platform.connect() });
@@ -117,7 +117,7 @@ describe("a tool input the wire can carry", () => {
 
     const fixture = demoPlugin("echo", "echo", "echo answered");
     const model = scriptedModel([toolReply("call-1", "echo", original), textReply("done")]);
-    const platform = createHostPlatform({ modelClient: model.client, plugins: [fixture.plugin] });
+    const platform = await createHostPlatform({ modelClient: model.client, plugins: [fixture.plugin] });
     open.push({ close: () => platform.shutdown() });
 
     const client = createClient({ connect: () => platform.connect() });

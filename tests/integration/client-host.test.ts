@@ -24,14 +24,14 @@ const TOOL_NAME = "cli-tool";
 const TOOL_ANSWER = "tool answered";
 const ANSWER = `the tool said: ${TOOL_ANSWER}`;
 
-function scenario() {
+async function scenario() {
   const demo = demoPlugin(PLUGIN_ID, TOOL_NAME, TOOL_ANSWER);
   const model = scriptedModel([
     toolReply("call-1", TOOL_NAME, { value: "from-the-model" }),
     textReply(ANSWER),
     partialThenAbortReply("a draft that must not survive"),
   ]);
-  const platform = createHostPlatform({ modelClient: model.client, plugins: [demo.plugin] });
+  const platform = await createHostPlatform({ modelClient: model.client, plugins: [demo.plugin] });
 
   return {
     demo,
@@ -53,7 +53,7 @@ function scenario() {
 
 describe("the second client over memory", () => {
   it("walks describe, sessions, plugins, a tool run, a cancel and a reconnect", async () => {
-    const fixture = scenario();
+    const fixture = await scenario();
     const report = await fixture.cli();
 
     // Describe: the host's own identity and honest capabilities.
@@ -129,7 +129,7 @@ describe("the second client over memory", () => {
   });
 
   it("does not retry a write and does not need a second submission", async () => {
-    const fixture = scenario();
+    const fixture = await scenario();
     const client = createClientOn(fixture.platform);
     await client.connect();
 
@@ -160,7 +160,7 @@ describe("the second client over memory", () => {
   });
 
   it("describes a settled run to a client that arrives afterwards", async () => {
-    const fixture = scenario();
+    const fixture = await scenario();
     const first = createClientOn(fixture.platform);
     await first.connect();
     await first.plugins.enable({ pluginId: PLUGIN_ID });
@@ -191,7 +191,7 @@ describe("the second client over memory", () => {
   });
 
   it("shows plugin state changes as events, not as response echoes", async () => {
-    const fixture = scenario();
+    const fixture = await scenario();
     const client = createClientOn(fixture.platform);
     await client.connect();
 

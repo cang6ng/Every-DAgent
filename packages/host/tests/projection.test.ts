@@ -79,7 +79,7 @@ describe("tool inputs a durable conversation cannot carry", () => {
     readonly liveCalls: number;
   }> {
     const seen: unknown[] = [];
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([toolReply("call-1", "observer", input)], { repeatLast: true }).client,
       plugins: [testPlugin({ id: "tools", tools: [recordingTool("observer", seen)] })],
     });
@@ -183,7 +183,7 @@ describe("published input snapshots", () => {
     const input: Record<string, unknown> = { value: 1 };
     const hold = gate();
 
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([
         toolReply("call-1", "observer", input),
         gatedReply(hold, textReply("done")),
@@ -219,7 +219,7 @@ describe("published input snapshots", () => {
 
 describe("canonical occurrences", () => {
   it("pairs each call with its own result in log order", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([
         [
           { type: "tool-call", call: { callId: "call-1", name: "echo", input: { n: 1 } } },
@@ -268,7 +268,7 @@ describe("canonical occurrences", () => {
   });
 
   it("records a failed tool observation as ok:false without interpreting it", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([toolReply("call-1", "ghost", {}), textReply("recovered")]).client,
     });
     const client = connect(host);
@@ -293,7 +293,7 @@ describe("canonical occurrences", () => {
 
 describe("safe failure projection", () => {
   it("does not put a Core failure's own words on the wire", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([{ error: "provider said: key=sk-secret-value" } as never]).client,
     });
     const client = connect(host);
@@ -318,7 +318,7 @@ describe("safe failure projection", () => {
   });
 
   it("does not publish a plugin's own failure message", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [failingPlugin("boom")],
     });
@@ -353,7 +353,7 @@ describe("safe failure projection", () => {
   });
 
   it("does not announce a plugin whose public content did not change", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [testPlugin({ id: "quiet", tools: [] })],
     });
@@ -369,7 +369,7 @@ describe("safe failure projection", () => {
   });
 
   it("counts failed cleanup without repeating its text", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [failingPlugin("boom", { cleanupFails: true })],
     });
@@ -390,7 +390,7 @@ describe("safe failure projection", () => {
   });
 
   it("turns an unprojectable live value into a host failure with a blocked session", async () => {
-    const host = testHost({ modelClient: scriptedModel([brokenTextReply(), textReply("never used")]).client });
+    const host = await testHost({ modelClient: scriptedModel([brokenTextReply(), textReply("never used")]).client });
     const client = connect(host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -439,7 +439,7 @@ describe("safe failure projection", () => {
       textReply("unused"),
     ]);
 
-    const host = testHost({
+    const host = await testHost({
       modelClient: model.client,
       plugins: [testPlugin({ id: "tools", tools: [gatedTool("slow", release, started)] })],
     });

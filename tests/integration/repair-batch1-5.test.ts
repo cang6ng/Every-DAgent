@@ -95,7 +95,7 @@ describe("R05 history refuses a record outside its own turn's committed range", 
 
       // Two settled tool-carrying turns in one session: the ranges the damage
       // reaches across.
-      const seedPlatform = createHostPlatform({
+      const seedPlatform = await createHostPlatform({
         modelClient: model.client,
         plugins: [tools.plugin],
         persistence: { kind: "sqlite", location: path },
@@ -128,7 +128,7 @@ describe("R05 history refuses a record outside its own turn's committed range", 
         .run(older.turn_id as string, session.sessionId, seq.seq as number);
       database.close();
 
-      const platform = createHostPlatform({
+      const platform = await createHostPlatform({
         modelClient: scriptedModel([textReply("unused")]).client,
         plugins: [],
         persistence: { kind: "sqlite", location: path },
@@ -175,7 +175,7 @@ describe("R05 a lost commit receipt never publishes a terminal for a rewritten r
     await withTempDir(async (dir) => {
       const path = join(dir, "rewritten.db");
       const model = scriptedModel([textReply("answer")]);
-      const platform = createHostPlatform({
+      const platform = await createHostPlatform({
         modelClient: model.client,
         plugins: [],
         persistence: { kind: "sqlite", location: path },
@@ -225,7 +225,7 @@ describe("R05 a lost commit receipt never publishes a terminal for a rewritten r
       expect(durable.status).toBe("completed");
       expect(rewritten.count).toBe(1);
 
-      const restarted = createHostPlatform({
+      const restarted = await createHostPlatform({
         modelClient: scriptedModel([textReply("unused")]).client,
         plugins: [],
         persistence: { kind: "sqlite", location: path },

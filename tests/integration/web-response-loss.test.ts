@@ -61,7 +61,7 @@ function dropping(
 }
 
 async function webPlatform(drop?: (frame: string) => boolean): Promise<{
-  readonly platform: ReturnType<typeof createHostPlatform>;
+  readonly platform: Awaited<ReturnType<typeof createHostPlatform>>;
   readonly binding: HttpBinding;
   readonly demo: ReturnType<typeof demoPlugin>;
   readonly client: ReturnType<typeof createClient>;
@@ -76,7 +76,7 @@ async function webPlatform(drop?: (frame: string) => boolean): Promise<{
   ]);
 
   let binding: HttpBinding | undefined;
-  const platform = createHostPlatform({
+  const platform = await createHostPlatform({
     modelClient: model.client,
     plugins: [demo.plugin],
     source: async () => {

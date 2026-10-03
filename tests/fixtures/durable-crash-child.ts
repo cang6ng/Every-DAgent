@@ -29,6 +29,7 @@ import type { ProtocolChannel, ProtocolChannelListener } from "@every-dagent/pro
 import type { Plugin } from "@every-dagent/plugin-system";
 
 import { TEST_MODEL_LIMITS } from "../helpers/model-limits.js";
+import { TEST_BOOTSTRAP, testComposition } from "../helpers/test-composition.js";
 
 const [phase, databasePath, journalPath] = process.argv.slice(2);
 if (phase === undefined || databasePath === undefined || journalPath === undefined) {
@@ -216,8 +217,9 @@ async function main(): Promise<void> {
   armBoundary();
 
   const channel = channelPair();
-  const host = createHost({
-    modelClient: crashModel(),
+  const host = await createHost({
+    bootstrap: TEST_BOOTSTRAP,
+    composition: testComposition({ modelClient: crashModel() }),
     plugins: [countingTool()],
     persistence: { kind: "sqlite", location: databasePath },
   });

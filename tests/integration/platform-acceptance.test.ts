@@ -63,7 +63,7 @@ async function platformFor(
 ): Promise<{ readonly platform: HostPlatform; readonly model: ReturnType<typeof scriptedModel> }> {
   const model = scriptedModel(replies);
   let binding: HttpBinding | undefined;
-  const platform = createHostPlatform({
+  const platform = await createHostPlatform({
     modelClient: model.client,
     plugins,
     reverseProfiles: PROFILES,

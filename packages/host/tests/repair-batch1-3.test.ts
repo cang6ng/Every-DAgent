@@ -104,7 +104,7 @@ function interfereWithEndingTheTransaction(): { injected(): number; restore(): v
 async function runTwoTurns(
   location?: string,
 ): Promise<{ readonly composed: ComposedHost; readonly client: TestClient; readonly sessionId: string }> {
-  const composed = composeTestHost({
+  const composed = await composeTestHost({
     modelClient: scriptedModel(
       [
         toolReply("c-1", "observer", { n: 1 }),
@@ -141,7 +141,7 @@ describe("E1 storage fault boundary", () => {
   it("refuses current-state answers on a faulted host, keeps canonical readable, and invents nothing", async () => {
     await withTempDir(async (dir) => {
       const path = join(dir, "fault.db");
-      const composed = composeTestHost({
+      const composed = await composeTestHost({
         modelClient: scriptedModel([textReply("first answer"), textReply("second answer")]).client,
         location: path,
       });
@@ -225,7 +225,7 @@ describe("E1 storage fault boundary", () => {
 
       // The restart is the only reconciliation: unfinished becomes interrupted
       // with its evidence class, and the committed run keeps its fact.
-      const restarted = composeTestHost({
+      const restarted = await composeTestHost({
         modelClient: scriptedModel([textReply("unused")]).client,
         location: path,
       });
@@ -348,7 +348,7 @@ describe("E3 history pages", () => {
       database.close();
 
       const model = scriptedModel([textReply("later")]);
-      const composed = composeTestHost({ modelClient: model.client, location: path });
+      const composed = await composeTestHost({ modelClient: model.client, location: path });
       const client = connect(composed.host);
       await client.describe();
       // Nothing was read from the session first, so nothing has been refused:
@@ -389,7 +389,7 @@ describe("E4 request-id bound", () => {
   ];
 
   it("echoes every legal id byte for byte", async () => {
-    const composed = composeTestHost({ modelClient: scriptedModel([textReply("ok")], { repeatLast: true }).client });
+    const composed = await composeTestHost({ modelClient: scriptedModel([textReply("ok")], { repeatLast: true }).client });
     const client = connect(composed.host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -410,7 +410,7 @@ describe("E4 request-id bound", () => {
   });
 
   it("treats one byte past the bound as a connection fault, never an answered request", async () => {
-    const composed = composeTestHost({ modelClient: scriptedModel([textReply("ok")], { repeatLast: true }).client });
+    const composed = await composeTestHost({ modelClient: scriptedModel([textReply("ok")], { repeatLast: true }).client });
     const client = connect(composed.host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -446,7 +446,7 @@ describe("E4 request-id bound", () => {
   });
 
   it("refuses an over-long id with no business side effect at all", async () => {
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([textReply("ok")], { repeatLast: true }).client,
     });
     const client = connect(composed.host);

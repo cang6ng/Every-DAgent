@@ -15,7 +15,7 @@ import {
 
 describe("connection initialization", () => {
   it("refuses a business method on a connection that never described", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
 
     const described = connect(host);
     const description = await described.describe();
@@ -34,7 +34,7 @@ describe("connection initialization", () => {
   });
 
   it("refuses a request that names another host instance", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -44,7 +44,7 @@ describe("connection initialization", () => {
   });
 
   it("refuses a connection that changes its mind about capabilities", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     const first = await client.describe();
     expect(first.result?.clientCapabilities.reverseRequests).toBe(false);
@@ -61,7 +61,7 @@ describe("connection initialization", () => {
 
 describe("frame-level faults", () => {
   it("closes the connection on a frame it cannot parse at all", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -75,7 +75,7 @@ describe("frame-level faults", () => {
   });
 
   it("closes the connection when a request id is reused", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -102,7 +102,7 @@ describe("frame-level faults", () => {
   });
 
   it("closes the connection on a frame that claims the host's own direction", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -127,7 +127,7 @@ describe("frame-level faults", () => {
   });
 
   it("answers an unknown method with METHOD_NOT_FOUND and keeps the connection", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     const description = await client.describe();
     const instanceId = description.result?.hostInstanceId as string;
@@ -153,7 +153,7 @@ describe("frame-level faults", () => {
   });
 
   it("answers invalid params with INVALID_REQUEST and keeps the connection", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     const description = await client.describe();
     const instanceId = description.result?.hostInstanceId as string;
@@ -175,7 +175,7 @@ describe("frame-level faults", () => {
   });
 
   it("refuses a generation it does not speak without executing anything", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -196,7 +196,7 @@ describe("frame-level faults", () => {
   });
 
   it("drops an unassociated client response without answering it", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
     const before = client.frames.length;
@@ -220,7 +220,7 @@ describe("frame-level faults", () => {
   });
 
   it("closes a connection that outruns its own queue while the host keeps working", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
 
     const burst = connect(host);
     await burst.describe();
@@ -254,7 +254,7 @@ describe("frame-level faults", () => {
 describe("run versus reader loss", () => {
   it("keeps a run alive while a subscription is replaced underneath it", async () => {
     const hold = gate();
-    const host = testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
+    const host = await testHost({ modelClient: scriptedModel([gatedReply(hold)]).client });
     const client = connect(host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -284,7 +284,7 @@ describe("run versus reader loss", () => {
 
 describe("request id identity", () => {
   it("consumes the id of a request the envelope layer could not read", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
     const instanceId = client.hostInstanceId as string;
@@ -323,7 +323,7 @@ describe("request id identity", () => {
   });
 
   it("consumes the id of a request that failed the method schema", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
     const instanceId = client.hostInstanceId as string;
@@ -360,7 +360,7 @@ describe("request id identity", () => {
   });
 
   it("closes when a valid request is followed by an unreadable one with its id", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
     const instanceId = client.hostInstanceId as string;
@@ -384,7 +384,7 @@ describe("request id identity", () => {
   });
 
   it("closes a valid request that follows an unreadable one with its id", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
     const instanceId = client.hostInstanceId as string;
@@ -420,7 +420,7 @@ describe("request id identity", () => {
   });
 
   it("still closes a frame whose correlation cannot be recovered at all", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 

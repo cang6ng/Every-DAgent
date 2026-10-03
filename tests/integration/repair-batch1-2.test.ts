@@ -125,7 +125,7 @@ describe("R02 presentation invalidation", () => {
         },
         textReply("finished"),
       ]);
-      const platform = createHostPlatform({
+      const platform = await createHostPlatform({
         modelClient: model.client,
         plugins: [tools.plugin],
         persistence: { kind: "sqlite", location: path },
@@ -210,7 +210,7 @@ describe("R02 presentation invalidation", () => {
 
       // The durable truth: nothing was written that pretends the run ended, and
       // a restart reconciles it honestly — interrupted, unknown, blocked.
-      const restarted = createHostPlatform({
+      const restarted = await createHostPlatform({
         modelClient: scriptedModel([textReply("unused")]).client,
         plugins: [],
         persistence: { kind: "sqlite", location: path },
@@ -233,7 +233,7 @@ describe("R02 presentation invalidation", () => {
     await withTempDir(async (dir) => {
       const path = join(dir, "landed.db");
       const model = scriptedModel([textReply("answer")]);
-      const platform = createHostPlatform({
+      const platform = await createHostPlatform({
         modelClient: model.client,
         plugins: [],
         persistence: { kind: "sqlite", location: path },

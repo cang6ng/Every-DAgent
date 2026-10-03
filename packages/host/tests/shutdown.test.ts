@@ -21,7 +21,7 @@ import {
 describe("shutdown", () => {
   it("aborts the active run, waits for it, and then releases the plugins", async () => {
     let disposed = 0;
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([toolReply("call-1", "polite", {})]).client,
       plugins: [
         testPlugin({
@@ -55,7 +55,7 @@ describe("shutdown", () => {
   it("stays pending while an accepted execution has not settled", async () => {
     const started = gate();
     const release = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([toolReply("call-1", "stubborn", {})]).client,
       plugins: [testPlugin({ id: "tools", tools: [gatedTool("stubborn", release, started)] })],
     });
@@ -89,7 +89,7 @@ describe("shutdown", () => {
   it("waits for an accepted activation before cleaning anything up", async () => {
     const activation = gate();
     const order: string[] = [];
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [
         testPlugin({
@@ -128,7 +128,7 @@ describe("shutdown", () => {
 
   it("does not retry a plugin stuck in the error state, and says so", async () => {
     let otherDisposed = 0;
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [
         failingPlugin("boom", { cleanupFails: true }),
@@ -157,7 +157,7 @@ describe("shutdown", () => {
   });
 
   it("refuses new connections once it has begun", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -169,7 +169,7 @@ describe("shutdown", () => {
   });
 
   it("answers the same promise however many times it is called", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
 
     const first = host.shutdown();
     const second = host.shutdown();
@@ -179,7 +179,7 @@ describe("shutdown", () => {
   });
 
   it("resolves when there was nothing to stop", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     await expect(host.shutdown()).resolves.toBeUndefined();
   });
 });
@@ -209,7 +209,7 @@ describe("shutdown completion ownership", () => {
   it("shares one shutdown with a connection that closes back into the host", async () => {
     let disposed = 0;
     let reentered: Promise<void> | undefined;
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [
         testPlugin({
@@ -245,7 +245,7 @@ describe("shutdown completion ownership", () => {
     const started = gate();
     let disposed = 0;
     let reentered: Promise<void> | undefined;
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([toolReply("call-1", "reenter", {})]).client,
       plugins: [
         testPlugin({
@@ -300,7 +300,7 @@ describe("shutdown completion ownership", () => {
 
   it("does not resolve while a deferred cleanup is still running", async () => {
     const release = gate();
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [
         testPlugin({
@@ -329,7 +329,7 @@ describe("shutdown completion ownership", () => {
   });
 
   it("gives every caller the same rejection when a cleanup fails", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [
         testPlugin({
@@ -366,7 +366,7 @@ describe("shutdown completion ownership", () => {
   });
 
   it("returns the same settled outcome to a later caller after a clean shutdown", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
 
     const first = host.shutdown();
     await first;

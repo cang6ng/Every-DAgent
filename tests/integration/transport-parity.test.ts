@@ -33,14 +33,14 @@ afterEach(async () => {
   for (const closer of open.splice(0)) await closer.close();
 });
 
-function scenario() {
+async function scenario() {
   const demo = demoPlugin(PLUGIN_ID, TOOL_NAME, TOOL_ANSWER);
   const model = scriptedModel([
     toolReply("call-1", TOOL_NAME, { value: "from-the-model" }),
     textReply(ANSWER),
     partialThenAbortReply("a draft that must not survive"),
   ]);
-  const platform = createHostPlatform({ modelClient: model.client, plugins: [demo.plugin] });
+  const platform = await createHostPlatform({ modelClient: model.client, plugins: [demo.plugin] });
   return {
     demo,
     model,
@@ -60,7 +60,7 @@ function scenario() {
 }
 
 /** The web carrier: a real socket, the real binding, the real client channel. */
-function webScenario() {
+async function webScenario() {
   const demo = demoPlugin(PLUGIN_ID, TOOL_NAME, TOOL_ANSWER);
   const model = scriptedModel([
     toolReply("call-1", TOOL_NAME, { value: "from-the-model" }),
@@ -68,7 +68,7 @@ function webScenario() {
     partialThenAbortReply("a draft that must not survive"),
   ]);
   const bindingRef: { current: HttpBinding | undefined } = { current: undefined };
-  const platform = createHostPlatform({
+  const platform = await createHostPlatform({
     modelClient: model.client,
     plugins: [demo.plugin],
     source: async () => {
@@ -136,7 +136,7 @@ function expectSameWalk(report: ClientCliReport): void {
 
 describe("the same client on both carriers", () => {
   it("walks the same scenario over the memory carrier", async () => {
-    const fixture = scenario();
+    const fixture = await scenario();
     const report = await fixture.cli();
 
     expectSameWalk(report);
@@ -146,7 +146,7 @@ describe("the same client on both carriers", () => {
   });
 
   it("walks the same scenario over the web binding", async () => {
-    const fixture = webScenario();
+    const fixture = await webScenario();
     await fixture.start();
     const report = await fixture.cli();
 
@@ -160,7 +160,7 @@ describe("the same client on both carriers", () => {
 describe("a client can move between carriers", () => {
   it("reconnects a single client over a different carrier and finds the same host", async () => {
     const model = scriptedModel([textReply("the answer")]);
-    const platform = createHostPlatform({ modelClient: model.client, plugins: [] });
+    const platform = await createHostPlatform({ modelClient: model.client, plugins: [] });
     const binding = await startHttpBinding({ onConnection: (channel) => platform.host.attach(channel) });
     open.push(binding);
 

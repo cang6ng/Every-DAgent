@@ -39,6 +39,8 @@ export interface ScriptedPiAiStream extends PiAiStreamSource {
   readonly contexts: readonly Context[];
   /** Every options object it was handed, in call order. */
   readonly options: readonly (StreamOptions | undefined)[];
+  /** Every model it was handed, in call order. */
+  readonly models: readonly Model<Api>[];
 }
 
 export function createScriptedPiAiStream(
@@ -46,16 +48,19 @@ export function createScriptedPiAiStream(
 ): ScriptedPiAiStream {
   const contexts: Context[] = [];
   const options: (StreamOptions | undefined)[] = [];
+  const models: Model<Api>[] = [];
   let calls = 0;
 
   return {
     contexts,
     options,
+    models,
     stream(
-      _model: Model<Api>,
+      model: Model<Api>,
       context: Context,
       streamOptions?: StreamOptions,
     ): AsyncIterable<AssistantMessageEvent> {
+      models.push(model);
       contexts.push(context);
       options.push(streamOptions);
 

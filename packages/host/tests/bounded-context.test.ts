@@ -60,7 +60,7 @@ describe("admission preflight", () => {
   it("refuses an input no run under this profile could send, before anything durable", async () => {
     const limits = tightLimits(400);
     const model = scriptedModel([textReply("never reached")], { limits });
-    const composed = composeTestHost({ modelClient: model.client });
+    const composed = await composeTestHost({ modelClient: model.client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
 
     const client = connect(composed.host);
@@ -98,7 +98,7 @@ describe("admission preflight", () => {
   it("leaves the execution lease free for the next run", async () => {
     const limits = tightLimits(400);
     const model = scriptedModel([textReply("answered")], { limits });
-    const composed = composeTestHost({ modelClient: model.client });
+    const composed = await composeTestHost({ modelClient: model.client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     composed.repository.createSession({ sessionId: "s-2", title: "t", createdAt: 2 });
 
@@ -130,7 +130,7 @@ describe("admission preflight", () => {
   it("does not consume the submission identity it refused", async () => {
     const limits = tightLimits(400);
     const model = scriptedModel([textReply("answered")], { limits });
-    const composed = composeTestHost({ modelClient: model.client });
+    const composed = await composeTestHost({ modelClient: model.client });
     composed.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
 
     const client = connect(composed.host);
@@ -204,7 +204,7 @@ function seedRecords(turnId: string, startSeq: number, text: string, answer: str
 describe("long conversations", () => {
   it("sends a bounded, in-budget request after a hundred and twenty turns", async () => {
     const model = scriptedModel([textReply("ok")]);
-    const composed = composeTestHost({ modelClient: model.client });
+    const composed = await composeTestHost({ modelClient: model.client });
     composed.repository.createSession({ sessionId: "s-long", title: "t", createdAt: 1 });
     for (let index = 1; index <= 120; index += 1) seedTurn(composed.repository, "s-long", index);
     expect(composed.repository.getSession("s-long")?.committedSeq).toBe(480);
@@ -238,13 +238,13 @@ describe("long conversations", () => {
     // process asked, which store answered, or what was in memory before.
     const runOnce = async (): Promise<readonly unknown[]> => {
       const path = storePath();
-      const seeding = composeTestHost({ modelClient: scriptedModel([textReply("ok")]).client, location: path });
+      const seeding = await composeTestHost({ modelClient: scriptedModel([textReply("ok")]).client, location: path });
       seeding.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
       for (let index = 1; index <= 40; index += 1) seedTurn(seeding.repository, "s-1", index);
       await seeding.host.shutdown();
 
       const model = scriptedModel([textReply("ok")]);
-      const composed = composeTestHost({ modelClient: model.client, location: path });
+      const composed = await composeTestHost({ modelClient: model.client, location: path });
       const client = connect(composed.host);
       await client.describe();
       const started = await client.call("runs.start", {
@@ -269,13 +269,13 @@ describe("long conversations", () => {
   it("keeps the window bounded and in budget across a restart", async () => {
     const path = storePath();
     const limits = tightLimits(3000);
-    const seeding = composeTestHost({ modelClient: scriptedModel([textReply("ok")]).client, location: path });
+    const seeding = await composeTestHost({ modelClient: scriptedModel([textReply("ok")]).client, location: path });
     seeding.repository.createSession({ sessionId: "s-1", title: "t", createdAt: 1 });
     for (let index = 1; index <= 20; index += 1) seedTurn(seeding.repository, "s-1", index);
     await seeding.host.shutdown();
 
     const model = scriptedModel([textReply("ok")], { limits });
-    const composed = composeTestHost({ modelClient: model.client, location: path });
+    const composed = await composeTestHost({ modelClient: model.client, location: path });
     const client = connect(composed.host);
     await client.describe();
     const started = await client.call("runs.start", {
@@ -306,7 +306,7 @@ describe("a result that cannot be kept", () => {
   it("keeps the old canonical, blocks the session, and closes no turn", async () => {
     const executed: unknown[] = [];
     const model = scriptedModel([toolReply("call-1", "big", { n: 1 }), textReply("never reached")]);
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       // The tool exists and runs; what it returns is larger than one turn item
       // may hold, which is a fact only known after it has run.
       plugins: [testPlugin({ id: "m2", tools: [recordingTool("big", executed, "x".repeat(70 * 1024))] })],
@@ -350,7 +350,7 @@ describe("a result that cannot be kept", () => {
       toolReply("call-1", "big", { n: 1 }),
       textReply("never reached"),
     ]);
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       plugins: [testPlugin({ id: "m2", tools: [recordingTool("big", executed, "x".repeat(70 * 1024))] })],
       modelClient: model.client,
     });

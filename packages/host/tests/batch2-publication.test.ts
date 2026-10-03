@@ -54,7 +54,7 @@ function pluginsRevision(client: TestClient): number | undefined {
 
 describe("C4 publication and revisions", () => {
   it("announces a rename with the summary and the catalogue version it moved", async () => {
-    const host = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host.host);
     try {
       await client.describe();
@@ -89,7 +89,7 @@ describe("C4 publication and revisions", () => {
 
   it("announces the runs revision a recorded cancel moved", async () => {
     const release = gate();
-    const host = composeTestHost({
+    const host = await composeTestHost({
       modelClient: scriptedModel([gatedReply(release, textReply("finished"))]).client,
     });
     const client = connect(host.host);
@@ -123,7 +123,7 @@ describe("C4 publication and revisions", () => {
   });
 
   it("publishes a plugin change and its catalogue revision together", async () => {
-    const host = composeTestHost({
+    const host = await composeTestHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [testPlugin({ id: "demo", tools: [] })],
     });
@@ -152,7 +152,7 @@ describe("C4 publication and revisions", () => {
   });
 
   it("publishes nothing when the catalogue revision cannot be recorded, and stops vouching for writes", async () => {
-    const host = composeTestHost({
+    const host = await composeTestHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [testPlugin({ id: "demo", tools: [] })],
       location: join(tempDir(), "plugin-fault.db"),

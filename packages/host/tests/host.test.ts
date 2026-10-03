@@ -15,7 +15,7 @@ import {
 
 describe("host description", () => {
   it("describes exactly what the host supports, without over-claiming", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
 
     const response = await client.describe();
@@ -53,8 +53,8 @@ describe("host description", () => {
   });
 
   it("keeps one instance id per host and a fresh one per host", async () => {
-    const first = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
-    const second = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const first = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const second = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
 
     const firstId = (await connect(first).describe()).result?.hostInstanceId;
     const againId = (await connect(first).describe()).result?.hostInstanceId;
@@ -66,7 +66,7 @@ describe("host description", () => {
   });
 
   it("answers a repeated describe with an equivalent description", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
 
     const first = await client.describe();
@@ -76,7 +76,7 @@ describe("host description", () => {
   });
 
   it("refuses a client that cannot speak generation 2", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
 
     const response = await client.call("host.describe", {
@@ -92,7 +92,7 @@ describe("host description", () => {
 
 describe("session directory", () => {
   it("starts empty and lists the summaries it created", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -110,7 +110,7 @@ describe("session directory", () => {
   });
 
   it("creates an empty, ready session with a host clock timestamp", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -128,7 +128,7 @@ describe("session directory", () => {
   });
 
   it("returns the same session from get as it published by create", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -139,7 +139,7 @@ describe("session directory", () => {
   });
 
   it("answers an unknown session id with SESSION_NOT_FOUND", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -149,7 +149,7 @@ describe("session directory", () => {
   });
 
   it("announces each creation with a session.created event on the subscription", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
     await client.call("subscriptions.open", {});
@@ -163,7 +163,7 @@ describe("session directory", () => {
   });
 
   it("lists summaries without the conversation, and never carries a canonical array", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -179,7 +179,7 @@ describe("session directory", () => {
   });
 
   it("does not let a caller mutate host state through a returned read", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 
@@ -200,7 +200,7 @@ describe("session directory", () => {
 
 describe("host lifetime", () => {
   it("keeps its directory across connections of the same host", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const first = connect(host);
     await first.describe();
     const session = await createSessionThrough(first);
@@ -214,7 +214,7 @@ describe("host lifetime", () => {
 
   it("does not cancel a run when the client goes away", async () => {
     const model = scriptedModel([textReply("done anyway")]);
-    const host = testHost({ modelClient: model.client });
+    const host = await testHost({ modelClient: model.client });
     const client = connect(host);
     await client.describe();
     const session = await createSessionThrough(client);
@@ -241,7 +241,7 @@ describe("host lifetime", () => {
 
 describe("plugin directory", () => {
   it("lists registered plugins in registration order, disabled", async () => {
-    const host = testHost({
+    const host = await testHost({
       modelClient: scriptedModel([textReply("unused")]).client,
       plugins: [
         testPlugin({ id: "alpha", tools: [] }),
@@ -260,7 +260,7 @@ describe("plugin directory", () => {
   });
 
   it("answers an unknown plugin id with PLUGIN_NOT_FOUND", async () => {
-    const host = testHost({ modelClient: scriptedModel([textReply("unused")]).client });
+    const host = await testHost({ modelClient: scriptedModel([textReply("unused")]).client });
     const client = connect(host);
     await client.describe();
 

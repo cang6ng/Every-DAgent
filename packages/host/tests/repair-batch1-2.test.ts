@@ -137,7 +137,7 @@ describe("R04 hostile tool-call slots", () => {
         yield { type: "done" } as never;
       };
 
-      const composed = composeTestHost({
+      const composed = await composeTestHost({
         modelClient: scriptedModel([hostile, textReply("clean answer")]).client,
         plugins: [testPlugin({ id: "tools", tools: [countingTool(executions)] })],
       });
@@ -183,7 +183,7 @@ describe("R04 hostile tool-call slots", () => {
       },
     });
 
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([toolReply("call-1", "observer", input), textReply("clean answer")]).client,
       plugins: [testPlugin({ id: "tools", tools: [countingTool(executions)] })],
     });
@@ -207,7 +207,7 @@ describe("R04 hostile tool-call slots", () => {
 
   it("owns a plain call as a deep snapshot, and runs its tool once", async () => {
     const seen: unknown[] = [];
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([toolReply("call-1", "observer", { n: 1 }), textReply("done")]).client,
       plugins: [testPlugin({ id: "tools", tools: [recordingTool("observer", seen)] })],
     });
@@ -236,7 +236,7 @@ describe("R04 hostile tool-call slots", () => {
 describe("R05 legal history fragments", () => {
   it("walks a real tool turn one item at a time without calling it corruption", async () => {
     const seen: unknown[] = [];
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([toolReply("call-1", "observer", { n: 1 }), textReply("finished")], {
         repeatLast: true,
       }).client,
@@ -308,7 +308,7 @@ describe("R05 legal history fragments", () => {
 describe("R05 terminal run authority", () => {
   /** Two runs really finished, one after the other, in one session. */
   async function twoRealRuns(path: string): Promise<{ sessionId: string; first: string; second: string }> {
-    const composed = composeTestHost({
+    const composed = await composeTestHost({
       modelClient: scriptedModel([
         toolReply("c-1", "observer", { n: 1 }),
         textReply("one"),
@@ -364,7 +364,7 @@ describe("R05 terminal run authority", () => {
         .run(owner.turn_id as string, owner.committed_from_seq as number, owner.committed_to_seq as number, first);
       database.close();
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
 
@@ -392,7 +392,7 @@ describe("R05 terminal run authority", () => {
       client.detach();
       await composed.host.shutdown();
 
-      const again = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const again = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const reader = connect(again.host);
       await reader.describe();
 
@@ -438,7 +438,7 @@ describe("R05 terminal run authority", () => {
         .run(range.committed_from_seq as number, range.committed_to_seq as number);
       database.close();
 
-      const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
+      const composed = await composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
       const client = connect(composed.host);
       await client.describe();
       const got = await client.call("runs.get", { runId: second });
@@ -465,13 +465,17 @@ describe("E4 request-id reservation and one frame authority", () => {
   }
 
   /** A host at one static configuration, with its live state observed. */
-  function hostAt(
+  async function hostAt(
     bytes: number,
     model = scriptedModel([textReply("ok")], { repeatLast: true }),
-  ): { readonly composed: ComposedHost; readonly state: HostState; readonly model: ReturnType<typeof scriptedModel> } {
+  ): Promise<{
+    readonly composed: ComposedHost;
+    readonly state: HostState;
+    readonly model: ReturnType<typeof scriptedModel>;
+  }> {
     let state: HostState | undefined;
-    const composed = composeHost(
-      { modelClient: model.client, plugins: [bigPlugin(bytes)], persistence: { kind: "ephemeral" } },
+    const composed = await composeTestHost(
+      { modelClient: model.client, plugins: [bigPlugin(bytes)] },
       {
         onState: (observed) => {
           state = observed;
@@ -484,7 +488,7 @@ describe("E4 request-id reservation and one frame authority", () => {
 
   /** The boundary configuration: heaviest legal state exactly at the limit, with the reservation. */
   async function boundaryAt(base: number): Promise<number> {
-    const measured = hostAt(base);
+    const measured = await hostAt(base);
     const baseSnapshot = snapshotOfHeaviestState(measured.state, "prepare:stream");
     const baseBytes = frameBytesOf(measured.state, baseSnapshot, PREPARED_REQUEST_ID);
     expect(snapshotFrameFits(measured.state, baseSnapshot)).toBe(true);
@@ -516,10 +520,10 @@ describe("E4 request-id reservation and one frame authority", () => {
     // limit *with the reservation*, and one configuration byte more is
     // refused — this host will not exist if the only ids it could serve are
     // the short ones.
-    const startup = hostAt(atLimit);
+    const startup = await hostAt(atLimit);
     const heaviest = snapshotOfHeaviestState(startup.state, "prepare:stream");
     expect(frameBytesOf(startup.state, heaviest, PREPARED_REQUEST_ID)).toBe(MAX_FRAME_BYTES);
-    expect(() => hostAt(atLimit + 1)).toThrow(/frame|room/i);
+    await expect(hostAt(atLimit + 1)).rejects.toThrow(/frame|room/i);
 
     // And under that reservation every legal request id fits, measured one at
     // a time through the encoder: the 36 B placeholder this used to reserve
@@ -544,7 +548,7 @@ describe("E4 request-id reservation and one frame authority", () => {
     const atLimit = await boundaryAt(96 * 1024);
     const hold = gate();
     const model = scriptedModel([gatedReply(hold, textReply("late"))], { repeatLast: true });
-    const admitting = hostAt(atLimit, model);
+    const admitting = await hostAt(atLimit, model);
     const client = connect(admitting.composed.host);
     await client.describe();
     await client.call("subscriptions.open", {});

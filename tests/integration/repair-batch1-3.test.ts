@@ -87,7 +87,7 @@ describe("E1 a faulted host has nothing current to bootstrap into", () => {
       const path = join(dir, "fault.db");
       const tools = demoPlugin("tools", "observer", "observed");
       const model = scriptedModel([toolReply("call-1", "observer", { n: 1 }), textReply("finished")]);
-      const platform = createHostPlatform({
+      const platform = await createHostPlatform({
         modelClient: model.client,
         plugins: [tools.plugin],
         persistence: { kind: "sqlite", location: path },
@@ -163,7 +163,7 @@ describe("E1 a faulted host has nothing current to bootstrap into", () => {
 
       // The restart is the reconciliation: interrupted, unknown, blocked — and
       // still no re-execution.
-      const restarted = createHostPlatform({
+      const restarted = await createHostPlatform({
         modelClient: scriptedModel([textReply("unused")]).client,
         plugins: [],
         persistence: { kind: "sqlite", location: path },
@@ -188,7 +188,7 @@ describe("E3 a limit=1 traversal is legal end to end", () => {
   it("reads a real tool turn one item at a time without a protocol failure", async () => {
     const tools = demoPlugin("tools", "observer", "observed");
     const model = scriptedModel([toolReply("call-1", "observer", { n: 1 }), textReply("finished")]);
-    const platform = createHostPlatform({ modelClient: model.client, plugins: [tools.plugin] });
+    const platform = await createHostPlatform({ modelClient: model.client, plugins: [tools.plugin] });
     open.push({ close: () => platform.shutdown() });
 
     const client = createClientOn(platform);
