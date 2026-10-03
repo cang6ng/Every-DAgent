@@ -599,3 +599,284 @@ acceptance PASS。**Owner repair：NOT USED**（0 / 1）。
 
 `.zcode/` 内的 probe / mutation / scratch 是过程证据，**不是** contract authority，也不构成本文档的组成
 部分；它们保持有意 untracked、不 stage、不 commit。
+
+## M4 Final Closeout / Seal
+
+> 本节为 seal 轮追加，只记录 M4 关闭与该轮之后的事实；以上 P4.0 冻结、M1 Batch 1 closeout、M1 seal、M2
+> seal 与 M3 seal 的历史事实不被追溯改写。本节由独立 docs-only commit（`docs: seal phase 4 m4`）记录；
+> 文档不引用该提交自身的 SHA。
+
+### Current State
+
+| Milestone | 状态 |
+| --- | --- |
+| P4.0 | COMPLETE / FROZEN |
+| M1 | COMPLETE / SEALED |
+| M2 | COMPLETE / SEALED |
+| M3 | COMPLETE / SEALED |
+| M4 | **COMPLETE / SEALED** |
+| M5 | NOT STARTED |
+
+M4 不再重新打开，除非后续真实 regression 证明 Frozen Contract violation。
+
+### M4 Final Implementation Baseline
+
+`d30caea3f5acccf575557cb8d374f7c25aac7e75` — `test(m4): close hitl execution acceptance`
+
+它由 M4 的 4 个 semantic commits 组成（自 `b37b246` 起，未 amend/squash/rebase）：
+
+| SHA | Subject |
+| --- | --- |
+| `107aca08e075d0ab8be23386b797dd2802616a1a` | `feat(core): prepare bound tool executions` |
+| `5667227ed6372e4e240ca2966a0342cab5a621ed` | `feat(host): enforce policy and coordinate tool approvals` |
+| `3e622da65b6e03548d29d3e6edab6b3b0f30634e` | `feat(client): support typed tool approval replies` |
+| `d30caea3f5acccf575557cb8d374f7c25aac7e75` | `test(m4): close hitl execution acceptance` |
+
+seal commit 只更新本 HANDOFF。
+
+### Frozen Contract Authority
+
+- `docs/PHASE4_PLATFORM_SPEC.md`
+- `docs/PHASE4_M1_CONTRACT_ERRATA.md`
+
+两者共同构成契约权威；两份冻结文档自冻结以来未被修改（`git diff b37b246 d30caea -- docs/PHASE4_PLATFORM_SPEC.md docs/PHASE4_M1_CONTRACT_ERRATA.md` 为空）。Protocol generation 保持 **`"2"`**：M4 implementation **未修改 Frozen Contract**，未新增 frozen semantics，未新增 forward operation、error code 或 DTO；schema version 仍为 **3**（无 migration）；新增 production dependency 为零。
+
+### Approval / Execution Profile
+
+Frozen Contract 未规定具体数值，以下是 M4 的 current implementation profile（集中定义于
+`packages/host/src/limits.ts`，不是 Protocol 永久 law，也不是 M3 Settings）：
+
+| 项目 | 当前 profile |
+| --- | --- |
+| business approval deadline | 120 000 ms（Host monotonic clock 为 authority） |
+| approval exact input | ≤ 24 KiB（不可完整表示时 fail closed，不静默截断） |
+| ApprovalSnapshot encoding | ≤ 32 KiB |
+| pending business approval | ≤ 1 |
+| active deliveries / approval | ≤ 8（每 connection/stream 至多 1） |
+| projection rendezvous | 有界内部等待，仅 fail closed，可被 cancel/closing/storageFault/run settle 立即唤醒 |
+
+### M4 Delivered Capabilities
+
+1. whole-group pre-log preparation（validate ALL → prepare ALL → 只有全部成功才写 assistant declaration）
+2. provider-neutral Core prepared execution seam（`prepareBatch` / `executePrepared`，Core 不依赖 Host）
+3. concrete function + receiver binding（注册时捕获，dispatch 时绝不重新读取 `tool.execute`）
+4. owned immutable approval/execution authority input（deep-freeze authority snapshot）
+5. isolated mutable Tool execution copy（Tool 改写自己的 input 不影响 authority/canonical）
+6. ToolRegistry monotonic generation（仅真实 mapping 变化递增）
+7. stable registration identity（delete+re-register 产生新 identity）
+8. Host-managed executionId（prepare 时生成，不使用 provider callId）
+9. trusted ToolPolicy（由 Trusted Composition 提供）
+10. allow / deny / require-approval 三个决策，无第四种
+11. unknown/unclassified tool default deny（Tool/plugin metadata 不能自我授予 allow）
+12. Host-owned in-memory ApprovalRecord（进入 SQLite/Settings/Plugin KV/canonical/resume state 的通道不存在）
+13. approval state / execution state separation
+14. 120-second Host-authoritative business deadline（reconnect 不刷新）
+15. final dispatch guard
+16. synchronous dispatching → invocation critical section（中间无 await/lookup/policy/copy/publication/callback）
+17. same-host executionId at-most-once dispatch（正常授权时 exactly once）
+18. not-executed observations（固定安全文案，可按既有 Loop 继续）
+19. executed/attempted failure disposition（sync throw / rejection / ok:false / abort 后 settle 均属 executed）
+20. `tool.approval` reverse profile（唯一新增 production reverse method）
+21. `approval.updated`（business authority 事件，先于对应 delivery）
+22. multiple deliveries / first valid business decision wins
+23. disconnect-safe approval persistence within current Host（只关闭 delivery）
+24. same-host reconnect redelivery（同一 business record，新 stream/request，不 re-prepare/re-policy/不刷新 deadline/不重放旧答案）
+25. old stream/epoch/reply invalidation（迟到答复零业务效果）
+26. restart invalidates execution capability（新 hostInstance 无旧 approval/prepared/callable/resolver）
+27. typed Client approval handler（`registerToolApprovalHandler`，唯一 approval 公共 seam）
+28. Client business/reply state separation（`presentation.approval` vs `approvalReply`，`approvalCanRespond` 为推导值）
+29. approval exact input boundedness（prospective frame 检查在 prepare 阶段）
+30. execution lease retained while approval pending（second Run / settings / plugin / registry mutation 均 HOST_BUSY）
+31. real Chrome HITL carrier acceptance（最小 harness 页面 + 3 个 strict required cases）
+
+### Prepared Execution Law
+
+Model tool declaration **≠** execution authority。Managed execution 的顺序是一条不可换序的链条：
+
+```text
+whole group validate → whole group prepare → only then assistant declaration →
+policy → optional approval → final guard → bound invocation
+```
+
+Prepared execution 绑定：executionId、position（turn/step/callIndex）、concrete executor、receiver、
+immutable authority input、registry generation、registration identity、Host-private policy/Run ownership。
+批准后不得按 name lookup、不得重新读取 `tool.execute`、不得替换 arguments。
+
+### Policy Law
+
+ToolPolicy 由 Trusted Composition 提供，Host 拥有 enforcement。只允许 `allow` / `deny` /
+`require-approval`；未知或未分类一律 `deny`。Policy 为 Host lifetime fixed：不能通过 Settings、
+plugin config、model output 或 client 改变（不 hot reload）。Policy throw、返回非法值、Promise、
+object 或 undefined 一律 fail closed、zero dispatch。
+
+### Dispatch Safety
+
+final guard 至少覆盖：hostInstance、current Run、execution lease、cancel/signal、business deadline、
+prepared identity、registry generation、registration identity、policy identity/revision、
+authorization、dispatch state。guard 通过后 **synchronously mark dispatching → immediately invoke the
+already-bound function**，中间没有 await、动态 lookup、callback、publication、policy 或 client 交互。
+
+同一 Host 同一 executionId：**at most one dispatch**；正常授权且 guard 成立时 **exactly one
+dispatch**。不保证外部系统的 exactly-once 副作用，也不得以 `ok:false` 或 content 推断未发生副作用。
+
+### Cancel / Timeout Semantics
+
+cancel、timeout 与 approve 在 Host authority 上竞争并串行化：
+
+- pre-dispatch 的 cancel/expire → zero dispatch；
+- dispatch 已发生 → cancel 只能请求 abort，**不得**声称 rollback / not executed / 无外部副作用；
+- tool throws 或 `ok:false` → 仍属 executed/attempted；
+- executor 未 settle 前不得释放 execution lease。
+
+### Approval Delivery
+
+唯一 production reverse profile 是 `tool.approval`。Business ApprovalRecord 与 reverse delivery 严格
+分离：
+
+- disconnect：只关闭该 delivery；business approval 保持 pending，Run 不被取消；
+- same-host reconnect：same approvalId / same executionId / same exact input / same business deadline，
+  新的 stream/request delivery；不重新 prepare、不 re-policy、不刷新 deadline、不重放旧答案；
+- multiple connections：first valid business decision wins；其余 reply 零业务效果、零二次 dispatch；
+- 没有 approval-capable client：绝不 allow，保持 pending 至 deadline 后 expire（not-executed）。
+
+### Business Deadline
+
+Owner amendment 已落实：business approval 为固定 **120 秒**，Host monotonic clock 是 authority；
+**delivery timeout 没有使用 30 秒人为缩短**——每次有效 delivery 覆盖当前剩余的 business approval
+window（复用 reverse long-timeout segmentation）。验收记录：initial delivery `timeoutMs = 120000`；
+business 走 30 秒后重连的新 delivery `timeoutMs = 90000`，且 `deadlineAt` 保持同一绝对值（重连不刷新
+deadline）。
+
+### Execution Lease
+
+approval pending 期间保持既有 Run execution lease，因此 second Run、settings mutation、plugin
+lifecycle mutation 与 registry mutation 都不能越过执行 ownership（均 HOST_BUSY）；reads、cancel 与
+reverse reply 仍可处理。已 dispatch 且 executor 未 settle 时不得提前释放 lease。
+
+### Restart Boundary
+
+Pending approval 期间的真实 SIGKILL：old Run 按 M1 reconciliation 成为 `interrupted`（`unknown`），
+session blocked。new Host 有新的 hostInstance，没有旧 ApprovalRecord、PreparedExecution、callable、
+resolver 或 reverse pending；旧 reply 零效果；DB 中的 Run/input/history 只用于查询与 reconciliation，
+**不得**用于重建 execution capability。不存在 `runs.resume`、`approvals.resume`、durable approval 或
+per-tool execution checkpoint。
+
+### Protocol / Client
+
+Protocol 仍为 generation **`"2"`**，落实 Frozen v2 已声明的：`ApprovalSnapshot`、
+`ToolApprovalResponse`、`tool.approval`、`approval.updated`、`HostSnapshot.approval`、
+`run.tool.call`/`run.tool.result` 的 execution/invocation 关联与安全 execution disposition。
+没有 forward approval API、`tools.execute`、resume API 或新 error code。
+
+Client 的唯一 approval 公共 seam 是 typed `registerToolApprovalHandler`（或最终实际 public 等价
+API）；不公开 generic reverse method registration、arbitrary JSON response API 或任何执行入口。
+Client state 明确区分 **Host business approval**（来自 `approval.updated` 与 snapshot）与
+**local delivery/reply state**（none/pending/sent/closed/failed）；`sent` 只表示已发出、等待 Host 确认。
+
+### Related Local Fixes
+
+M4 顺路闭合的三个直接相关安全问题（局部 prerequisite，未重开 M1/M2、未改 Frozen limits、无无关
+重构）：
+
+1. `ToolRegistry` disposer 捕获 registration key/identity，不在 dispose 时读取 mutable `tool.name`；
+2. JSON ownership 精确保留合法 own `"__proto__"` 与 nested null-prototype 键（不调用 getter/toJSON/coercion）；
+3. Host outbox 统一按真实 UTF-8 byte count 计量，不使用 JS `string.length` 作为 byte authority。
+
+### Durable Execution Disposition
+
+M4 的新 tool result facts 可以明确 `executed` / `not-executed`；旧 M1–M3 history 没有该字段时保持
+legacy/unknown。禁止根据 `ok:false` 或 content 反向推断未产生外部副作用。
+
+durable `tool/call`、`tool/result` record 当前**不额外保存 executionId**：executionId 继续用于
+live/wire/approval identity，durable occurrence identity 保持现有 invocation identity（按 prompt §8
+不得以 executionId 替代）。其原因进入 hardening backlog（见下）：直接加入 executionId 会改变 M1 冻结的
+64 KiB at-bound record 行为。
+
+### Acceptance Evidence
+
+**A01–A36：36/36 PASS**。关键断言：allow = 1；deny = 0；pending pre-approve = 0；approve = 1；
+duplicate approve = still 1；reject = 0；timeout = 0；cancel-before-dispatch = 0；restart 后旧
+execution = 0；multiple deliveries dispatch ≤ 1；pending 期间 lease 保持；approval exact input 保真；
+whole-group preparation failure = group 0。
+
+覆盖位置：`packages/host/tests/tool-policy.test.ts`、`packages/host/tests/run.test.ts`、
+`packages/host/tests/projection.test.ts`、`packages/host/tests/outbox-bytes.test.ts`、
+`packages/client/tests/approval.test.ts`、`packages/agent-core/tests/tool-execution.test.ts`、
+`tests/integration/tool-approval.test.ts`、`tests/integration/approval-crash.test.ts`、
+`apps/web/tests/shell-approval.browser.test.ts`。
+
+### Negative Controls
+
+| NC | mutant | 结果 |
+| --- | --- | --- |
+| NC1 | require-approval 绕过 approval 直接派发 | **KILLED** |
+| NC2 | dispatch 时重读 `Tool.execute` | **KILLED** |
+| NC3 | duplicate/loser reply 二次决定 | **KILLED** |
+| NC4 | disconnect 自动 cancel business approval | **KILLED** |
+| NC5 | reconnect 重置 business/delivery deadline | **KILLED** |
+| NC6 | final guard 忽略 registryGeneration | **KILLED** |
+| NC7 | pending approval 释放 execution lease | **KILLED** |
+| NC8 | restart 恢复旧 execution authority（跳过 reconciliation） | **KILLED** |
+
+**8/8 KILLED**：每条均以 business assertion 失败，mutant 真实加载、逐文件 byte-identical restore、
+恢复后目标测试重新变绿，无 residue。**NC2 特别控制**：registry generation 不变、仅替换原
+Tool 的 `.execute` property，证明 killed 的是 concrete function binding，而不是被 generation
+mismatch guard 代杀。
+
+### M4 Evidence
+
+| 项目 | 结果 |
+| --- | --- |
+| full offline | **1525 passed / 0 failed / 0 skipped / 1525 total**（排除 `real-provider` 与 `.zcode/**`；本机有 Chrome，浏览器用例实际执行） |
+| real Chrome strict（`pnpm test:web:browser`） | **20 passed / 0 failed / 0 skipped**（原 Phase1–M3 required cases 17 + 新增 M4 required cases 3） |
+| M4 browser cases | approve → exactly one dispatch；reject → zero dispatch；reconnect → same approval continues 且 exactly one dispatch |
+| agent-core | **188 passed** |
+| host | **422 passed** |
+| client | **220 passed** |
+| protocol | **183 passed** |
+| plugin-system | **81 passed** |
+| plugin-calculator | **7 passed** |
+| model-pi-ai（adapter） | **60 passed** |
+| integration | **161 passed** |
+| A01–A36 | **36/36 PASS** |
+| NC1–NC8 | **8/8 KILLED** |
+| typecheck（root + browser project） | **PASS** |
+| `pnpm build:web` | **PASS** |
+| `git diff --check` | clean |
+| real-provider | **NOT RUN**（未运行，不记为 PASS） |
+
+全部 gate 在最终 implementation baseline `d30caea` 上通过；seal 轮为 docs-only，未重跑上述 suite。
+
+### Review / Acceptance History
+
+如实记录：ChatGPT → M4 architecture research → D1–D24 frozen；Sol 6.1 → one formal Implementation
+Plan；ChatGPT → owner plan check → four implementation amendments；DSFlash → one-shot
+implementation（实现期内自行发现并修复缺陷，均在 acceptance 之前）→ A01–A36 → NC1–NC8 → full
+gates；ChatGPT → owner acceptance PASS。**Owner repair：NOT USED**（0 / 1）。
+
+**没有发生“independent DSFlash review PASS”或“Sol implementation review PASS”**，本节不作此表述。
+
+`.zcode/` 内的 probe / mutation / scratch 是过程证据，**不是** contract authority，也不构成本文档的
+组成部分；它们保持有意 untracked、不 stage、不 commit。
+
+### M4 Hardening Backlog
+
+非阻塞项，记录但不属于 M4 blocker：
+
+1. durable `tool/call`、`tool/result` 未来是否加入 executionId——需要先裁决与 M1 冻结的 64 KiB
+   at-bound record 行为的兼容策略。
+2. `PROJECTION_RENDEZVOUS_MS` / `APPROVAL_*` internal profile 的 future tuning，任何改动需重新给出
+   boundary evidence。
+3. M5 的正式 approval UI 与说明。
+4. M1/M2/M3 原有 backlog 保持原状态。
+
+以下**不是** backlog，它们是 M4 contract 本身：dynamic executor lookup、double dispatch、approval
+races、business deadline correctness、execution lease、restart capability、exact approval input。
+
+### M5 Boundary
+
+下一个 milestone 为 **M5 — UX + Phase 4 Acceptance / Seal**，状态 **NOT STARTED**。M5 的 Frozen scope：
+history/page coverage UX、session rename/delete UX、settings/restart UX、approval/interrupted
+explanation UX、Phase 4 full cross-layer acceptance、real browser gate、final independent review /
+seal。本轮不设计、不实施 M5，不重做 Shell architecture，不添加 archive/tag/folder，也不新增
+workflow/multiagent。
