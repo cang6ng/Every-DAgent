@@ -6,6 +6,7 @@ import { DEFAULT_MODEL_FRAMING, defineModelBudget } from "@every-dagent/agent-co
 import type { ModelClient, ModelEvent, ModelRequest, RuntimeContext } from "@every-dagent/agent-core";
 
 import { UnsupportedPiAiProfileError, createPiAiModelClient } from "../src/pi-ai-client.js";
+import type { PiAiStreamSource } from "../src/pi-ai-client.js";
 import {
   abortedScript,
   createRewriteSource,
@@ -31,6 +32,30 @@ async function collect(client: ModelClient, request: ModelRequest): Promise<Mode
   const events: ModelEvent[] = [];
   for await (const event of client.stream(request, context)) events.push(event);
   return events;
+}
+
+/**
+ * A source that does nothing but count.
+ *
+ * It exists for the tests where the assertion is that nothing happened at all:
+ * a client that could not be built has no stream to call, and a source that never
+ * handed out an event is the evidence.
+ */
+function countingSource(scripts: readonly (readonly AssistantMessageEvent[])[] = []): {
+  readonly source: PiAiStreamSource;
+  streams: () => number;
+} {
+  let streams = 0;
+  const inner = createScriptedPiAiStream(scripts);
+  return {
+    streams: () => streams,
+    source: {
+      stream: (model, context_, options) => {
+        streams += 1;
+        return inner.stream(model, context_, options);
+      },
+    },
+  };
 }
 
 /** The capability this adapter declares for the test model. */
@@ -374,14 +399,42 @@ describe("PiAiModelClient requests", () => {
     ).toThrow(/context window/);
   });
 
-  it("refuses a model API whose output cap it cannot enforce", async () => {
-    const source = createScriptedPiAiStream([textScript("ok")]);
+  it("refuses a model API whose output cap it cannot enforce, at construction", () => {
+    const counting = countingSource();
     const unaudited = { ...MODEL, api: "openai-responses" as typeof MODEL.api };
-    const client = createPiAiModelClient({ models: source, model: unaudited });
 
-    await expect(collect(client, request())).rejects.toThrow(UnsupportedPiAiProfileError);
-    // No provider call, and above all no provider payload.
-    expect(source.contexts).toHaveLength(0);
+    // The refusal is the adapter's own, it happens where the client would have
+    // been built, and it is the caller's synchronously — not the first request's.
+    expect(() => createPiAiModelClient({ models: counting.source, model: unaudited })).toThrow(
+      UnsupportedPiAiProfileError,
+    );
+
+    // Nothing was streamed and nothing was built: there is no client to ask.
+    expect(counting.streams()).toBe(0);
+  });
+
+  it("refuses an API no pi-ai profile claims either", () => {
+    const counting = countingSource();
+    const undeclared = { ...MODEL, api: "faux" as typeof MODEL.api };
+
+    expect(() => createPiAiModelClient({ models: counting.source, model: undeclared })).toThrow(
+      /not one whose output cap this adapter can enforce/,
+    );
+    expect(counting.streams()).toBe(0);
+  });
+
+  it("admits a scripted transport that declares an audited API", async () => {
+    // A fake transport is not a fake capability: the profile it names is what is
+    // admitted, and it is admitted on the same terms as any other — which is why
+    // the scripted source behind these tests has to say what protocol it speaks.
+    const counting = countingSource([textScript("ok")]);
+    const client = createPiAiModelClient({ models: counting.source, model: MODEL });
+
+    await expect(collect(client, request())).resolves.toEqual([
+      { type: "text-delta", text: "ok" },
+      { type: "done" },
+    ]);
+    expect(counting.streams()).toBe(1);
   });
 
   it("refuses a payload whose cap is not the one the request reserved", async () => {

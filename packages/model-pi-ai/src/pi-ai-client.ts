@@ -77,9 +77,11 @@ export interface PiAiModelClientOptions {
 /**
  * A model API whose request body this adapter cannot prove carries the right cap.
  *
- * It is refused before the network, never negotiated down: the contract is that
- * the provider's own output cap equals the request's reserve, and an API this
- * adapter has no serializer evidence for is one where it cannot say that.
+ * It is refused at the composition that would have used it — the adapter does not
+ * become an executable ModelClient for a profile whose output cap it cannot
+ * enforce — and never negotiated down: the contract is that the provider's own
+ * output cap equals the request's reserve, and an API this adapter has no
+ * serializer evidence for is one where it cannot say that.
  */
 export class UnsupportedPiAiProfileError extends NonRetryableModelError {}
 
@@ -91,6 +93,12 @@ export class UnsupportedPiAiProfileError extends NonRetryableModelError {}
  * below is written against these two lists rather than against a predicted
  * `compat` decision, so a pi-ai that changes which field it writes is caught by
  * comparing the body it really built — not by re-deriving its logic here.
+ *
+ * This table is also the adapter's profile admission: an API that is not in it has
+ * no evidence behind it, and a model that names one cannot become an executable
+ * profile. Two spellings of the same OpenAI-compatible protocol are the same
+ * entry, because they are the same serializer: which of the two field names it
+ * writes is decided by pi-ai, and the payload guard accepts either.
  */
 const AUDITED_PROFILES: Readonly<
   Record<string, { readonly capFields: readonly string[]; readonly conflicting: readonly string[] }>
@@ -110,15 +118,32 @@ function positiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
+/** What the adapter has to know to run: the capability, and the audited shape. */
+interface BoundedProfile {
+  readonly limits: ModelLimits;
+  readonly cap: {
+    readonly capFields: readonly string[];
+    readonly conflicting: readonly string[];
+  };
+}
+
 /**
- * The capability this adapter declares, read from the model it will really call.
+ * The capability this adapter declares, read from the model it will really call,
+ * and the profile it will run it under.
  *
- * Both numbers come from pi-ai's own registry entry and neither is guessed: a
- * model whose metadata has no usable window or maximum is refused rather than
- * assumed large. Nothing here looks at the model's *name*, and nothing reaches
- * the network to learn a limit.
+ * Every question that can be answered from the model's own metadata is answered
+ * here, before there is a client to hand out: are the limits usable, is the
+ * configured ceiling a cap below the model's own maximum, and — the one that
+ * decides whether this is an *executable* profile at all — is the API one whose
+ * request body this adapter can prove carries the request's own output cap. A
+ * model that fails any of them is refused at construction rather than admitted
+ * and refused later: a composition that cannot enforce the cap must not be able
+ * to reach `ready` and record a run first.
+ *
+ * Nothing here looks at the model's *name*, nothing reaches the network, and
+ * nothing consults a provider.
  */
-function capabilityOf({ model, maxTokens }: PiAiModelClientOptions): ModelLimits {
+function boundedProfileOf({ model, maxTokens }: PiAiModelClientOptions): BoundedProfile {
   if (!positiveInteger(model.contextWindow)) {
     throw new ModelLimitsError("the model declares no usable context window");
   }
@@ -129,11 +154,21 @@ function capabilityOf({ model, maxTokens }: PiAiModelClientOptions): ModelLimits
     throw new ModelLimitsError("the configured output ceiling is not a cap below the model's own maximum");
   }
 
-  return validateModelLimits({
-    contextWindow: model.contextWindow,
-    maxOutputTokens: maxTokens ?? model.maxTokens,
-    framing: DEFAULT_MODEL_FRAMING,
-  });
+  const cap = AUDITED_PROFILES[model.api as string];
+  if (cap === undefined) {
+    throw new UnsupportedPiAiProfileError(
+      `the model API "${model.api}" is not one whose output cap this adapter can enforce`,
+    );
+  }
+
+  return {
+    limits: validateModelLimits({
+      contextWindow: model.contextWindow,
+      maxOutputTokens: maxTokens ?? model.maxTokens,
+      framing: DEFAULT_MODEL_FRAMING,
+    }),
+    cap,
+  };
 }
 
 /**
@@ -152,25 +187,23 @@ function capabilityOf({ model, maxTokens }: PiAiModelClientOptions): ModelLimits
  *   ordinary terminal (a truncated answer most of all) — so that a stream that
  *   merely ends can only ever mean a step that completed;
  * - retry nothing: retry is the AgentLoop's decision and would otherwise multiply.
+ *
+ * A model whose profile is not executable throws from here, which is the whole
+ * point of the boundary: there is no `ModelClient` to compose, so no host, no
+ * admitted run and no first request that has to discover it.
  */
 export function createPiAiModelClient(options: PiAiModelClientOptions): ModelClient {
-  const limits = capabilityOf(options);
-  return { limits, stream: (request, context) => stream(options, limits, request, context) };
+  const { limits, cap } = boundedProfileOf(options);
+  return { limits, stream: (request, context) => stream(options, limits, cap, request, context) };
 }
 
 async function* stream(
   { models, model, apiKey, timeoutMs }: PiAiModelClientOptions,
   limits: ModelLimits,
+  profile: BoundedProfile["cap"],
   request: ModelRequest,
   context: RuntimeContext,
 ): AsyncGenerator<ModelEvent> {
-  const profile = AUDITED_PROFILES[model.api as string];
-  if (profile === undefined) {
-    throw new UnsupportedPiAiProfileError(
-      `the model API "${model.api}" is not one whose output cap this adapter can enforce`,
-    );
-  }
-
   const cap = request.maxOutputTokens;
   if (!positiveInteger(cap) || cap > limits.maxOutputTokens) {
     // This request reserved more output than this profile may ever send. It never

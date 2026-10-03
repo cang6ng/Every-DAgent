@@ -32,7 +32,7 @@ import {
   defineModelBudget,
 } from "@every-dagent/agent-core";
 
-import { createPiAiModelClient } from "../src/pi-ai-client.js";
+import { UnsupportedPiAiProfileError, createPiAiModelClient } from "../src/pi-ai-client.js";
 import type { PiAiStreamSource } from "../src/pi-ai-client.js";
 import { TEST_MODEL } from "./helpers/fake-pi-ai-stream.js";
 
@@ -510,10 +510,11 @@ describe("the output cap the provider really receives", () => {
 
   it("sends the reserve as the single cap of an openai-completions body", async () => {
     const socket = stubSockets([sseBody([openAiChunk({ role: "assistant", content: "ok" }), openAiChunk({}, "stop")])]);
-    const runtime = runtimeFor(
-      createPiAiModelClient({ models: openAiSource(socket), model: TEST_MODEL, apiKey: "unused" }),
-      createToolRegistry(),
-    );
+    // The profile is admitted where the client is built; the body is what proves
+    // the admission was worth something.
+    const client = createPiAiModelClient({ models: openAiSource(socket), model: TEST_MODEL, apiKey: "unused" });
+    expect(client.limits.maxOutputTokens).toBe(TEST_MODEL.maxTokens);
+    const runtime = runtimeFor(client, createToolRegistry());
 
     await runtime.run({ session: createSession("s-1"), text: "hi" });
 
@@ -531,10 +532,9 @@ describe("the output cap the provider really receives", () => {
       baseUrl: "https://api.deepseek.com/v1",
     };
     const socket = stubSockets([sseBody([openAiChunk({ role: "assistant", content: "ok" }), openAiChunk({}, "stop")])]);
-    const runtime = runtimeFor(
-      createPiAiModelClient({ models: openAiSource(socket), model: deepseek, apiKey: "unused" }),
-      createToolRegistry(),
-    );
+    const client = createPiAiModelClient({ models: openAiSource(socket), model: deepseek, apiKey: "unused" });
+    expect(client.limits.maxOutputTokens).toBe(deepseek.maxTokens);
+    const runtime = runtimeFor(client, createToolRegistry());
 
     await runtime.run({ session: createSession("s-1"), text: "hi" });
 
@@ -546,10 +546,9 @@ describe("the output cap the provider really receives", () => {
 
   it("sends the reserve as anthropic's max_tokens, and nothing else named like a cap", async () => {
     const socket = stubSockets([anthropicTextBody("ok")]);
-    const runtime = runtimeFor(
-      createPiAiModelClient({ models: anthropicSource(socket), model: TEST_MODEL, apiKey: "unused" }),
-      createToolRegistry(),
-    );
+    const client = createPiAiModelClient({ models: anthropicSource(socket), model: TEST_MODEL, apiKey: "unused" });
+    expect(client.limits.maxOutputTokens).toBe(TEST_MODEL.maxTokens);
+    const runtime = runtimeFor(client, createToolRegistry());
 
     await runtime.run({ session: createSession("s-1"), text: "hi" });
 
@@ -557,6 +556,41 @@ describe("the output cap the provider really receives", () => {
     expect(body.max_tokens).toBe(CAP);
     expect(body.max_completion_tokens).toBeUndefined();
     expect(body.max_output_tokens).toBeUndefined();
+  });
+
+  it("refuses an unaudited API at construction, with no serializer and no network", () => {
+    const socket = stubSockets([sseBody([openAiChunk({ role: "assistant", content: "ok" }), openAiChunk({}, "stop")])]);
+    let serialized = 0;
+    let fetches = 0;
+    const counting: PiAiFetch = (url, init) => {
+      fetches += 1;
+      return socket.fetch(url, init);
+    };
+    const source = openAiSource({ fetch: counting });
+
+    // The serializer and the socket are real, so the counters would move if the
+    // profile were admitted: what is refused is the profile, and the refusal
+    // happens before either of them is asked for anything.
+    const unaudited: Model<"openai-responses"> = {
+      ...(TEST_MODEL as unknown as Model<"openai-responses">),
+      api: "openai-responses",
+    };
+    expect(() =>
+      createPiAiModelClient({
+        models: {
+          stream: (model, context_, options) => {
+            serialized += 1;
+            return source.stream(model, context_, options);
+          },
+        },
+        model: unaudited,
+        apiKey: "unused",
+      }),
+    ).toThrow(UnsupportedPiAiProfileError);
+
+    expect(serialized).toBe(0);
+    expect(fetches).toBe(0);
+    expect(socket.sent).toHaveLength(0);
   });
 
   it("sends the reserve the request carried, not the profile's ceiling", async () => {
