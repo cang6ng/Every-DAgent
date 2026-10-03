@@ -414,14 +414,27 @@ describe("the run strip", () => {
 
 describe("the plugin panel", () => {
   const plugins: readonly PluginSummary[] = [
-    { id: "calculator", name: "Calculator", version: "0.1.0", permissions: [], status: "disabled" },
-    { id: "text-stats", name: "Text Stats", version: "1.0.0", description: "Measures a text.", permissions: ["storage"], status: "enabled" },
+    summary({ id: "calculator", name: "Calculator", version: "0.1.0", status: "disabled" }),
+    summary({
+      id: "text-stats",
+      name: "Text Stats",
+      version: "1.0.0",
+      description: "Measures a text.",
+      permissions: ["storage"],
+      status: "enabled",
+      desiredEnabled: true,
+    }),
     {
       id: "broken",
       name: "Broken",
       version: "0.0.1",
       permissions: [],
       status: "error",
+      desiredEnabled: false,
+      configRevision: null,
+      effectiveConfigRevision: null,
+      restartRequired: false,
+      unavailable: true,
       lastFailure: { operation: "enable", phase: "activate", code: "PLUGIN_OPERATION_FAILED", message: "activation failed", cleanupFailureCount: 1 },
     },
   ];
@@ -452,7 +465,7 @@ describe("the plugin panel", () => {
     // unguarded would find `Object.prototype.constructor` and render the
     // plugin as permanently mid-operation, with its button disabled.
     const inherited: readonly PluginSummary[] = [
-      { id: "constructor", name: "Constructor", version: "1.0.0", permissions: [], status: "disabled" },
+      summary({ id: "constructor", name: "Constructor", version: "1.0.0", status: "disabled" }),
     ];
     const markup = renderToStaticMarkup(
       <PluginsPanel
@@ -613,5 +626,23 @@ describe("the host panel and the whole shell", () => {
 });
 
 function plugins0(): PluginSummary {
-  return { id: "p", name: "p", version: "0", permissions: [], status: "disabled" };
+  return summary({ id: "p", name: "p", version: "0", status: "disabled" });
+}
+
+/** One plugin summary, with the fields a plugin's own state derives. */
+function summary(overrides: Partial<PluginSummary> & { readonly id: string; readonly status: PluginSummary["status"] }): PluginSummary {
+  const configRevision = overrides.configRevision ?? null;
+  const effectiveConfigRevision = overrides.effectiveConfigRevision ?? configRevision;
+  const desiredEnabled = overrides.desiredEnabled ?? false;
+  return {
+    name: overrides.id,
+    version: "1.0.0",
+    permissions: [],
+    desiredEnabled,
+    configRevision,
+    effectiveConfigRevision,
+    restartRequired: configRevision !== null && configRevision !== effectiveConfigRevision,
+    unavailable: overrides.status === "error" || (desiredEnabled && overrides.status !== "enabled"),
+    ...overrides,
+  };
 }

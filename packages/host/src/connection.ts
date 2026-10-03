@@ -23,9 +23,12 @@ import type {
 import { encodeFrame, validateMessage } from "@every-dagent/protocol";
 
 import { HOST_LIMITS, OUTBOX_LIMIT_FRAMES } from "./limits.js";
-import { ProjectionError, projectPluginInfo, samePluginSummary } from "./projection.js";
+import { ProjectionError, pluginFactsOf, projectPluginInfo, samePluginSummary } from "./projection.js";
 import { createReverseConnectionState, dropAllReverse } from "./reverse.js";
 import type { ReverseProfile } from "./reverse.js";
+// Type-only on purpose: `state.ts` reaches `run.ts`, which reaches this module,
+// so a value import here would close a cycle through the live-run path — and a
+// cycle is enough to break the module identity a test's `vi.mock` depends on.
 import type { ConnectionState, HostState, RunEntry } from "./state.js";
 
 /**
@@ -388,7 +391,7 @@ export function observePlugin(state: HostState, pluginId: string): PluginSummary
   const info = state.manager.get(pluginId);
   if (info === undefined) return undefined;
 
-  const summary = projectPluginInfo(info);
+  const summary = projectPluginInfo(info, pluginFactsOf(state, pluginId));
   const published = state.plugins.get(pluginId);
   if (published !== undefined && samePluginSummary(published, summary)) return summary;
 

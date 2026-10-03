@@ -136,15 +136,22 @@ describe("C4 publication and revisions", () => {
       expect(enabled.error).toBeUndefined();
       expect(enabled.result?.plugin.status).toBe("enabled");
 
-      const updated = await client.waitForEvent("plugin.updated");
-      expect(updated.payload.plugin.status).toBe("enabled");
-      expect(pluginsRevision(client)).toBe(1);
+      // Two announcements, in the order the two facts became true: the durable
+      // intent first ("wanted, not yet on"), then the lifecycle that honoured
+      // it. Each moved the plugin catalogue, and each revision travelled with
+      // its own summary.
+      const updates = client.events.filter((event) => event.type === "plugin.updated");
+      expect(updates.map((event) => event.payload.plugin.status)).toEqual(["disabled", "enabled"]);
+      expect(updates[0]?.payload.plugin.desiredEnabled).toBe(true);
+      expect(updates[0]?.payload.plugin.unavailable).toBe(true);
+      expect(updates[1]?.payload.plugin.unavailable).toBe(false);
+      expect(pluginsRevision(client)).toBe(2);
 
       // A no-op enable changes nothing, so it announces nothing.
       const again = await client.call("plugins.enable", { pluginId: "demo" });
       expect(again.error).toBeUndefined();
-      expect(client.events.filter((event) => event.type === "plugin.updated")).toHaveLength(1);
-      expect(client.events.filter((event) => event.type === "collection.invalidated")).toHaveLength(1);
+      expect(client.events.filter((event) => event.type === "plugin.updated")).toHaveLength(2);
+      expect(client.events.filter((event) => event.type === "collection.invalidated")).toHaveLength(2);
     } finally {
       client.detach();
       await host.host.shutdown();

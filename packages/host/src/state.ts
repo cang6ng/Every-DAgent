@@ -185,6 +185,12 @@ export interface ConnectionState {
   closed: boolean;
 }
 
+/** One plugin's two configuration revisions: what is asked for, and what runs. */
+export interface PluginConfigRevisions {
+  desired: number;
+  effective: number | null;
+}
+
 /**
  * The configuration this host instance is running from.
  *
@@ -220,6 +226,21 @@ export interface HostState {
   /** The published plugin summaries, by id, in registration order. */
   readonly plugins: Map<string, PluginSummary>;
   readonly pluginOrder: string[];
+  /**
+   * The desired-enabled intent of each registered plugin, as storage holds it.
+   *
+   * It is a projection, not an authority: an `enable` writes the intent first
+   * and only then updates this map, so what a summary reports here is always a
+   * durable fact rather than an intention this host has not committed.
+   */
+  readonly pluginIntents: Map<string, boolean>;
+  /**
+   * Per plugin: the desired configuration revision and the one this instance
+   * actually bound. A plugin with no configuration contract has no entry, which
+   * is what `null` on the wire means.
+   */
+  readonly pluginConfigRevisions: Map<string, PluginConfigRevisions>;
+
   /** The runs this host is currently executing. Terminal runs live in storage. */
   readonly runs: Map<string, RunEntry>;
   readonly connections: Set<ConnectionState>;

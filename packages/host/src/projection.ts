@@ -141,9 +141,47 @@ export function projectDisplayInput(input: unknown): DisplayInput {
     : Object.freeze({ kind: "unavailable" as const, reason: "not-json-safe" as const });
 }
 
+/**
+ * What one plugin's summary needs beyond its lifecycle, and where it comes from.
+ *
+ * The lifecycle is the manager's fact; the intent and the two configuration
+ * revisions are the host's — the desired intent is what storage holds, and the
+ * effective revision is what this instance actually bound. A projection that
+ * conflated them would be unable to say "off, but wanted" or "on, but a
+ * different configuration than the one requested".
+ */
+export interface PluginConfigurationFacts {
+  readonly desiredEnabled: boolean;
+  readonly configRevision: number | null;
+  readonly effectiveConfigRevision: number | null;
+}
+
+/**
+ * The lifecycle-external half of one plugin's summary.
+ *
+ * Read from the host's own projections rather than from storage: a summary is
+ * published inside a synchronous step, and a durable read there would be a
+ * second authority about a fact the host already holds. It lives beside the
+ * projection because it is one of that projection's inputs, not a fact of its
+ * own.
+ */
+export function pluginFactsOf(
+  state: import("./state.js").HostState,
+  pluginId: string,
+): PluginConfigurationFacts {
+  const revisions = state.pluginConfigRevisions.get(pluginId);
+  return {
+    desiredEnabled: state.pluginIntents.get(pluginId) ?? false,
+    configRevision: revisions?.desired ?? null,
+    effectiveConfigRevision: revisions?.effective ?? null,
+  };
+}
+
 /** The plugin as the protocol sees it: a projection, never a `PluginInfo` re-export. */
-export function projectPluginInfo(info: PluginInfo): PluginSummary {
+export function projectPluginInfo(info: PluginInfo, facts: PluginConfigurationFacts): PluginSummary {
   const manifest = info.manifest;
+  const restartRequired =
+    facts.configRevision !== null && facts.configRevision !== facts.effectiveConfigRevision;
   return Object.freeze({
     id: manifest.id,
     name: manifest.name,
@@ -152,6 +190,11 @@ export function projectPluginInfo(info: PluginInfo): PluginSummary {
     permissions: Object.freeze([...(manifest.permissions ?? [])]),
     status: info.status,
     ...(info.lastFailure === undefined ? {} : { lastFailure: pluginFailureSummary(info.lastFailure) }),
+    desiredEnabled: facts.desiredEnabled,
+    configRevision: facts.configRevision,
+    effectiveConfigRevision: facts.effectiveConfigRevision,
+    restartRequired,
+    unavailable: info.status === "error" || (facts.desiredEnabled && info.status !== "enabled"),
   });
 }
 
@@ -171,6 +214,11 @@ export function samePluginSummary(left: PluginSummary, right: PluginSummary): bo
     left.version !== right.version ||
     left.description !== right.description ||
     left.status !== right.status ||
+    left.desiredEnabled !== right.desiredEnabled ||
+    left.configRevision !== right.configRevision ||
+    left.effectiveConfigRevision !== right.effectiveConfigRevision ||
+    left.restartRequired !== right.restartRequired ||
+    left.unavailable !== right.unavailable ||
     left.permissions.length !== right.permissions.length
   ) {
     return false;

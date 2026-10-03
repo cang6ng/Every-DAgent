@@ -239,23 +239,40 @@ const pluginFailureSummarySchema = v.object({
   cleanupFailureCount: nonNegativeSafeIntegerSchema,
 });
 
-const pluginSummarySchema = v.object({
-  id: pluginIdSchema,
-  name: nonEmptyStringSchema,
-  version: nonEmptyStringSchema,
-  // A plain string on purpose: plugin descriptions come from trusted plugin
-  // authors, and "" is as legitimate as any other text.
-  description: v.optional(v.string()),
-  permissions: v.array(v.literal("storage")),
-  status: v.union([
-    v.literal("disabled"),
-    v.literal("enabling"),
-    v.literal("enabled"),
-    v.literal("disabling"),
-    v.literal("error"),
-  ]),
-  lastFailure: v.optional(pluginFailureSummarySchema),
-});
+const pluginSummarySchema = v.pipe(
+  v.object({
+    id: pluginIdSchema,
+    name: nonEmptyStringSchema,
+    version: nonEmptyStringSchema,
+    // A plain string on purpose: plugin descriptions come from trusted plugin
+    // authors, and "" is as legitimate as any other text.
+    description: v.optional(v.string()),
+    permissions: v.array(v.literal("storage")),
+    status: v.union([
+      v.literal("disabled"),
+      v.literal("enabling"),
+      v.literal("enabled"),
+      v.literal("disabling"),
+      v.literal("error"),
+    ]),
+    lastFailure: v.optional(pluginFailureSummarySchema),
+    desiredEnabled: v.boolean(),
+    configRevision: v.union([v.null(), revisionSchema]),
+    effectiveConfigRevision: v.union([v.null(), revisionSchema]),
+    restartRequired: v.boolean(),
+    unavailable: v.boolean(),
+  }),
+  // Two derived facts, pinned to their definitions so a summary cannot claim
+  // one thing with its numbers and another with its flags: a restart is owed
+  // exactly when the desired configuration revision moved past the bound one,
+  // and a plugin is unavailable exactly when it is broken or off while wanted.
+  v.check(
+    (plugin) =>
+      plugin.restartRequired ===
+        (plugin.configRevision !== null && plugin.configRevision !== plugin.effectiveConfigRevision) &&
+      plugin.unavailable === (plugin.status === "error" || (plugin.desiredEnabled && plugin.status !== "enabled")),
+  ),
+);
 
 // ---------------------------------------------------------------------------
 // Canonical conversation.

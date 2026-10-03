@@ -1,8 +1,12 @@
 export type { PluginPermission } from "./permissions.js";
 
+export { isPluginConfigValue, ownPluginConfigValue } from "./config.js";
+
 export type {
   Plugin,
   PluginCapabilities,
+  PluginConfigValue,
+  PluginConfiguration,
   PluginContext,
   PluginDisposer,
   PluginManifest,

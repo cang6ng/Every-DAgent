@@ -16,7 +16,7 @@ import type {
   RuntimeContext,
   Tool,
 } from "@every-dagent/agent-core";
-import type { Plugin, PluginContext, PluginPermission } from "@every-dagent/plugin-system";
+import type { Plugin, PluginConfiguration, PluginContext, PluginPermission } from "@every-dagent/plugin-system";
 import type {
   DecodedEnvelope,
   HostEvent,
@@ -589,6 +589,8 @@ export function cooperativeTool(name: string): Tool {
 }
 
 export interface TestPluginOptions {
+  /** The plugin's configuration contract, forwarded as declared. */
+  readonly configuration?: PluginConfiguration;
   readonly id: string;
   readonly name?: string;
   readonly version?: string;
@@ -600,6 +602,7 @@ export interface TestPluginOptions {
 
 export function testPlugin(options: TestPluginOptions): Plugin {
   return {
+    ...(options.configuration === undefined ? {} : { configuration: options.configuration }),
     manifest: {
       id: options.id,
       name: options.name ?? `Plugin ${options.id}`,

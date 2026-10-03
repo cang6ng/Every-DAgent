@@ -45,7 +45,18 @@ function sessionFixture(sessionId: string): SessionSummary {
 }
 
 function pluginFixture(id: string, status: PluginSummary["status"] = "disabled"): PluginSummary {
-  return { id, name: id, version: "1.0.0", permissions: [], status };
+  return {
+    id,
+    name: id,
+    version: "1.0.0",
+    permissions: [],
+    status,
+    desiredEnabled: false,
+    configRevision: null,
+    effectiveConfigRevision: null,
+    restartRequired: false,
+    unavailable: status === "error",
+  };
 }
 
 function runFixture(runId: string, sessionId: string, status: RunSnapshot["status"] = "completed"): RunSnapshot {

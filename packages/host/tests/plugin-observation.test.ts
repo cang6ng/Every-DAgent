@@ -43,13 +43,29 @@ function pluginInfo(overrides: Partial<PluginInfo> = {}): PluginInfo {
   };
 }
 
+/** One published summary, with the derived flags its own numbers imply. */
+function summaryFixture(
+  overrides: Partial<PluginSummary> & { readonly id: string; readonly status: PluginSummary["status"] },
+): PluginSummary {
+  const configRevision = overrides.configRevision ?? null;
+  const effectiveConfigRevision = overrides.effectiveConfigRevision ?? configRevision;
+  return {
+    name: "Demo",
+    version: "1.0.0",
+    permissions: [],
+    desiredEnabled: false,
+    configRevision,
+    effectiveConfigRevision,
+    restartRequired: configRevision !== null && configRevision !== effectiveConfigRevision,
+    unavailable: overrides.status === "error",
+    ...overrides,
+  };
+}
+
 describe("published summary comparison", () => {
   it("treats a changed safe failure as a change even when the status is the same", () => {
-    const before: PluginSummary = {
+    const before: PluginSummary = summaryFixture({
       id: "demo",
-      name: "Demo",
-      version: "1.0.0",
-      permissions: [],
       status: "disabled",
       lastFailure: {
         operation: "enable",
@@ -58,7 +74,7 @@ describe("published summary comparison", () => {
         message: "the plugin failed to activate",
         cleanupFailureCount: 0,
       },
-    };
+    });
     const after: PluginSummary = { ...before, lastFailure: { ...before.lastFailure!, cleanupFailureCount: 1 } };
 
     expect(after.status).toBe(before.status);
@@ -66,11 +82,8 @@ describe("published summary comparison", () => {
   });
 
   it("treats a change of the safe code or phase as a change on its own", () => {
-    const base: PluginSummary = {
+    const base: PluginSummary = summaryFixture({
       id: "demo",
-      name: "Demo",
-      version: "1.0.0",
-      permissions: [],
       status: "error",
       lastFailure: {
         operation: "enable",
@@ -79,7 +92,7 @@ describe("published summary comparison", () => {
         message: "the plugin failed to register its tools",
         cleanupFailureCount: 0,
       },
-    };
+    });
 
     expect(
       samePluginSummary(base, { ...base, lastFailure: { ...base.lastFailure!, code: "PLUGIN_PERMISSION_DENIED" } }),
@@ -90,6 +103,17 @@ describe("published summary comparison", () => {
     expect(
       samePluginSummary(base, { ...base, lastFailure: { ...base.lastFailure!, operation: "disable" } }),
     ).toBe(false);
+  });
+
+  it("treats a moved intent or configuration revision as a change on its own", () => {
+    const base = summaryFixture({ id: "demo", status: "disabled" });
+    expect(samePluginSummary(base, { ...base, desiredEnabled: true })).toBe(false);
+    expect(
+      samePluginSummary(base, { ...base, configRevision: 2, effectiveConfigRevision: 1, restartRequired: true }),
+    ).toBe(false);
+    // A restart requirement the flags claim without the numbers is a different
+    // summary, and one no projection of these numbers could produce.
+    expect(samePluginSummary(base, { ...base, restartRequired: true })).toBe(false);
   });
 
   it("ignores everything the protocol does not carry", () => {
@@ -124,11 +148,8 @@ describe("observation of a live plugin", () => {
     const summaries = new Map<string, PluginSummary>([
       [
         "demo",
-        {
+        summaryFixture({
           id: "demo",
-          name: "Demo",
-          version: "1.0.0",
-          permissions: [],
           status: "disabled",
           lastFailure: {
             operation: "enable",
@@ -137,7 +158,7 @@ describe("observation of a live plugin", () => {
             message: "the plugin failed to activate",
             cleanupFailureCount: 0,
           },
-        },
+        }),
       ],
     ]);
 
@@ -165,7 +186,7 @@ describe("observation of a live plugin", () => {
     const fired: string[] = [];
     const connection = recordingConnection(fired);
     const summaries = new Map<string, PluginSummary>([
-      ["demo", { id: "demo", name: "Demo", version: "1.0.0", permissions: [], status: "disabled" }],
+      ["demo", summaryFixture({ id: "demo", status: "disabled" })],
     ]);
     const state = observationState(summaries, connection, () => pluginInfo());
 
@@ -235,9 +256,14 @@ describe("plugin lifecycle announcements", () => {
     const first = await client.call("plugins.enable", { pluginId: "calm" });
     expect(first.result?.plugin.status).toBe("enabled");
     const announced = client.events.filter((event) => event.type === "plugin.updated");
-    // A synchronous activation is observed as finished, never as an invented
-    // `enabling` in between.
-    expect(announced.map((event) => event.payload.plugin.status)).toEqual(["enabled"]);
+    // Two truthful announcements, in the order the facts become true: the
+    // durable intent first ("wanted, not yet on"), then the lifecycle. What is
+    // never invented is an `enabling` state the manager's synchronous
+    // activation never passed through.
+    expect(announced.map((event) => event.payload.plugin.status)).toEqual(["disabled", "enabled"]);
+    expect(announced[0]?.payload.plugin.desiredEnabled).toBe(true);
+    expect(announced[0]?.payload.plugin.unavailable).toBe(true);
+    expect(announced[1]?.payload.plugin.desiredEnabled).toBe(true);
 
     // The manager's no-op enable leaves the plugin in the state the host already
     // published: an observation that finds the same content announces nothing.
@@ -299,6 +325,8 @@ function observationState(
     manager: { get: () => current() },
     plugins: summaries,
     pluginOrder: ["demo"],
+    pluginIntents: new Map<string, boolean>([["demo", false]]),
+    pluginConfigRevisions: new Map<string, { desired: number; effective: number | null }>(),
     connections: new Set([connection]),
     repository: {
       bumpPluginRevision: (): CollectionRevisions => {

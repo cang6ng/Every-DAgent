@@ -1,6 +1,7 @@
 import type { Tool, ToolRegistry } from "@every-dagent/agent-core";
 
 import { createActivationScope } from "./activation-scope.js";
+import { ownPluginConfigValue } from "./config.js";
 import type { ActivationScope } from "./activation-scope.js";
 import { PluginBusyError, normalizeThrownValue } from "./errors.js";
 import { normalizeManifest } from "./manifest.js";
@@ -9,6 +10,7 @@ import type { PluginPermission } from "./permissions.js";
 import type {
   Plugin,
   PluginCapabilities,
+  PluginConfigValue,
   PluginContext,
   PluginDisposer,
   PluginManifest,
@@ -43,7 +45,17 @@ export interface PluginManagerOptions {
 }
 
 export interface PluginManager {
-  register(plugin: Plugin): void;
+  /**
+   * Registers one trusted plugin with the effective configuration this instance
+   * will run it with.
+   *
+   * A plugin that declares a configuration contract must be registered with a
+   * value that satisfies it: the value is owned (deep copied and frozen) and
+   * bound to every activation of this registration. A plugin that declares none
+   * must be registered without one — a configuration bound to a plugin that has
+   * no contract for it would be a value nothing validated.
+   */
+  register(plugin: Plugin, effectiveConfig?: PluginConfigValue): void;
   unregister(id: string): Promise<void>;
   enable(id: string): Promise<void>;
   disable(id: string): Promise<void>;
@@ -55,6 +67,8 @@ interface Entry {
   readonly manifest: PluginManifest;
   readonly plugin: Plugin;
   readonly granted: readonly PluginPermission[];
+  /** The owned, deep-frozen effective configuration; `undefined` when none is declared. */
+  readonly config: PluginConfigValue | undefined;
   status: PluginStatus;
   scope?: ActivationScope;
   lastFailure?: PluginFailure;
@@ -153,6 +167,10 @@ export function createPluginManager(options: PluginManagerOptions): PluginManage
         },
       },
       capabilities,
+      // The entry's own frozen value: every activation of this registration
+      // reads the same object, and a plugin cannot mutate it into something the
+      // next activation would see.
+      config: entry.config,
       onDispose: (disposer: PluginDisposer) => {
         scope.registerDisposer(disposer);
       },
@@ -206,7 +224,7 @@ export function createPluginManager(options: PluginManagerOptions): PluginManage
     return failure;
   }
 
-  function register(plugin: Plugin): void {
+  function register(plugin: Plugin, effectiveConfig?: PluginConfigValue): void {
     if (plugin === null || typeof plugin !== "object") {
       throw new Error("plugin must be an object with a manifest and an activate function");
     }
@@ -217,10 +235,34 @@ export function createPluginManager(options: PluginManagerOptions): PluginManage
       throw new Error(`plugin "${manifest.id}" is already registered`);
     }
 
+    // The configuration is bound here, once, and never again: an activation
+    // reads the entry's own frozen copy, so a plugin can neither see a later
+    // revision nor hand one to the next activation. A declared contract
+    // without a value, and a value without a contract, are both refused —
+    // silently accepting either would make "effective configuration" a claim
+    // this manager could not back.
+    const descriptor = plugin.configuration;
+    if (descriptor !== undefined) {
+      if (!Number.isSafeInteger(descriptor.schemaVersion) || descriptor.schemaVersion < 1) {
+        throw new Error(`plugin "${manifest.id}" declares a configuration schema version that is not a version`);
+      }
+      if (effectiveConfig === undefined) {
+        throw new Error(`plugin "${manifest.id}" declares a configuration but none was bound`);
+      }
+    } else if (effectiveConfig !== undefined) {
+      throw new Error(`plugin "${manifest.id}" declares no configuration but one was bound`);
+    }
+
+    const config = effectiveConfig === undefined ? undefined : ownPluginConfigValue(effectiveConfig);
+    if (effectiveConfig !== undefined && config === undefined) {
+      throw new Error(`plugin "${manifest.id}" was handed a configuration this system cannot own`);
+    }
+
     entries.set(manifest.id, {
       manifest,
       plugin,
       granted: grants.get(manifest.id) ?? NO_PERMISSIONS,
+      config,
       status: "disabled",
     });
   }

@@ -200,13 +200,14 @@ describe("plugin contract: activation surface", () => {
       pluginId: "demo",
       tools,
       capabilities: {},
+      config: undefined,
       onDispose: () => {},
     };
 
     context.tools.register(toolFrom("calculator"));
 
     expect(registered.map((tool) => tool.name)).toEqual(["calculator"]);
-    expect(Object.keys(context).sort()).toEqual(["capabilities", "onDispose", "pluginId", "tools"]);
+    expect(Object.keys(context).sort()).toEqual(["capabilities", "config", "onDispose", "pluginId", "tools"]);
 
     // @ts-expect-error the plugin context carries no bare ToolRegistry
     context.registry;
@@ -229,6 +230,7 @@ describe("plugin contract: activation surface", () => {
       pluginId: "demo",
       tools: { register: () => {} },
       capabilities: {},
+      config: undefined,
       onDispose: () => {},
     });
 
@@ -355,7 +357,12 @@ describe("plugin contract: manager surface", () => {
 
 describe("plugin contract: public exports", () => {
   it("exports only the documented runtime API", () => {
-    expect(Object.keys(pluginSystem).sort()).toEqual(["PluginBusyError", "createPluginManager"]);
+    expect(Object.keys(pluginSystem).sort()).toEqual([
+      "PluginBusyError",
+      "createPluginManager",
+      "isPluginConfigValue",
+      "ownPluginConfigValue",
+    ]);
   });
 
   it("names the busy rejection after the plugin", () => {

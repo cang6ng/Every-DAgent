@@ -21,10 +21,13 @@
  * mean inventing which of two divergent truths is the missing one.
  */
 
+import { ownPluginConfigValue } from "@every-dagent/plugin-system";
+import type { Plugin, PluginConfigValue } from "@every-dagent/plugin-system";
 import { validateJsonValue, type JsonValue } from "@every-dagent/protocol";
 
 import type { BootstrapSettings, SettingsRevisions, TrustedComposition } from "./composition.js";
 import type { Repository } from "./repository.js";
+import { pluginNamespace } from "./settings-profile.js";
 import { ownStoredSettingsValue, validateHostSettings, type HostSettings } from "./settings.js";
 
 /** The namespace this host's own settings live in. */
@@ -49,6 +52,18 @@ export interface EffectiveNamespace {
   readonly value: JsonValue;
 }
 
+/** One registered plugin's configuration, as the startup read it. */
+export interface LoadedPluginConfiguration {
+  /** The durable desired-enabled intent; the restore step aims for this. */
+  readonly desiredEnabled: boolean;
+  /** The effective configuration the manager binds, or `undefined` when none is declared. */
+  readonly config: PluginConfigValue | undefined;
+  /** The revision of the value above; `null` for a plugin with no configuration contract. */
+  readonly configRevision: number | null;
+  /** The schema version the value was written under; `null` for a plugin with no contract. */
+  readonly schemaVersion: number | null;
+}
+
 /** What one startup read, validated, and made effective. */
 export interface LoadedConfiguration {
   readonly host: HostSettings;
@@ -56,6 +71,8 @@ export interface LoadedConfiguration {
   readonly revisions: SettingsRevisions;
   /** The effective values, by namespace. Never mutated after startup. */
   readonly effective: ReadonlyMap<string, EffectiveNamespace>;
+  /** One entry per registered plugin, by id. */
+  readonly plugins: ReadonlyMap<string, LoadedPluginConfiguration>;
 }
 
 /**
@@ -85,9 +102,10 @@ export function loadConfiguration(input: {
   readonly repository: Repository;
   readonly bootstrap: BootstrapSettings;
   readonly composition: TrustedComposition;
+  readonly plugins: readonly Plugin[];
   readonly at: number;
 }): LoadedConfiguration {
-  const { repository, bootstrap, composition } = input;
+  const { repository, bootstrap, composition, plugins } = input;
 
   const storedHost = repository.getSettingsNamespace(HOST_NAMESPACE);
   const storedModel = repository.getSettingsNamespace(MODEL_NAMESPACE);
@@ -95,7 +113,13 @@ export function loadConfiguration(input: {
     throw new ConfigurationError("half of the managed namespaces is missing");
   }
 
-  if (storedHost === undefined && storedModel === undefined) {
+  const absent = storedHost === undefined && storedModel === undefined;
+  // Every plugin's own pair is decided by the same rule the two host namespaces
+  // obey, whether or not this store already holds a configuration: a plugin
+  // registered later owns an absent pair and initializes exactly that.
+  const pluginPlan = planPluginInitialization(repository, plugins);
+
+  if (absent) {
     // Validate the defaults before they become durable: a store must never be
     // initialized with a value this build would refuse to run.
     const defaults = validatedDefaults(bootstrap, composition);
@@ -112,8 +136,15 @@ export function loadConfiguration(input: {
           schemaVersion: SETTINGS_SCHEMA_VERSION,
           valueJson: JSON.stringify(defaults.model),
         },
+        ...pluginPlan.namespaces,
       ],
-      pluginIntents: [],
+      pluginIntents: pluginPlan.intents,
+    });
+  } else if (pluginPlan.namespaces.length > 0 || pluginPlan.intents.length > 0) {
+    repository.initializeConfiguration({
+      at: input.at,
+      namespaces: pluginPlan.namespaces,
+      pluginIntents: pluginPlan.intents,
     });
   }
 
@@ -127,6 +158,8 @@ export function loadConfiguration(input: {
   const modelValue = readNamespaceValue(modelRecord.valueJson, modelRecord.schemaVersion, "model");
   const modelCheck = composition.validateModel(modelValue);
   if (!modelCheck.ok) throw new ConfigurationError("the stored model settings are not one this composition accepts");
+
+  const pluginConfigs = readPluginConfigurations(repository, plugins);
 
   const effective = new Map<string, EffectiveNamespace>([
     [
@@ -154,7 +187,137 @@ export function loadConfiguration(input: {
     model: modelValue,
     revisions: Object.freeze({ host: hostRecord.revision, model: modelRecord.revision }),
     effective,
+    plugins: pluginConfigs,
   });
+}
+
+/**
+ * What a startup that is taking over an absent pair has to write for its plugins.
+ *
+ * The rule is one rule per plugin, and it is the same rule host and model obey:
+ * a plugin whose namespace *and* intent are both absent is initialized from its
+ * declared default, in the same transaction as everything else a fresh store
+ * needs; a plugin that holds one and not the other stops the startup, because
+ * completing it would mean inventing which of two divergent truths is the
+ * missing one. A plugin that declares no configuration contract has no
+ * namespace to initialize — only its intent, which every registered plugin owns.
+ */
+function planPluginInitialization(
+  repository: Repository,
+  plugins: readonly Plugin[],
+): {
+  readonly namespaces: { readonly namespace: string; readonly schemaVersion: number; readonly valueJson: string }[];
+  readonly intents: { readonly pluginId: string; readonly desiredEnabled: boolean }[];
+} {
+  const namespaces: { namespace: string; schemaVersion: number; valueJson: string }[] = [];
+  const intents: { pluginId: string; desiredEnabled: boolean }[] = [];
+
+  for (const plugin of plugins) {
+    const pluginId = plugin.manifest.id;
+    const descriptor = plugin.configuration;
+    const namespace = pluginNamespace(pluginId);
+    const storedConfig = descriptor === undefined ? undefined : repository.getSettingsNamespace(namespace);
+    const storedIntent = repository.getPluginIntent(pluginId);
+
+    if (descriptor === undefined) {
+      // No configuration contract: a row in that namespace, if one exists, is a
+      // fact this plugin does not claim — it is left exactly as it is.
+      if (storedIntent === undefined) intents.push({ pluginId, desiredEnabled: false });
+      continue;
+    }
+
+    if ((storedConfig === undefined) !== (storedIntent === undefined)) {
+      throw new ConfigurationError("half of a plugin's configuration is missing");
+    }
+    if (storedConfig === undefined && storedIntent === undefined) {
+      const owned = ownPluginConfigValue(descriptor.defaultValue);
+      if (owned === undefined) {
+        throw new ConfigurationError("a plugin's default configuration is not a value this host can store");
+      }
+      if (!Number.isSafeInteger(descriptor.schemaVersion) || descriptor.schemaVersion < 1) {
+        throw new ConfigurationError("a plugin's configuration schema version is not a version");
+      }
+      namespaces.push({
+        namespace,
+        schemaVersion: descriptor.schemaVersion,
+        valueJson: JSON.stringify(owned),
+      });
+      intents.push({ pluginId, desiredEnabled: false });
+    }
+  }
+
+  return { namespaces, intents };
+}
+
+/**
+ * Reads every registered plugin's configuration, validated now.
+ *
+ * The stored value is re-validated against the plugin's *current* contract —
+ * the schema version first, then the plugin's own validator — because a value
+ * that was legal when it was written is not automatically legal when it is
+ * read. A refusal stops the startup: a plugin whose configuration this host
+ * cannot vouch for does not run. Neither the validator's words (a validator can
+ * quote the value it was handed) nor the stored value itself travels.
+ */
+function readPluginConfigurations(
+  repository: Repository,
+  plugins: readonly Plugin[],
+): ReadonlyMap<string, LoadedPluginConfiguration> {
+  const found = new Map<string, LoadedPluginConfiguration>();
+
+  for (const plugin of plugins) {
+    const pluginId = plugin.manifest.id;
+    const descriptor = plugin.configuration;
+    const intent = repository.getPluginIntent(pluginId);
+
+    if (descriptor === undefined) {
+      found.set(pluginId, {
+        desiredEnabled: intent?.desiredEnabled ?? false,
+        config: undefined,
+        configRevision: null,
+        schemaVersion: null,
+      });
+      continue;
+    }
+
+    const record = repository.getSettingsNamespace(pluginNamespace(pluginId));
+    if (record === undefined || intent === undefined) {
+      throw new ConfigurationError("a plugin's configuration is missing from the store");
+    }
+    if (record.schemaVersion !== descriptor.schemaVersion) {
+      throw new ConfigurationError("a plugin's stored configuration was written under a different schema version");
+    }
+
+    const value = ownStoredSettingsValue(record.valueJson);
+    if (value === undefined) {
+      throw new ConfigurationError("a plugin's stored configuration is not a readable value");
+    }
+    const owned = ownPluginConfigValue(value);
+    if (owned === undefined) {
+      throw new ConfigurationError("a plugin's stored configuration is not a value this host can own");
+    }
+
+    let accepted: unknown;
+    try {
+      accepted = descriptor.validate(owned);
+    } catch {
+      // A throwing validator is a refusing validator, and its message could
+      // quote the value it was given: nothing of it travels.
+      accepted = false;
+    }
+    if (accepted !== true) {
+      throw new ConfigurationError("a plugin's stored configuration is not one its own contract accepts");
+    }
+
+    found.set(pluginId, {
+      desiredEnabled: intent.desiredEnabled,
+      config: owned,
+      configRevision: record.revision,
+      schemaVersion: record.schemaVersion,
+    });
+  }
+
+  return found;
 }
 
 /** The bootstrap defaults, judged before they are allowed to become durable. */

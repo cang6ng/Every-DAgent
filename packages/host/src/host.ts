@@ -45,13 +45,13 @@ import type { OperationMap, ProtocolChannel } from "@every-dagent/protocol";
 import { PROTOCOL_VERSION, validateMessage } from "@every-dagent/protocol";
 
 import type { BootstrapSettings, ComposedExecution, TrustedComposition } from "./composition.js";
-import { loadConfiguration } from "./configuration.js";
+import { loadConfiguration, type LoadedConfiguration } from "./configuration.js";
 import { closeConnection, createConnection, observePlugin } from "./connection.js";
 import { handleFrame } from "./dispatch.js";
 import { guardedModelClient, openTurnOf } from "./guard.js";
 import type { StepTurnIdentity } from "./guard.js";
 import { HOST_LIMITS } from "./limits.js";
-import { projectPluginInfo } from "./projection.js";
+import { pluginFactsOf, projectPluginInfo } from "./projection.js";
 import { openRepository } from "./repository.js";
 import type { Repository } from "./repository.js";
 import { createReverseTrigger } from "./reverse.js";
@@ -186,6 +186,7 @@ export async function composeHost(options: HostOptions, internals: HostInternals
       repository,
       bootstrap: options.bootstrap,
       composition: options.composition,
+      plugins: options.plugins,
       at: Date.now(),
     });
 
@@ -257,6 +258,17 @@ export async function composeHost(options: HostOptions, internals: HostInternals
       disposeComposition: execution.dispose,
       plugins: new Map(),
       pluginOrder: [],
+      pluginIntents: new Map(
+        [...loaded.plugins].map(([pluginId, plugin]) => [pluginId, plugin.desiredEnabled] as const),
+      ),
+      pluginConfigRevisions: new Map(
+        [...loaded.plugins]
+          .filter(([, plugin]) => plugin.configRevision !== null)
+          .map(
+            ([pluginId, plugin]) =>
+              [pluginId, { desired: plugin.configRevision as number, effective: plugin.configRevision }] as const,
+          ),
+      ),
       runs: new Map(),
       connections: new Set(),
       pending: new Set(),
@@ -268,12 +280,24 @@ export async function composeHost(options: HostOptions, internals: HostInternals
 
     // Registration is configuration, and configuration mistakes stop the host
     // from existing: a host that cannot list a plugin it was given has no honest
-    // way to announce itself as ready.
-    for (const plugin of options.plugins) manager.register(plugin);
+    // way to announce itself as ready. The effective configuration is bound
+    // here, once: every activation this instance runs reads that one value, so
+    // a later desired revision cannot leak into a running plugin.
+    for (const plugin of options.plugins) {
+      manager.register(plugin, loaded.plugins.get(plugin.manifest.id)?.config);
+    }
     for (const info of manager.list()) {
-      hostState.plugins.set(info.manifest.id, projectPluginInfo(info));
+      hostState.plugins.set(
+        info.manifest.id,
+        projectPluginInfo(info, pluginFactsOf(hostState, info.manifest.id)),
+      );
       hostState.pluginOrder.push(info.manifest.id);
     }
+
+    // The durable intent is restored last: every plugin is registered with the
+    // configuration this instance will run it with, and only then does a
+    // plugin wanted enabled get its one attempt.
+    await restorePluginIntents(hostState, loaded);
 
     assertSelfDescription(hostState);
 
@@ -351,6 +375,38 @@ async function releaseStartup(
   }
 
   repository.close();
+}
+
+/**
+ * Restores the desired-enabled intent of every registered plugin, once.
+ *
+ * A plugin wanted enabled gets exactly one attempt — not a retry loop, and not a
+ * background task — and an activation that fails with a *clean* cleanup leaves
+ * that plugin unavailable while the host still comes up: the failure is a fact
+ * about the plugin, reported through the catalogue, not a reason for a host with
+ * other work to do to refuse to exist. A cleanup that did not converge is the
+ * other case, and it stops the startup: tools that may still be registered and
+ * resources that may still be held are not a state this host may call ready.
+ */
+async function restorePluginIntents(state: HostState, loaded: LoadedConfiguration): Promise<void> {
+  for (const pluginId of state.pluginOrder) {
+    const configuration = loaded.plugins.get(pluginId);
+    if (configuration === undefined || !configuration.desiredEnabled) continue;
+
+    try {
+      await state.manager.enable(pluginId);
+    } catch {
+      // The refused activation is already recorded by the manager, and the
+      // readiness check below is what decides whether it left anything behind.
+    }
+    observePlugin(state, pluginId);
+  }
+
+  for (const pluginId of state.pluginOrder) {
+    if (state.manager.get(pluginId)?.status === "error") {
+      throw new Error(`the plugin "${pluginId}" could not be restored: its cleanup did not converge`);
+    }
+  }
 }
 
 /** The system prompt the default builder applies, or `undefined` for none. */

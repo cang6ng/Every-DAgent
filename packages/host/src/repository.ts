@@ -2828,14 +2828,19 @@ class SqliteRepository implements Repository {
         return record;
       },
       () => {
+        // The batch's own evidence, and it is about a *value*, not a row: a row
+        // saying what this write wanted means the intent is durable — whether
+        // this write produced it or the store already held it, the answer a
+        // caller needs is the same one. A row saying something else, like no
+        // row at all, proves the batch did not land: this connection is the
+        // store's only writer, so nothing else could have left the old intent
+        // standing.
         const row = this.rawIntentRow(input.pluginId);
-        if (row === undefined) return { kind: "indeterminate" as const };
-        if ((row["desired_enabled"] === 1) === input.desiredEnabled) {
-          const record = this.getPluginIntent(input.pluginId);
-          if (record === undefined) return { kind: "indeterminate" as const };
-          return { kind: "committed" as const, value: record };
-        }
-        return { kind: "indeterminate" as const };
+        if (row === undefined) return { kind: "absent" as const };
+        if ((row["desired_enabled"] === 1) !== input.desiredEnabled) return { kind: "absent" as const };
+        const record = this.getPluginIntent(input.pluginId);
+        if (record === undefined) return { kind: "indeterminate" as const };
+        return { kind: "committed" as const, value: record };
       },
     );
   }

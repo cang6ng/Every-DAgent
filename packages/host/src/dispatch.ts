@@ -27,6 +27,7 @@ import type {
   ProtocolErrorCode,
   ValidationFailureReason,
 } from "@every-dagent/protocol";
+import type { PluginFailure } from "@every-dagent/plugin-system";
 import { PROTOCOL_VERSION, decodeFrame, encodeFrame, validateMessage } from "@every-dagent/protocol";
 
 import {
@@ -53,7 +54,7 @@ import { defaultTitle, readHistoryPage, readRunPage, readSessionPage, sessionSum
 import { ProjectionError } from "./projection.js";
 import { answerReversePending, dropReverseForStream } from "./reverse.js";
 import { blockCorruptedSession, cancelRun, markStorageFault, readRun, startRun } from "./run.js";
-import { StoreUntrustedError } from "./repository.js";
+import { CommitOutcomeUnknownError, StoreUntrustedError } from "./repository.js";
 import {
   captureHostSnapshot,
   newId,
@@ -775,9 +776,11 @@ function operatePlugin(
 
   const info = state.manager.get(pluginId);
   if (info === undefined) return Promise.resolve(operationFailed(protocolError("PLUGIN_NOT_FOUND")));
-  if (info.status === "error") {
-    return Promise.resolve(operationFailed(protocolError("PLUGIN_UNAVAILABLE")));
-  }
+  // No refusal on the manager's error state, for either operation: the desired
+  // intent is committed before the lifecycle is touched, so a plugin that could
+  // never be asked to stop would keep a durable intent to run across a restart
+  // and be attempted again on every startup. A lifecycle that fails anyway is
+  // reported truthfully below, with the intent the client asked for intact.
 
   const lease = state.gate.tryAcquire("mutation");
   if (lease === undefined) return Promise.resolve(operationFailed(protocolError("HOST_BUSY")));
@@ -812,7 +815,38 @@ async function completePluginOperation(
     }
   };
 
+  // What the manager recorded before this attempt: a refusal that does not add
+  // a failure is the error state answering, and the code a client sees should
+  // say so rather than quote a lifecycle failure from an earlier request.
+  const failureBefore = state.manager.get(pluginId)?.lastFailure;
+
   try {
+    // The desired intent is committed first, and the lifecycle is not touched
+    // until it is durable. A store that cannot confirm the intent gets no
+    // lifecycle at all: a plugin that changed state without a recorded intent
+    // would be one no later startup could explain, and the client's request
+    // would have taken effect somewhere this host cannot account for.
+    const desiredEnabled = operation === "enable";
+    let intent;
+    try {
+      intent = state.repository.setPluginDesiredEnabled({
+        pluginId,
+        desiredEnabled,
+        at: Date.now(),
+      });
+    } catch (error) {
+      if (error instanceof CommitOutcomeUnknownError) markStorageFault(state);
+      return operationFailed(storageUnavailableError());
+    }
+
+    const changed = state.pluginIntents.get(pluginId) !== intent.desiredEnabled;
+    state.pluginIntents.set(pluginId, intent.desiredEnabled);
+    // The intent is durable now, so what this publishes is a fact rather than
+    // an intention. Publishing before the lifecycle runs is the honest order:
+    // "wanted, not yet enabled" is exactly the truth at this moment, and a
+    // lifecycle that fails leaves it standing.
+    if (changed) observe();
+
     const settled =
       operation === "enable" ? state.manager.enable(pluginId) : state.manager.disable(pluginId);
     // The handler is attached before anything can await, so a rejection is never
@@ -837,7 +871,9 @@ async function completePluginOperation(
       return operationFailed(storageUnavailableError());
     }
     if (projectionFailed) return operationFailed(protocolError("INTERNAL_ERROR"));
-    if (result.failed) return operationFailed(pluginOperationError(state, pluginId, operation));
+    if (result.failed) {
+      return operationFailed(pluginOperationError(state, pluginId, operation, failureBefore));
+    }
 
     const summary = state.plugins.get(pluginId);
     if (summary === undefined) return operationFailed(protocolError("INTERNAL_ERROR"));
@@ -854,14 +890,24 @@ async function completePluginOperation(
  *
  * Read from what the manager recorded, never parsed out of the thrown value: a
  * plugin's own words are not a classification this host is willing to trust.
+ * `failureBefore` is how the two kinds of failure are told apart: a manager in
+ * its error state refuses to operate at all and records nothing new, so the
+ * same failure object coming back means the state answered — which has its own
+ * code and is not a lifecycle failure this request caused.
  */
 function pluginOperationError(
   state: HostState,
   pluginId: string,
   operation: "enable" | "disable",
+  failureBefore: PluginFailure | undefined,
 ): ProtocolError {
   const info = state.manager.get(pluginId);
   const failure = info?.lastFailure;
+  if (failure === failureBefore) {
+    return info?.status === "error"
+      ? protocolError("PLUGIN_UNAVAILABLE")
+      : protocolError("INTERNAL_ERROR");
+  }
   if (failure !== undefined && failure.operation === operation) {
     return protocolError(codeForPluginFailure(failure));
   }

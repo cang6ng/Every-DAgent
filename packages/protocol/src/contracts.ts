@@ -141,15 +141,44 @@ export interface PluginFailureSummary {
   readonly cleanupFailureCount: number;
 }
 
-/** The plugin as the protocol sees it. A projection, never a `PluginInfo` re-export. */
+/**
+ * The plugin as the protocol sees it. A projection, never a `PluginInfo` re-export.
+ *
+ * Three facts that used to be one are separated here, because a client that
+ * cannot tell them apart cannot act honestly: `status` is the *actual* lifecycle
+ * of this host instance, `desiredEnabled` is the durable intent that survives a
+ * restart, and `restartRequired` is about configuration alone — a pending
+ * configuration is not the same thing as a plugin that is off when it was asked
+ * to be on.
+ */
 export interface PluginSummary {
   readonly id: Id;
   readonly name: string;
   readonly version: string;
   readonly description?: string;
   readonly permissions: readonly "storage"[];
+  /** The actual lifecycle of this host instance. */
   readonly status: "disabled" | "enabling" | "enabled" | "disabling" | "error";
   readonly lastFailure?: PluginFailureSummary;
+  /** The durable desired-enabled intent; a restart aims for this, not for `status`. */
+  readonly desiredEnabled: boolean;
+  /** The desired configuration revision, or null when the plugin has no configuration contract. */
+  readonly configRevision: Revision | null;
+  /** The configuration revision this instance actually bound, or null. */
+  readonly effectiveConfigRevision: Revision | null;
+  /**
+   * Whether a restart would run a configuration this instance does not.
+   *
+   * It is derived from the two revisions alone: `desiredEnabled` disagreeing
+   * with `status` is not a restart requirement, because a lifecycle change
+   * applies without one.
+   */
+  readonly restartRequired: boolean;
+  /**
+   * Whether the plugin is not serving what it was asked for: it is in the error
+   * state, or its desired intent is enabled and its actual lifecycle is not.
+   */
+  readonly unavailable: boolean;
 }
 
 /** Fields every canonical conversation item carries. */

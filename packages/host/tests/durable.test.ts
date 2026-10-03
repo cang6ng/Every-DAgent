@@ -1164,11 +1164,13 @@ describe("catalogue revisions", () => {
     const after = composed.repository.revisions.plugins;
     expect(after).toBeGreaterThan(before);
 
-    const invalidated = await client.waitForEvent("collection.invalidated");
-    expect(invalidated.payload.collections.plugins).toBe(after);
-    // And the summary that changed travelled on its own event.
-    const updated = await client.waitForEvent("plugin.updated");
-    expect(updated.payload.plugin.status).toBe("enabled");
+    const invalidated = client.events.filter((event) => event.type === "collection.invalidated");
+    expect(invalidated.at(-1)?.payload.collections.plugins).toBe(after);
+    // And the summaries that changed travelled on their own events: the durable
+    // intent first, then the lifecycle it was followed by.
+    const updated = client.events.filter((event) => event.type === "plugin.updated");
+    expect(updated.map((event) => event.payload.plugin.status)).toEqual(["disabled", "enabled"]);
+    expect(updated[1]?.payload.plugin.desiredEnabled).toBe(true);
 
     client.detach();
     await composed.host.shutdown();
