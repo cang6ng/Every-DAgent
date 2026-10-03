@@ -17,6 +17,7 @@
 import type { ModelClient, ModelEvent, ModelRequest, RuntimeContext } from "@every-dagent/agent-core";
 
 import { DANGEROUS_INPUT } from "../../../../tests/fixtures/text-stats-plugin.js";
+import { TEST_MODEL_LIMITS } from "../../../../tests/helpers/model-limits.js";
 
 export const MARKER = {
   /** Ask for the calculator tool (a*b), then answer. */
@@ -210,6 +211,7 @@ export function offlineModel(): OfflineModel {
 
   return {
     client: {
+      limits: TEST_MODEL_LIMITS,
       stream(request: ModelRequest, context: RuntimeContext): AsyncIterable<ModelEvent> {
         requests.push(request);
         return reply(request, context);

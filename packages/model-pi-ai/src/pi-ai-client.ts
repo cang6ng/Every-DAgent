@@ -16,12 +16,14 @@ import type {
 import type {
   ModelClient,
   ModelEvent,
+  ModelLimits,
   ModelMessage,
   ModelRequest,
   RuntimeContext,
   ToolCall,
   ToolSchema,
 } from "@every-dagent/agent-core";
+import { DEFAULT_MODEL_FRAMING, ModelLimitsError, validateModelLimits } from "@every-dagent/agent-core";
 
 /**
  * The slice of pi-ai's model registry this adapter calls: one streaming request.
@@ -51,8 +53,11 @@ export interface PiAiModelClientOptions {
    */
   readonly apiKey?: string;
   /**
-   * Output cap. Left out, the provider client's own default applies — pi-ai only
-   * falls back to the model's declared `maxTokens` on its `streamSimple` path.
+   * The output ceiling this profile is allowed to declare.
+   *
+   * It is a *ceiling*, not the cap of any request, and it may only be smaller than
+   * what the model itself offers — `0 < configured <= native maxTokens`. Left out,
+   * the model's own maximum is the ceiling.
    */
   readonly maxTokens?: number;
   /**
@@ -78,7 +83,39 @@ export interface PiAiModelClientOptions {
  * - retry nothing: retry is the AgentLoop's decision and would otherwise multiply.
  */
 export function createPiAiModelClient(options: PiAiModelClientOptions): ModelClient {
-  return { stream: (request, context) => stream(options, request, context) };
+  const limits = capabilityOf(options);
+  return { limits, stream: (request, context) => stream(options, request, context) };
+}
+
+/** A positive whole number of tokens, which is the only usable cap. */
+function positiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+/**
+ * The capability this adapter declares, read from the model it will really call.
+ *
+ * Both numbers come from pi-ai's own registry entry and neither is guessed: a
+ * model whose metadata has no usable window or maximum is refused rather than
+ * assumed large. Nothing here looks at the model's *name*, and nothing reaches
+ * the network to learn a limit.
+ */
+function capabilityOf({ model, maxTokens }: PiAiModelClientOptions): ModelLimits {
+  if (!positiveInteger(model.contextWindow)) {
+    throw new ModelLimitsError("the model declares no usable context window");
+  }
+  if (!positiveInteger(model.maxTokens)) {
+    throw new ModelLimitsError("the model declares no usable maximum output");
+  }
+  if (maxTokens !== undefined && (!positiveInteger(maxTokens) || maxTokens > model.maxTokens)) {
+    throw new ModelLimitsError("the configured output ceiling is not a cap below the model's own maximum");
+  }
+
+  return validateModelLimits({
+    contextWindow: model.contextWindow,
+    maxOutputTokens: maxTokens ?? model.maxTokens,
+    framing: DEFAULT_MODEL_FRAMING,
+  });
 }
 
 async function* stream(

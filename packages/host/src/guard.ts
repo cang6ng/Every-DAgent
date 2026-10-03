@@ -175,9 +175,15 @@ export function assertStepStorable(
  * Text passes through untouched; tool calls pass through as the host's own
  * snapshots; and a step that must not proceed is answered with a throw, which
  * the Core already treats as a failed model step.
+ *
+ * The client's declared capability is forwarded unchanged, and deliberately not
+ * widened here: the budget the Core derives is what decides whether a request is
+ * sent at all, and a wrapper that advertised a larger model than the one behind
+ * it would move that decision away from the thing that has to live with it.
  */
 export function guardedModelClient(inner: ModelClient, options: StepGuardOptions): ModelClient {
   return {
+    limits: inner.limits,
     stream(request: ModelRequest, context: RuntimeContext): AsyncIterable<ModelEvent> {
       return guardStream(inner.stream(request, context), options);
     },

@@ -238,6 +238,7 @@ describe("AgentLoop model retry", () => {
         build: async () => {
           throw new Error("context builder exploded");
         },
+        getFixedContext: () => ({ tools: [] }),
       },
     });
 

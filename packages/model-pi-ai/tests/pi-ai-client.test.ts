@@ -2,6 +2,7 @@ import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-work
 import type { AssistantMessageEvent, JsonObject } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
+import { DEFAULT_MODEL_FRAMING, defineModelBudget } from "@every-dagent/agent-core";
 import type { ModelClient, ModelEvent, ModelRequest, RuntimeContext } from "@every-dagent/agent-core";
 
 import { createPiAiModelClient } from "../src/pi-ai-client.js";
@@ -31,8 +32,21 @@ async function collect(client: ModelClient, request: ModelRequest): Promise<Mode
   return events;
 }
 
+/** The capability this adapter declares for the test model. */
+const CLIENT_LIMITS = {
+  contextWindow: MODEL.contextWindow,
+  maxOutputTokens: MODEL.maxTokens,
+  framing: DEFAULT_MODEL_FRAMING,
+};
+
+/** A request whose reserve is this profile's own: `R = min(4096, 1024)`. */
 function request(overrides: Partial<ModelRequest> = {}): ModelRequest {
-  return { messages: [{ role: "user", text: "hi" }], tools: [], ...overrides };
+  return {
+    messages: [{ role: "user", text: "hi" }],
+    tools: [],
+    maxOutputTokens: defineModelBudget(CLIENT_LIMITS).reservedOutput,
+    ...overrides,
+  };
 }
 
 describe("PiAiModelClient model events", () => {
@@ -322,6 +336,30 @@ describe("PiAiModelClient requests", () => {
 
     // Better a local message than the provider's rejection of a malformed request.
     await expect(replay).rejects.toThrow(/not a JSON object/);
+  });
+
+  it("declares the model's own finite capability", () => {
+    const { client } = clientFor([textScript("ok")]);
+
+    expect(client.limits).toEqual(CLIENT_LIMITS);
+  });
+
+  it("refuses a configured ceiling above the model's own maximum", () => {
+    expect(() =>
+      createPiAiModelClient({
+        models: createScriptedPiAiStream([]),
+        model: MODEL,
+        maxTokens: MODEL.maxTokens + 1,
+      }),
+    ).toThrow(/ceiling/);
+  });
+
+  it("refuses a model that declares no usable capability", () => {
+    const broken = { ...MODEL, contextWindow: Number.POSITIVE_INFINITY };
+
+    expect(() =>
+      createPiAiModelClient({ models: createScriptedPiAiStream([]), model: broken }),
+    ).toThrow(/context window/);
   });
 
   it("leaves the credential to pi-ai when none is given", async () => {

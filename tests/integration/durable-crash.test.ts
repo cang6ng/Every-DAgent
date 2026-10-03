@@ -35,6 +35,8 @@ import { createHost } from "@every-dagent/host";
 import { openRepository, submissionHash } from "../../packages/host/src/repository.js";
 import type { Repository } from "../../packages/host/src/repository.js";
 
+import { TEST_MODEL_LIMITS } from "../helpers/model-limits.js";
+
 const MAX_RECORD_BYTES = 64 * 1024;
 
 let bundle: string;
@@ -162,6 +164,7 @@ function reopen(databasePath: string): Repository {
 /** A model client that counts, for proving a restart executes nothing. */
 function countingModel(calls: { count: number }): ModelClient {
   return {
+    limits: TEST_MODEL_LIMITS,
     async *stream(_request: ModelRequest, _context: RuntimeContext): AsyncGenerator<ModelEvent> {
       calls.count += 1;
       yield { type: "text-delta", text: "unexpected" };

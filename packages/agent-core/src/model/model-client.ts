@@ -1,3 +1,4 @@
+import type { ModelLimits } from "../context/model-budget.js";
 import type { RuntimeContext } from "../runtime/runtime-context.js";
 import type { ModelMessage, ToolCall } from "./message.js";
 
@@ -18,6 +19,17 @@ export interface ModelRequest {
   readonly systemPrompt?: string;
   readonly messages: readonly ModelMessage[];
   readonly tools: readonly ToolSchema[];
+  /**
+   * The effective output cap for this request, and the `R` of the budget it was
+   * built against.
+   *
+   * It is required rather than optional because an omitted cap is not a neutral
+   * default: a provider that is given no cap decides one itself, and the Core
+   * would then be enforcing a reserve that the request never carried. A
+   * ModelClient must send exactly this value as the provider's own output cap,
+   * or refuse the request.
+   */
+  readonly maxOutputTokens: number;
 }
 
 /**
@@ -44,10 +56,18 @@ export type ModelEvent =
  *   never multiply. A retry is silent while it can be — the loop only repeats a
  *   step that produced nothing — and an exhausted one is reported as the turn's
  *   own `error`. Phase 1 has no event kind for an attempt, so a retry that
- *   succeeded leaves no separate trace beyond the step it produced.
+ *   succeeded leaves no separate trace beyond the step it produced. A failure
+ *   this adapter classifies as deterministic is thrown as a
+ *   `NonRetryableModelError`, which tells the loop not to spend another attempt
+ *   on an answer that cannot change.
  * - Implementations must honour `context.signal` and stop producing once it is
  *   aborted.
+ * - `limits` is the finite capability the client will really call with. The Core
+ *   derives its budget from these numbers alone and refuses anything that is not
+ *   a usable capability, so an adapter that does not know its model's window
+ *   must say so instead of declaring a larger one.
  */
 export interface ModelClient {
+  readonly limits: ModelLimits;
   stream(request: ModelRequest, context: RuntimeContext): AsyncIterable<ModelEvent>;
 }

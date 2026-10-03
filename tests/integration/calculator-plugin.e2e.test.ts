@@ -6,6 +6,7 @@ import {
   createDefaultContextBuilder,
   createSession,
   createToolRegistry,
+  defineModelBudget,
 } from "@every-dagent/agent-core";
 import type {
   ContextBuilder,
@@ -18,9 +19,19 @@ import type {
 import { createCalculatorPlugin } from "@every-dagent/plugin-calculator";
 import { createPluginManager } from "@every-dagent/plugin-system";
 
+import { limitsWithWindow, TEST_MODEL_LIMITS } from "../helpers/model-limits.js";
 import { unsettledToolCalls } from "../helpers/session-lifecycle.js";
 
 const SYSTEM_PROMPT = "You are a calculator. Use the calculator tool for arithmetic.";
+const PLUGIN_TURN = "plugin-turn";
+
+/** A session with the open turn a request is built for. */
+function framedSession(id: string): Session {
+  const session = createSession(id);
+  session.append({ type: "turn/start", turnId: PLUGIN_TURN, data: {} });
+  session.append({ type: "message/user", turnId: PLUGIN_TURN, data: { text: "what is 21 * 2" } });
+  return session;
+}
 
 /**
  * A scripted ModelClient built here rather than reused from a package's tests:
@@ -36,6 +47,7 @@ function scriptedModelClient(scripts: readonly ModelEvent[][]): {
   let step = 0;
 
   const client: ModelClient = {
+    limits: TEST_MODEL_LIMITS,
     async *stream(request): AsyncIterable<ModelEvent> {
       requests.push(request);
       const script = scripts[step];
@@ -155,20 +167,30 @@ describe("calculator plugin end to end (no real model)", () => {
     const manager = createPluginManager({ tools: registry });
     const contextBuilder: ContextBuilder = createDefaultContextBuilder(SYSTEM_PROMPT);
     const runtimeContext = { sessionId: "plugin-e2e", signal: new AbortController().signal };
-    const session = createSession("plugin-e2e");
+    const session = framedSession("plugin-e2e");
+    const build = () =>
+      contextBuilder.build({
+        session,
+        tools: registry,
+        context: runtimeContext,
+        turnId: PLUGIN_TURN,
+        limits: TEST_MODEL_LIMITS,
+        budget: defineModelBudget(TEST_MODEL_LIMITS),
+        fixed: contextBuilder.getFixedContext({ tools: registry, context: runtimeContext }),
+      });
 
     manager.register(createCalculatorPlugin());
 
-    const requestWithout = await contextBuilder.build({ session, tools: registry, context: runtimeContext });
+    const requestWithout = await build();
     expect(requestWithout.tools).toEqual([]);
 
     await manager.enable("calculator");
-    const requestWith = await contextBuilder.build({ session, tools: registry, context: runtimeContext });
+    const requestWith = await build();
     expect(requestWith.tools.map((schema) => schema.name)).toEqual(["calculator"]);
 
     await manager.disable("calculator");
 
-    const requestAfter = await contextBuilder.build({ session, tools: registry, context: runtimeContext });
+    const requestAfter = await build();
     expect(requestAfter.tools).toEqual([]);
 
     await expect(

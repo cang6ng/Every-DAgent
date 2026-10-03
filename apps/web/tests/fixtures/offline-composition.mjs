@@ -13,8 +13,22 @@ import { createHost } from "@every-dagent/host";
 export function createShellHost() {
   return createHost({
     // A model that answers nothing: this fixture exists for the composition
-    // path, not for running a conversation.
+    // path, not for running a conversation. Its declared capability is still a
+    // real one — a composition that could not say what its model can take is a
+    // composition the host will not run.
     modelClient: {
+      limits: {
+        contextWindow: 128 * 1024,
+        maxOutputTokens: 8 * 1024,
+        framing: {
+          request: 256,
+          system: 64,
+          message: 64,
+          toolDefinition: 128,
+          toolCall: 64,
+          toolResult: 64,
+        },
+      },
       stream: async function* () {
         yield { type: "done" };
       },

@@ -20,6 +20,8 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 
 import type { ModelEvent, ModelRequest } from "@every-dagent/agent-core";
+
+import { TEST_MODEL_LIMITS } from "../../../tests/helpers/model-limits.js";
 import type { RunSummary } from "@every-dagent/protocol";
 
 import { SCHEMA_VERSION, encodeStoredData } from "../src/repository.js";
@@ -403,6 +405,7 @@ describe("a live host's own crash points", () => {
     let observed: { readonly status?: string; readonly startedAt?: number | null } | undefined;
 
     const model = {
+      limits: TEST_MODEL_LIMITS,
       stream(): AsyncIterable<ModelEvent> {
         // The moment the model is asked, the start must already be durable —
         // otherwise a crash here would leave a record that cannot explain what

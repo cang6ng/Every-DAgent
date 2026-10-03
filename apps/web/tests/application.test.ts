@@ -27,6 +27,21 @@ import { startStaticServer, type StaticServer } from "../src/server/static-serve
 import { ensureShellBuild } from "./helpers/shell-server.js";
 import { offlineModel } from "./helpers/offline-model.js";
 
+/** The capability a composed fixture model declares: finite, and easy to read. */
+const FIXTURE_LIMITS = {
+  contextWindow: 128 * 1024,
+  maxOutputTokens: 8 * 1024,
+  framing: {
+    request: 256,
+    system: 64,
+    message: 64,
+    toolDefinition: 128,
+    toolCall: 64,
+    toolResult: 64,
+  },
+};
+const FIXTURE_LIMITS_JSON = JSON.stringify(FIXTURE_LIMITS);
+
 let outDir: string;
 let pages: StaticServer;
 let shell: ShellServer;
@@ -258,7 +273,7 @@ describe("the shell command line", () => {
         'import { writeFileSync } from "node:fs";',
         'import { createHost } from "./server.mjs";',
         "export function createShellHost() {",
-        '  const host = createHost({ modelClient: { stream: async function* () { yield { type: "done" }; } }, plugins: [] });',
+        `  const host = createHost({ modelClient: { limits: ${FIXTURE_LIMITS_JSON}, stream: async function* () { yield { type: "done" }; } }, plugins: [] });`,
         "  return {",
         "    attach: (channel) => host.attach(channel),",
         `    shutdown: async () => { await host.shutdown(); writeFileSync(${JSON.stringify(marker)}, "released"); },`,
@@ -317,7 +332,7 @@ describe("the shell command line", () => {
         'import { createHost } from "./server.mjs";',
         "export function createShellHost() {",
         "  return createHost({",
-        '    modelClient: { stream: async function* () { yield { type: "done" }; } },',
+        `    modelClient: { limits: ${FIXTURE_LIMITS_JSON}, stream: async function* () { yield { type: "done" }; } },`,
         "    plugins: [],",
         "  });",
         "}",

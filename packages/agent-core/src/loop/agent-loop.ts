@@ -1,5 +1,6 @@
-import type { ContextBuilder } from "../context/context-builder.js";
-import { errorMessageOf } from "../errors.js";
+import type { ContextBuilder, FixedContext } from "../context/context-builder.js";
+import { defineModelBudget, validateModelLimits, type ModelBudget, type ModelLimits } from "../context/model-budget.js";
+import { NonRetryableModelError, errorMessageOf } from "../errors.js";
 import type { ToolCall } from "../model/message.js";
 import type { ModelClient, ModelRequest } from "../model/model-client.js";
 import type { RuntimeContext } from "../runtime/runtime-context.js";
@@ -87,14 +88,29 @@ export interface AgentLoop {
    * Runs one turn up to its budget and reports how it ended.
    *
    * The turn must already be framed (`turn/start`) with its input recorded. The
-   * loop never reads the log itself: every step re-derives the request through
-   * the ContextBuilder, so the session log stays the single source of truth.
+   * loop never reads the log itself to decide what to say: every step re-derives
+   * the request through the ContextBuilder, so the session log stays the single
+   * source of truth.
    */
   runTurn(input: AgentLoopInput): Promise<TurnOutcome>;
 }
 
+/** The Core's own view of one step: validated limits and the budget they carry. */
+interface ComposedStep {
+  readonly limits: ModelLimits;
+  readonly budget: ModelBudget;
+}
+
 export function createAgentLoop(deps: AgentLoopDeps): AgentLoop {
-  return { runTurn: (input: AgentLoopInput): Promise<TurnOutcome> => runTurn(deps, input) };
+  // Validated once, at the composition that will really run: an adapter that
+  // cannot state a usable capability, or a profile that leaves no room for
+  // input, is refused here rather than discovered per request.
+  const modelLimits = validateModelLimits(deps.modelClient.limits);
+  const composed: ComposedStep = { limits: modelLimits, budget: defineModelBudget(modelLimits) };
+
+  return {
+    runTurn: (input: AgentLoopInput): Promise<TurnOutcome> => runTurn(deps, composed, input),
+  };
 }
 
 /**
@@ -102,9 +118,13 @@ export function createAgentLoop(deps: AgentLoopDeps): AgentLoop {
  * instead of an exception, so the Runtime can always close the turn it opened: no
  * turn is left open in the log, whatever the model or a tool does.
  */
-async function runTurn(deps: AgentLoopDeps, input: AgentLoopInput): Promise<TurnOutcome> {
+async function runTurn(
+  deps: AgentLoopDeps,
+  composed: ComposedStep,
+  input: AgentLoopInput,
+): Promise<TurnOutcome> {
   try {
-    return await runSteps(deps, input);
+    return await runSteps(deps, composed, input);
   } catch (error) {
     // Anything that escaped the step itself came from the Core (context building,
     // the log, the loop's own code) rather than from the model, and is reported the
@@ -116,6 +136,7 @@ async function runTurn(deps: AgentLoopDeps, input: AgentLoopInput): Promise<Turn
 
 async function runSteps(
   deps: AgentLoopDeps,
+  composed: ComposedStep,
   { session, turnId, context, emit }: AgentLoopInput,
 ): Promise<TurnOutcome> {
   let lastText = "";
@@ -130,10 +151,18 @@ async function runSteps(
     // complete history; only the choice to continue is taken away.
     if (step === MAX_STEPS) return { reason: "max_steps", text: lastText };
 
+    // The fixed context is read from the live registry on every step, never
+    // snapshotted for the turn: a tool that appears between two steps is a tool
+    // the next request must be budgeted for.
+    const fixed: FixedContext = deps.contextBuilder.getFixedContext({ tools: deps.tools, context });
     const request: ModelRequest = await deps.contextBuilder.build({
       session,
       tools: deps.tools,
       context,
+      turnId,
+      limits: composed.limits,
+      budget: composed.budget,
+      fixed,
     });
 
     const outcome = await runModelStep(deps.modelClient, request, context, emit);
@@ -160,7 +189,7 @@ async function runSteps(
       });
       emit?.({ type: "tool/call", callId: call.callId, name: call.name, input: call.input });
 
-      // v0.1 runs tools one at a time, and each call is fully settled before the
+      // v0.2 runs tools one at a time, and each call is fully settled before the
       // next one starts, so the log reads as alternating call/result pairs.
       const result = await dispatchTool(deps.tools, call, context);
 
@@ -223,7 +252,10 @@ type ModelStepResult =
  *
  * The same rule keeps a retry invisible: it happens before anything is emitted.
  * A failure is never a `ModelEvent`: it arrives as a throw, which is also how a
- * cancellation (`signal.aborted`) is told apart from a model that broke.
+ * cancellation (`signal.aborted`) is told apart from a model that broke. What a
+ * retry may never do is reconsider a failure that is deterministic — a budget or
+ * a provider cap that would decide the same way again — so those arrive as
+ * `NonRetryableModelError` and end the turn on the first attempt.
  */
 async function runModelStep(
   modelClient: ModelClient,
@@ -237,8 +269,9 @@ async function runModelStep(
   const recordFailure = (message: string): void => {
     if (failures.at(-1) !== message) failures.push(message);
   };
+  const attempts = MAX_MODEL_ATTEMPTS;
 
-  for (let attempt = 1; attempt <= MAX_MODEL_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
     if (context.signal.aborted) return { status: "cancelled" };
 
     let text = "";
@@ -269,6 +302,7 @@ async function runModelStep(
       }
     } catch (error) {
       if (context.signal.aborted) return { status: "cancelled" };
+      if (error instanceof NonRetryableModelError) return { status: "failed", message: errorMessageOf(error) };
 
       recordFailure(errorMessageOf(error));
       if (text !== "") return { status: "failed", message: failures.join("; ") };
@@ -291,7 +325,7 @@ async function runModelStep(
 
   return {
     status: "failed",
-    message: `model step failed after ${MAX_MODEL_ATTEMPTS} attempts: ${failures.join("; ")}`,
+    message: `model step failed after ${attempts} attempts: ${failures.join("; ")}`,
   };
 }
 

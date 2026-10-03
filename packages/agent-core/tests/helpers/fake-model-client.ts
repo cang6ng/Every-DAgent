@@ -1,5 +1,7 @@
+import type { ModelLimits } from "../../src/context/model-budget.js";
 import type { ModelClient, ModelEvent, ModelRequest } from "../../src/model/model-client.js";
 import type { RuntimeContext } from "../../src/runtime/runtime-context.js";
+import { TEST_MODEL_LIMITS } from "./test-model-limits.js";
 
 /**
  * A step that failed rather than answered, before and after producing output.
@@ -42,17 +44,20 @@ export interface FakeModelClient extends ModelClient {
 export interface FakeModelClientOptions {
   /** Replays the last reply for every call past the end of the script. */
   readonly repeatLast?: boolean;
+  /** The capability this fake declares; the Core derives its budget from it. */
+  readonly limits?: ModelLimits;
 }
 
 export function createFakeModelClient(
   replies: readonly FakeModelReply[],
-  { repeatLast = false }: FakeModelClientOptions = {},
+  { repeatLast = false, limits = TEST_MODEL_LIMITS }: FakeModelClientOptions = {},
 ): FakeModelClient {
   const requests: ModelRequest[] = [];
   const contexts: RuntimeContext[] = [];
   let calls = 0;
 
   return {
+    limits,
     requests,
     contexts,
     stream(request: ModelRequest, context: RuntimeContext): AsyncIterable<ModelEvent> {

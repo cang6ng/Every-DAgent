@@ -11,6 +11,7 @@ import type {
   ContextBuilder,
   ModelClient,
   ModelEvent,
+  ModelLimits,
   ModelRequest,
   RuntimeContext,
   Tool,
@@ -32,6 +33,7 @@ import { decodeFrame, encodeFrame, validateMessage } from "@every-dagent/protoco
 
 import { composeHost, type ComposedHost } from "../../src/host.js";
 import { createHost, type Host } from "../../src/index.js";
+import { TEST_MODEL_LIMITS } from "../../../../tests/helpers/model-limits.js";
 import { createMemoryChannelPair } from "./memory-channel.js";
 
 // ---------------------------------------------------------------------------
@@ -409,12 +411,13 @@ export interface ScriptedModel {
  */
 export function scriptedModel(
   replies: readonly ModelReply[],
-  options: { readonly repeatLast?: boolean } = {},
+  options: { readonly repeatLast?: boolean; readonly limits?: ModelLimits } = {},
 ): ScriptedModel {
   const requests: ModelRequest[] = [];
   let calls = 0;
 
   const client: ModelClient = {
+    limits: options.limits ?? TEST_MODEL_LIMITS,
     stream(request: ModelRequest, context: RuntimeContext): AsyncIterable<ModelEvent> {
       requests.push(request);
       const reply = replies[calls] ?? (options.repeatLast === true ? replies[replies.length - 1] : undefined);
@@ -517,15 +520,20 @@ export function constantTool(name: string, value: unknown = "ok"): Tool {
   };
 }
 
-/** Records every input it is handed, so a test can prove what the tool really saw. */
-export function recordingTool(name: string, seen: unknown[]): Tool {
+/**
+ * Records every input it is handed, so a test can prove what the tool really saw.
+ *
+ * `value` is what it answers with, which is how a test hands the turn a result
+ * that is larger than the turn can keep.
+ */
+export function recordingTool(name: string, seen: unknown[], value: unknown = "recorded"): Tool {
   return {
     name,
     description: `The ${name} tool.`,
     inputSchema: { type: "object" },
     execute: async (input: unknown) => {
       seen.push(input);
-      return "recorded";
+      return value;
     },
   };
 }

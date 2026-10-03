@@ -28,6 +28,8 @@ import { createHost } from "@every-dagent/host";
 import type { ProtocolChannel, ProtocolChannelListener } from "@every-dagent/protocol";
 import type { Plugin } from "@every-dagent/plugin-system";
 
+import { TEST_MODEL_LIMITS } from "../helpers/model-limits.js";
+
 const [phase, databasePath, journalPath] = process.argv.slice(2);
 if (phase === undefined || databasePath === undefined || journalPath === undefined) {
   process.stderr.write("usage: durable-crash-child <phase> <database> <journal>\n");
@@ -173,6 +175,7 @@ function channelPair(): { readonly hostSide: ProtocolChannel; readonly clientSid
 /** The model that drives one turn: a tool call, then an answer. */
 function crashModel(): ModelClient {
   return {
+    limits: TEST_MODEL_LIMITS,
     async *stream(request: ModelRequest, _context: RuntimeContext): AsyncGenerator<ModelEvent> {
       journal({ kind: "model-call" });
       const last = request.messages[request.messages.length - 1];

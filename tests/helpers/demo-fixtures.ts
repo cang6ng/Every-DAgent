@@ -9,6 +9,8 @@
 import type { ModelClient, ModelEvent, ModelRequest, RuntimeContext, Tool } from "@every-dagent/agent-core";
 import type { Plugin, PluginContext } from "@every-dagent/plugin-system";
 
+import { TEST_MODEL_LIMITS } from "./model-limits.js";
+
 export type ModelReply =
   | readonly ModelEvent[]
   | ((request: ModelRequest, context: RuntimeContext) => AsyncIterable<ModelEvent>);
@@ -29,6 +31,7 @@ export function scriptedModel(replies: readonly ModelReply[]): ScriptedModel {
   let calls = 0;
 
   const client: ModelClient = {
+    limits: TEST_MODEL_LIMITS,
     stream(request: ModelRequest, context: RuntimeContext): AsyncIterable<ModelEvent> {
       requests.push(request);
       const reply = replies[calls];

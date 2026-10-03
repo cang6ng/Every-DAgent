@@ -22,12 +22,21 @@ import { unsettledToolCalls } from "../helpers/session-lifecycle.js";
 
 const SYSTEM_PROMPT = "You are a calculator. Use the calculator tool for arithmetic.";
 
+/**
+ * The API the faux registry declares.
+ *
+ * pi-ai's faux provider names its own protocol `faux`, which is deliberately
+ * outside the profiles the adapter can enforce an output cap for. The declared
+ * `api` is metadata the adapter reads; the transport stays faux's own.
+ */
+const AUDITED_API = "openai-completions" as const;
+
 /** The real pi-ai registry with a scripted provider, wired to the real Core. */
 function fauxCalculatorRuntime(responses: AssistantMessage[]): {
   readonly runtime: AgentRuntime;
   readonly faux: ReturnType<typeof fauxProvider>;
 } {
-  const faux = fauxProvider();
+  const faux = fauxProvider({ api: AUDITED_API });
   const models = createModels();
   models.setProvider(faux.provider);
   faux.setResponses(responses);

@@ -10,13 +10,15 @@
  * contract tests stay where they are.
  */
 
+import { afterEach, describe, expect, it } from "vitest";
+
 import type { ModelClient, ModelEvent, ModelRequest } from "@every-dagent/agent-core";
 import { createClient } from "@every-dagent/client";
 import { createCalculatorPlugin } from "@every-dagent/plugin-calculator";
-import { afterEach, describe, expect, it } from "vitest";
 
-import { createHostPlatform, runSettled, waitFor } from "../helpers/platform.js";
 import { scriptedModel, textReply, toolReply } from "../helpers/demo-fixtures.js";
+import { TEST_MODEL_LIMITS } from "../helpers/model-limits.js";
+import { createHostPlatform, runSettled, waitFor } from "../helpers/platform.js";
 
 const open: { close(): Promise<void> }[] = [];
 afterEach(async () => {
@@ -75,6 +77,7 @@ function scripted(): ModelClient {
 
 /** Shape two: a class whose generator derives the tool call from the message. */
 class DerivingModelClient implements ModelClient {
+  readonly limits = TEST_MODEL_LIMITS;
   private calls = 0;
 
   async *stream(request: ModelRequest): AsyncGenerator<ModelEvent> {
