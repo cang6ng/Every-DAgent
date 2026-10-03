@@ -89,3 +89,100 @@ R20 R21 R22 R24 R26 R27
 
 - **R12：E3 fragment dependency RESOLVED；R12 overall remains OPEN**（等待 Batch 2 完整处理）。
 - 其余为 OPEN / NOT REVIEWED；本轮不重新分析或修复任何 finding，不开始 Batch 2。
+
+## M1 Final Closeout / Seal
+
+> 本节为 seal 轮追加，只记录 M1 关闭与该轮之后的事实；以上 P4.0 冻结与 Batch 1 closeout 的历史事实不被追溯改写。本节由独立 docs-only commit（`docs: seal phase 4 m1`）记录；文档不引用该提交自身的 SHA。
+
+### Current State
+
+| Milestone | 状态 |
+| --- | --- |
+| P4.0 | COMPLETE / FROZEN |
+| M1 Batch 1 | COMPLETE / CLOSED |
+| M1 Batch 2 | COMPLETE / CLOSED |
+| M1 | **COMPLETE / SEALED** |
+| M2 | NOT STARTED |
+| M3 | NOT STARTED |
+| M4 | NOT STARTED |
+| M5 | NOT STARTED |
+
+### M1 Final Implementation Baseline
+
+`025abba9214286dafff7e5b31d029a91f9b743e9` — `fix(host): carry the active pair and one terminal projection`
+
+Batch 2 的 5 个语义 commit（自 `f2f0807` 起，未 amend/squash/rebase）：`a069a07`（durable metadata monotone）、`9054fb8`（history cursor 绑定 committed truth）、`1be931a`（mutation 与 catalogue revision 原子发布）、`b760364`（client 单调 merge）、`025abba`（active pair + 唯一 terminal projection + 验收矩阵）。seal commit 只更新本 HANDOFF。
+
+### Frozen Contract Authority
+
+- `docs/PHASE4_PLATFORM_SPEC.md`
+- `docs/PHASE4_M1_CONTRACT_ERRATA.md`（冻结于 `4a1ea52 docs: freeze phase 4 m1 contract errata`）
+
+两者共同构成 M1 契约权威；本 milestone 的两份冻结文档自冻结以来未被修改（`git diff <freeze> 025abba -- <doc>` 为空）。Protocol generation 保持 `"2"`：M1 implementation 未修改 generation、未新增 operation/event/error code/DTO 字段、未引入 schema migration 或新依赖。
+
+### M1 Delivered Capabilities
+
+1. SQLite durable Host repository（独占 ownership、schema version、原子事务、提交未知判定）
+2. complete settled-turn canonical persistence（只提交完整收敛 turn，旧 canonical 不被改写）
+3. restart reconciliation 与 `interrupted` / `not-started` / `unknown` knowledge
+4. bounded history paging 与固定 fence（hard item limit、片段合法、coverage 诚实）
+5. durable Run↔Turn ownership proof（turn 侧 owner 绑定 + run 级范围双证）
+6. storage fault fail-closed 边界（拒绝伪终态与 current-state bootstrap）
+7. request/frame boundedness（requestId 128B、页与 frame 上限、outbox 背压）
+8. monotonic durable metadata（时钟回退不回绕 `updatedAt` / run 时间序）
+9. authoritative cursor validation（fence 必须是已提交 turn 边界，revision 由 turn index 推导，无签名框架）
+10. monotonic Client projection（迟到页不复活/不回退/不抹 gap，`behind` 据 directory 重算）
+11. race-safe snapshot/live convergence（active run 与其 session 成对入 cut；cut 后内容 drop+标记+排队复读）
+12. atomic publication/revision semantics（rename 发布、plugin 先落 revision 再公告且不吞失败、cancel 公告 runs revision）
+13. immutable Client response boundary（返回 DTO 冻结，改写不影响 replica）
+14. complete public Run projection（五种终态经 `runs.list` / `runs.get` / snapshot 一致）
+15. public-path acceptance coverage（memory + web 两 carrier、真实 Chrome、真实 host/client）
+
+### Batch 2 Closure
+
+Batch 2 的 12 项 finding 全部由 project owner 接受关闭：
+
+```
+R07 R08 R11 R12 R17 R19
+R20 R21 R22 R24 R26 R27
+```
+
+- **R08**：closed by acceptance evidence（reconciliation 先于任何 frame、schema 不可打开的库不产生 host、同库第二 host 被拒）；future async settings/plugin composition readiness 属 **M3**，本轮未改 `createHost` 公开签名。
+- **R12**：main finding CLOSED（E3 依赖已闭 + 两 carrier 的 `limit=1` 片段遍历验收）；两个 conservative boundary-flag false-negative 保留为 Hardening Backlog。
+- 未重新打开 Batch 1 已关闭 finding；未发生新的 review chain。
+
+### M1 Evidence
+
+| 项目 | 结果 |
+| --- | --- |
+| full offline | **1249 passed / 0 failed / 0 skipped / 1249 total**（109 files；排除 `real-provider` 与 `.zcode/**`；本机有 Chrome，浏览器用例实际执行） |
+| real Chrome strict | **17 passed / 0 failed / 0 skipped**（`pnpm test:web:browser`，required cases 按名 pin） |
+| typecheck | root 与 browser project **0 error** |
+| negative controls | **8/8 KILLED**（均业务断言失败，restore 一致） |
+| `git diff --check` | clean |
+| real provider | **NOT RUN**（未运行，不记为 PASS） |
+
+全部 gate 在最终 implementation baseline `025abba` 上通过；seal 轮为 docs-only，未重跑上述 suite。
+
+### M1 Hardening Backlog
+
+非阻塞项，记录但不属于 M1 blocker；除 M2 自身依赖外不主动带入 M2 scope。
+
+1. R12 两个 conservative boundary flags（页首 `turn/end`、页尾 `turn/start` 的 false-negative；从不冒充完整 turn）
+2. async settings-driven composition readiness（→ M3）
+3. signed/MAC cursor（Frozen M1 明确不要求）
+4. plugin desired-state 持久化与恢复（→ M3）
+5. `plugins.list` 的 catalogue revision enrichment
+6. Core-error 终态 `error_code` 的 durable representation refinement
+7. `runs.list` frame estimation refinement（页字节预算仍为逐项估计，未实际越界）
+8. `.zcode/` scratch/reviewer tests 必须继续排除在正式 gate 之外
+
+### M2 Boundary
+
+下一个 milestone 为 **M2 — Context Budget**，状态 NOT STARTED。M2 不重新打开 M1，除非后续真实 regression 证明 M1 contract violation；本轮不定义 M2 implementation。
+
+### Review Policy
+
+M1 最终采用 **project-owner acceptance** 流程。Batch 1 有 implementation / regression / mutation 及既有 review chain（含一轮 closure re-review FAIL 与随后 repair）。Batch 2 基于 public-path reproducers、shared-invariant implementation、regression suite、targeted mutations（8/8 KILLED）与 real Chrome acceptance，由 project owner 接受关闭。
+
+**没有发生“外部 Sol 最终独立审查 PASS”**，本节不作此表述。`.zcode/` 内的 probe / mutation / agent scratch 是过程证据，**不是** contract authority，也不构成本文档的组成部分；它们保持有意 untracked、不 stage、不 commit。
