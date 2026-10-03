@@ -7,6 +7,7 @@ import type { ModelClient, ModelRequest } from "../model/model-client.js";
 import type { RuntimeContext } from "../runtime/runtime-context.js";
 import type { Session } from "../session/session.js";
 import type { SessionEventInput, TurnEndReason } from "../session/session-event.js";
+import type { PreparedToolExecution, ToolExecutionBoundary } from "../tools/tool-execution.js";
 import type { ToolExecutionResult } from "../tools/tool.js";
 import type { ToolRegistry } from "../tools/tool-registry.js";
 import {
@@ -42,6 +43,16 @@ export interface AgentLoopDeps {
    * either way there is one object, never two copies of the same number.
    */
   readonly limits?: LoopResourceLimits;
+  /**
+   * The managed execution seam, when a composition provides one.
+   *
+   * Present, every step's calls are prepared as a group before any of them is
+   * recorded and dispatched through the boundary — policy, approval and the
+   * dispatch guard are the boundary's, and the Core owns neither. Absent, the
+   * loop keeps its standalone behavior: calls execute by name through the
+   * registry, with no preparation and no execution identity.
+   */
+  readonly executionBoundary?: ToolExecutionBoundary;
 }
 
 /**
@@ -55,6 +66,8 @@ export type AgentLoopEvent =
       readonly callId: string;
       readonly name: string;
       readonly input: unknown;
+      /** The managed execution identity, when a boundary prepared this call. */
+      readonly executionId?: string;
     }
   | {
       readonly type: "tool/result";
@@ -62,6 +75,8 @@ export type AgentLoopEvent =
       readonly name: string;
       readonly ok: boolean;
       readonly content: string;
+      readonly executionId?: string;
+      readonly disposition?: "executed" | "not-executed";
     };
 
 export interface AgentLoopInput {
@@ -260,36 +275,63 @@ async function runSteps(
     // calls at all, so nothing it asked for can have run.
     assertToolGroup(outcome.toolCalls, limits);
 
+    // And, when a boundary owns execution, the whole group is *prepared* — as
+    // a group, synchronously, before the first record of the step exists. A
+    // batch that cannot be prepared is a step that declares nothing: no
+    // assistant record, no `tool/call`, and therefore no execution of any
+    // member, which is the only order in which "the second call failed
+    // validation" can honestly mean "the first call never ran".
+    const group = prepareGroup(deps, outcome.toolCalls, turnId, step);
+
     commitFact(meter, session, {
       type: "message/assistant",
       turnId,
-      data: { text: outcome.text, toolCalls: outcome.toolCalls },
+      data: { text: outcome.text, toolCalls: group.map((entry) => entry.call) },
     });
     lastText = outcome.text;
 
     // No tool call is the one and only termination condition: the step that asks
     // for nothing carries the final answer.
-    if (outcome.toolCalls.length === 0) {
+    if (group.length === 0) {
       return closeTurn(meter, turnId, { reason: "completed", text: outcome.text });
     }
 
-    for (const call of outcome.toolCalls) {
+    for (const entry of group) {
+      const { call } = entry;
       commitFact(meter, session, {
         type: "tool/call",
         turnId,
         data: { callId: call.callId, name: call.name, input: call.input },
       });
-      emit?.({ type: "tool/call", callId: call.callId, name: call.name, input: call.input });
+      emit?.({
+        type: "tool/call",
+        callId: call.callId,
+        name: call.name,
+        input: call.input,
+        ...(entry.executionId === undefined ? {} : { executionId: entry.executionId }),
+      });
 
       // v0.2 runs tools one at a time, and each call is fully settled before the
-      // next one starts, so the log reads as alternating call/result pairs.
-      const result = await dispatchTool(deps.tools, call, context);
+      // next one starts, so the log reads as alternating call/result pairs. A
+      // managed call may wait here for a policy decision or an approval; that
+      // wait is this execution's own, and the run's lease covers it.
+      const dispatched = await dispatchPrepared(deps, entry, context);
 
-      const content = toolResultContent(result);
+      const content = toolResultContent(dispatched.result);
       commitFact(
         meter,
         session,
-        { type: "tool/result", turnId, data: { callId: call.callId, name: call.name, ok: result.ok, content } },
+        {
+          type: "tool/result",
+          turnId,
+          data: {
+            callId: call.callId,
+            name: call.name,
+            ok: dispatched.result.ok,
+            content,
+            ...(dispatched.disposition === undefined ? {} : { disposition: dispatched.disposition }),
+          },
+        },
         // Charged after the tool ran, which is why this one raises a fault rather
         // than a refusal: the side effect may exist, and nothing about the request
         // can be re-phrased to make it un-happen.
@@ -299,10 +341,72 @@ async function runSteps(
         type: "tool/result",
         callId: call.callId,
         name: call.name,
-        ok: result.ok,
+        ok: dispatched.result.ok,
         content,
+        ...(entry.executionId === undefined ? {} : { executionId: entry.executionId }),
+        ...(dispatched.disposition === undefined ? {} : { disposition: dispatched.disposition }),
       });
     }
+  }
+}
+
+/** One member of a prepared step: the call as it will be recorded, and its binding. */
+interface PreparedGroupEntry {
+  readonly call: ToolCall;
+  readonly executionId: string | undefined;
+  /** Set when a boundary prepared this call; standalone entries have none. */
+  readonly prepared: PreparedToolExecution | undefined;
+}
+
+/**
+ * The step's calls, prepared as a whole or not at all.
+ *
+ * With no boundary this is the standalone path: the model's own calls, bound
+ * to nothing, executed by name when their turn comes. With one, the boundary's
+ * answer is the whole step — it may throw (and then the step declares
+ * nothing), and what it returns is what will be recorded.
+ */
+function prepareGroup(
+  deps: AgentLoopDeps,
+  calls: readonly ToolCall[],
+  turnId: string,
+  stepIndex: number,
+): readonly PreparedGroupEntry[] {
+  const boundary = deps.executionBoundary;
+  if (boundary === undefined || calls.length === 0) {
+    return calls.map((call) => ({ call, executionId: undefined, prepared: undefined }));
+  }
+  return boundary
+    .prepareBatch({ calls, position: { turnId, stepIndex } })
+    .map((prepared) => ({ call: prepared.call, executionId: prepared.executionId, prepared }));
+}
+
+/**
+ * Runs one recorded call, through the boundary that prepared it or through the
+ * registry in the standalone path.
+ *
+ * Either way the call is answered: a boundary that fails in a way its contract
+ * does not define still gets a result written down, because the one outcome the
+ * loop may never produce is a declared call without an answer. Such a failure
+ * carries no disposition — this side does not know whether anything ran, and
+ * guessing either way would be a claim the boundary never made.
+ */
+async function dispatchPrepared(
+  deps: AgentLoopDeps,
+  entry: PreparedGroupEntry,
+  context: RuntimeContext,
+): Promise<{ readonly result: ToolExecutionResult; readonly disposition: "executed" | "not-executed" | undefined }> {
+  const boundary = deps.executionBoundary;
+  if (entry.prepared === undefined || boundary === undefined) {
+    return { result: await dispatchTool(deps.tools, entry.call, context), disposition: undefined };
+  }
+
+  try {
+    const outcome = await boundary.executePrepared(entry.prepared, context);
+    return { result: outcome.result, disposition: outcome.executed ? "executed" : "not-executed" };
+  } catch (error) {
+    if (error instanceof TurnResourceFault) throw error;
+    return { result: { ok: false, error: errorMessageOf(error) }, disposition: undefined };
   }
 }
 

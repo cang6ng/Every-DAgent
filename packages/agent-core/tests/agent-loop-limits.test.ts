@@ -187,6 +187,8 @@ describe("AgentLoop model retry", () => {
       register: () => () => {},
       get: () => undefined,
       list: () => [],
+      registration: () => undefined,
+      generation: 0,
       async execute() {
         throw new Error("registry exploded");
       },

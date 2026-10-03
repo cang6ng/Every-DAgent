@@ -195,6 +195,7 @@ function toRuntimeEvent(event: AgentLoopEvent, sessionId: string, turnId: string
         callId: event.callId,
         name: event.name,
         input: event.input,
+        ...(event.executionId === undefined ? {} : { executionId: event.executionId }),
       };
     case "tool/result":
       return {
@@ -205,6 +206,8 @@ function toRuntimeEvent(event: AgentLoopEvent, sessionId: string, turnId: string
         name: event.name,
         ok: event.ok,
         content: event.content,
+        ...(event.executionId === undefined ? {} : { executionId: event.executionId }),
+        ...(event.disposition === undefined ? {} : { disposition: event.disposition }),
       };
   }
 }

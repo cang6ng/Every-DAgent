@@ -55,7 +55,15 @@ export type { GuardInput, GuardTurn } from "./context/context-guard.js";
 
 export type { Tool, ToolExecutionResult } from "./tools/tool.js";
 export { createToolRegistry } from "./tools/tool-registry.js";
-export type { ToolRegistry } from "./tools/tool-registry.js";
+export type { ToolRegistration, ToolRegistry } from "./tools/tool-registry.js";
+export type {
+  NotExecutedReason,
+  PreparedDispatchOutcome,
+  PreparedToolExecution,
+  PrepareToolBatchInput,
+  ToolExecutionBoundary,
+  ToolExecutionPosition,
+} from "./tools/tool-execution.js";
 
 export { createDefaultContextBuilder } from "./context/context-builder.js";
 export type {

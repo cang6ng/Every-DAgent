@@ -373,7 +373,16 @@ function own(value: unknown, depth: number, ancestors: Set<object>, what: string
         throw refused(`${what} has a property that would have to run to be read`);
       }
       if (descriptor.value === undefined) continue;
-      copy[name] = own(descriptor.value, depth + 1, ancestors, what);
+      // Defined, never assigned: `copy[name] = value` would send a legal own
+      // `"__proto__"` into the prototype setter instead of keeping it as the
+      // data property every other JSON key is, and the clone would silently
+      // lose the very key it was asked for.
+      Object.defineProperty(copy, name, {
+        value: own(descriptor.value, depth + 1, ancestors, what),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
     return Object.freeze(copy);
   } finally {

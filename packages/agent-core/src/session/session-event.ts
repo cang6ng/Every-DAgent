@@ -36,6 +36,18 @@ export interface ToolResultData {
   readonly name: string;
   readonly ok: boolean;
   readonly content: string;
+  /**
+   * Whether the tool was dispatched at all, when the producer knows.
+   *
+   * A managed execution boundary knows: it either invoked the executor or
+   * decided, before dispatch, that the call would not run (policy, a rejected
+   * or expired approval, a cancellation). The standalone loop does not — it
+   * owns no such decisions — and leaves the field out, which is also what every
+   * record written before this field existed carries. Absent is `unknown`;
+   * `executed` is deliberately not a promise that a side effect happened, and
+   * `ok: false` is never allowed to stand in for `not-executed`.
+   */
+  readonly disposition?: "executed" | "not-executed";
 }
 
 /**

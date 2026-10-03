@@ -23,6 +23,12 @@ export type RuntimeEvent =
       readonly callId: string;
       readonly name: string;
       readonly input: unknown;
+      /**
+       * The managed execution this call is, when a boundary prepared it. A
+       * consumer that projects calls by execution identity needs it to line a
+       * call up with its approval and its result; standalone runs have none.
+       */
+      readonly executionId?: string;
     }
   | {
       readonly type: "tool/result";
@@ -32,6 +38,9 @@ export type RuntimeEvent =
       readonly name: string;
       readonly ok: boolean;
       readonly content: string;
+      readonly executionId?: string;
+      /** Present only when the producer knows: see `ToolResultData.disposition`. */
+      readonly disposition?: "executed" | "not-executed";
     }
   | {
       readonly type: "turn/end";
