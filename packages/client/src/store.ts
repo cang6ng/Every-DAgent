@@ -7,15 +7,18 @@
  * directory the host published — a window, not a database; `live` is the drafts
  * of runs still executing, which are display state and never history; `history`
  * is what this client has actually read of each session's committed
- * conversation, with its gaps left visible. `getSnapshot()` returns the same
- * object until a real change happens, and `subscribe` hears about each change
- * exactly once.
+ * `history` is what this client has actually read of each session's committed
+ * conversation, with its gaps left visible; `settings` is the configuration
+ * this client has read, with what it has only been *told* about marked stale.
+ * `getSnapshot()` returns the same object until a real change happens, and
+ * `subscribe` hears about each change exactly once.
  */
 
 import type { ActiveRunSnapshot, HostDescription, HostSnapshot, Id } from "@every-dagent/protocol";
 
 import type { HistoryMap } from "./fold.js";
 import type { ClientError } from "./errors.js";
+import { EMPTY_SETTINGS, type SettingsMap } from "./settings.js";
 
 /** Where this client's connection is. `connected` is not `ready`. */
 export type ConnectionStatus =
@@ -49,6 +52,12 @@ export interface ClientSnapshot {
   readonly live: LiveMap;
   /** What has been loaded of each session's committed history, gaps included. */
   readonly history: HistoryMap;
+  /**
+   * The configuration namespaces this client has read, and what it knows about
+   * the ones it has only heard about. A cache, bounded and explicitly stale
+   * when it may be: nothing here is a claim about a host it is not talking to.
+   */
+  readonly settings: SettingsMap;
   /** True while the presentation is retained but no longer live. */
   readonly stale: boolean;
   /** The last terminal error — a protocol violation or a lost connection. */
@@ -70,6 +79,7 @@ function merge(current: ClientSnapshot, patch: Partial<ClientSnapshot>): ClientS
     presentationHost: patch.presentationHost ?? current.presentationHost,
     live: patch.live !== undefined ? patch.live : current.live,
     history: patch.history !== undefined ? patch.history : current.history,
+    settings: patch.settings !== undefined ? patch.settings : current.settings,
     stale: patch.stale ?? current.stale,
     error: patch.error !== undefined ? patch.error : current.error,
   });
@@ -83,6 +93,7 @@ function differs(current: ClientSnapshot, next: ClientSnapshot): boolean {
     current.presentationHost !== next.presentationHost ||
     current.live !== next.live ||
     current.history !== next.history ||
+    current.settings !== next.settings ||
     current.stale !== next.stale ||
     current.error !== next.error
   );
@@ -96,6 +107,7 @@ export function createStore(): PresentationStore {
     presentationHost: "none",
     live: Object.freeze({}),
     history: Object.freeze({}),
+    settings: EMPTY_SETTINGS,
     stale: false,
     error: null,
   });

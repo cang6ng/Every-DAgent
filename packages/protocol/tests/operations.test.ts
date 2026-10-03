@@ -16,6 +16,7 @@ import {
   runPage,
   sessionPage,
   sessionSummary,
+  settingsSnapshot,
   storageIdentity,
   terminalRun,
   activeRun,
@@ -33,6 +34,8 @@ const OPERATIONS: readonly OperationName[] = [
   "plugins.list",
   "plugins.enable",
   "plugins.disable",
+  "settings.get",
+  "settings.update",
   "subscriptions.open",
   "subscriptions.close",
 ];
@@ -46,6 +49,10 @@ function validParamsFor(method: OperationName): unknown {
     case "plugins.list":
     case "subscriptions.open":
       return {};
+    case "settings.get":
+      return { namespace: "host" };
+    case "settings.update":
+      return { namespace: "host", expectedRevision: 1, value: { systemPrompt: "next" } };
     case "sessions.get":
       return { sessionId: "s-1" };
     case "runs.start":
@@ -81,6 +88,9 @@ function validResultFor(method: OperationName): unknown {
     case "plugins.enable":
     case "plugins.disable":
       return { plugin: pluginSummary("enabled") };
+    case "settings.get":
+    case "settings.update":
+      return { settings: settingsSnapshot() };
     case "subscriptions.open":
       return { snapshot: hostSnapshotForOpen() };
     case "subscriptions.close":
@@ -97,6 +107,10 @@ function hostSnapshotForOpen(): Record<string, unknown> {
     sessions: sessionPage([sessionSummary()]),
     runs: runPage(),
     plugins: [pluginSummary()],
+    settings: [
+      { namespace: "host", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
+      { namespace: "model", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
+    ],
   };
 }
 
@@ -555,6 +569,10 @@ describe("host snapshot consistency (single-snapshot cross-field)", () => {
       sessions: sessionPage(sessions as never),
       runs: runPage(runs as never),
       plugins: [],
+      settings: [
+        { namespace: "host", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
+        { namespace: "model", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
+      ],
     };
   }
 

@@ -27,13 +27,10 @@ import { validateJsonValue, type JsonValue } from "@every-dagent/protocol";
 
 import type { BootstrapSettings, SettingsRevisions, TrustedComposition } from "./composition.js";
 import type { Repository } from "./repository.js";
-import { pluginNamespace } from "./settings-profile.js";
+import { HOST_NAMESPACE, MODEL_NAMESPACE, pluginNamespace } from "./settings-profile.js";
 import { ownStoredSettingsValue, validateHostSettings, type HostSettings } from "./settings.js";
 
-/** The namespace this host's own settings live in. */
-export const HOST_NAMESPACE = "host";
-/** The namespace the model profile lives in. */
-export const MODEL_NAMESPACE = "model";
+export { HOST_NAMESPACE, MODEL_NAMESPACE } from "./settings-profile.js";
 
 /**
  * The schema version of the two namespaces the host defines.
@@ -181,6 +178,24 @@ export function loadConfiguration(input: {
       }),
     ],
   ]);
+
+  // A plugin's configuration is effective state too: this instance bound that
+  // revision and that value at startup, and the settings surface reports it as
+  // such — the same map that carries the host's own two namespaces. A plugin
+  // with no contract has no entry, and a snapshot answers `null` for it.
+  for (const [pluginId, configuration] of pluginConfigs) {
+    if (configuration.configRevision === null || configuration.config === undefined) continue;
+    const namespace = pluginNamespace(pluginId);
+    effective.set(
+      namespace,
+      Object.freeze({
+        namespace,
+        revision: configuration.configRevision,
+        schemaVersion: configuration.schemaVersion ?? SETTINGS_SCHEMA_VERSION,
+        value: configuration.config,
+      }),
+    );
+  }
 
   return Object.freeze({
     host: hostCheck.settings,
@@ -334,6 +349,113 @@ function validatedDefaults(
   if (!modelCheck.ok) throw new ConfigurationError("the bootstrap model settings are not one this composition accepts");
 
   return { host: hostCheck.settings, model: modelValidated.output };
+}
+
+/**
+ * Which namespace a settings request names, or `undefined` when this host has
+ * no such namespace.
+ *
+ * `undefined` is the whole answer for everything a client could name: an
+ * arbitrary string, an unknown plugin, and a registered plugin that declares no
+ * configuration contract are all namespaces this host does not manage — and
+ * none of them is a reason to create one.
+ */
+export type SettingsTarget =
+  | { readonly kind: "host" }
+  | { readonly kind: "model" }
+  | { readonly kind: "plugin"; readonly pluginId: string };
+
+export function settingsTargetOf(
+  namespace: string,
+  contracts: ReadonlyMap<string, unknown>,
+): SettingsTarget | undefined {
+  if (namespace === HOST_NAMESPACE) return { kind: "host" };
+  if (namespace === MODEL_NAMESPACE) return { kind: "model" };
+  if (!namespace.startsWith("plugin:")) return undefined;
+  const pluginId = namespace.slice("plugin:".length);
+  return contracts.has(pluginId) ? { kind: "plugin", pluginId } : undefined;
+}
+
+/** Whether a value is one this host may store for a namespace it manages. */
+export type SettingsValueCheck =
+  | { readonly ok: true; readonly schemaVersion: number }
+  | { readonly ok: false };
+
+/**
+ * Judges one settings value for one namespace.
+ *
+ * Three authorities, one answer. The host namespace is this package's own
+ * schema; the model namespace is the trusted composition's judgement (its
+ * catalogue, its endpoints, its limits); a plugin namespace is that plugin's
+ * own contract, run on a value this host owns first. Nothing here reports *why*
+ * a value was refused: a refusal travels as one fixed word, and a validator's
+ * own message could quote the value it was given.
+ */
+export function validateSettingsValue(input: {
+  readonly target: SettingsTarget;
+  readonly value: JsonValue;
+  readonly authority: {
+    readonly validateModel: (value: JsonValue) => { readonly ok: boolean };
+    readonly pluginContracts: ReadonlyMap<
+      string,
+      {
+        readonly schemaVersion: number;
+        readonly validate: (value: import("@every-dagent/plugin-system").PluginConfigValue) => boolean;
+      }
+    >;
+  },
+}): SettingsValueCheck {
+  const { target, value, authority } = input;
+
+  switch (target.kind) {
+    case "host": {
+      const check = validateHostSettings(value);
+      return check.ok ? { ok: true, schemaVersion: SETTINGS_SCHEMA_VERSION } : { ok: false };
+    }
+    case "model":
+      return authority.validateModel(value).ok
+        ? { ok: true, schemaVersion: SETTINGS_SCHEMA_VERSION }
+        : { ok: false };
+    case "plugin": {
+      const contract = authority.pluginContracts.get(target.pluginId);
+      if (contract === undefined) return { ok: false };
+      const owned = ownPluginConfigValue(value);
+      if (owned === undefined) return { ok: false };
+      let accepted: unknown;
+      try {
+        accepted = contract.validate(owned);
+      } catch {
+        // A throwing validator is a refusing validator, and its words could
+        // quote the value: nothing of it travels.
+        accepted = false;
+      }
+      return accepted === true ? { ok: true, schemaVersion: contract.schemaVersion } : { ok: false };
+    }
+  }
+}
+
+/**
+ * One namespace's bounded snapshot: what is stored, and what this instance runs.
+ *
+ * `undefined` is a stored value this host cannot read as JSON — refused rather
+ * than repaired, like every other durable fact that is not what it claims.
+ */
+export function settingsSnapshotOf(input: {
+  readonly namespace: string;
+  readonly desired: { readonly revision: number; readonly valueJson: string };
+  readonly effective: EffectiveNamespace | undefined;
+}): import("@every-dagent/protocol").SettingsSnapshot | undefined {
+  const desiredValue = ownStoredSettingsValue(input.desired.valueJson);
+  if (desiredValue === undefined) return undefined;
+  const effective = input.effective;
+  return Object.freeze({
+    namespace: input.namespace,
+    desiredRevision: input.desired.revision,
+    effectiveRevision: effective?.revision ?? null,
+    restartRequired: effective === undefined || effective.revision !== input.desired.revision,
+    desiredValue,
+    effectiveValue: effective?.value ?? null,
+  });
 }
 
 /** One namespace the configuration must have, or a refusal. */

@@ -30,7 +30,21 @@ describe("snapshot identity", () => {
       notifications += 1;
     });
 
-    scenario.host.emit({ type: "plugin.updated", plugin: { id: "demo", name: "Demo", version: "1.0.0", permissions: [], status: "enabled" } });
+    scenario.host.emit({
+      type: "plugin.updated",
+      plugin: {
+        id: "demo",
+        name: "Demo",
+        version: "1.0.0",
+        permissions: [],
+        status: "enabled",
+        desiredEnabled: true,
+        configRevision: null,
+        effectiveConfigRevision: null,
+        restartRequired: false,
+        unavailable: false,
+      },
+    });
     const after = scenario.client.getSnapshot();
 
     expect(notifications).toBe(1);

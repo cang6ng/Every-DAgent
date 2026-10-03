@@ -36,13 +36,16 @@ import {
   collectionInvalidatedEvent,
   observePlugin,
   publishEvent,
+  publishValidatedEvent,
   sendFrame,
   sessionCreatedEvent,
   sessionDeletedEvent,
   sessionUpdatedEvent,
+  settingsUpdatedEvent,
 } from "./connection.js";
 import {
   codeForPluginFailure,
+  limitExceededError,
   protocolError,
   revisionConflictError,
   shuttingDownError,
@@ -51,16 +54,19 @@ import {
 } from "./errors.js";
 import { HOST_LIMITS } from "./limits.js";
 import { defaultTitle, readHistoryPage, readRunPage, readSessionPage, sessionSummaryOf } from "./history.js";
+import { settingsSnapshotOf, settingsTargetOf, validateSettingsValue } from "./configuration.js";
 import { ProjectionError } from "./projection.js";
 import { answerReversePending, dropReverseForStream } from "./reverse.js";
 import { blockCorruptedSession, cancelRun, markStorageFault, readRun, startRun } from "./run.js";
 import { CommitOutcomeUnknownError, StoreUntrustedError } from "./repository.js";
+import { MAX_SETTINGS_VALUE_BYTES } from "./settings-profile.js";
 import {
   captureHostSnapshot,
   newId,
   operationFailed,
   operationSucceeded,
   pluginSummaryOf,
+  PREPARED_REQUEST_ID,
   trackTask,
   type ConnectionState,
   type HostState,
@@ -88,9 +94,13 @@ const HOST_CAPABILITIES: HostCapabilities = Object.freeze({
   reverseRequests: true,
   historyPages: true,
   sessionMutations: true,
+  // Reads and CAS updates, by namespace. Claimed only because every layer of it
+  // is really wired: the store holds desired values, the startup composes from
+  // them, a mutation is refused while the host is busy or its store unconfirmed,
+  // and a subscriber is told which revisions moved.
+  settings: true,
   // Not implemented by this milestone, and said so rather than left out: a
   // client can tell "not supported" from "not asked".
-  settings: false,
   approvals: false,
 });
 
@@ -137,6 +147,12 @@ const CURRENT_STATE_METHODS: ReadonlySet<OperationName> = new Set([
   "runs.get",
   "runs.list",
   "subscriptions.open",
+  // A settings read claims what the desired *and* the effective state are, and
+  // a settings write is a write like any other: a host that cannot confirm a
+  // commit has neither. `plugins.list` stays readable — its summaries are this
+  // instance's own facts — and `settings.get` does not.
+  "settings.get",
+  "settings.update",
 ]);
 
 /** One frame: bytes in, an operation, a response out. */
@@ -497,6 +513,24 @@ function dispatchClientRequest(
             ),
           ),
         () => replyError(state, connection, requestId, protocolError("INTERNAL_ERROR")),
+      );
+      return;
+
+    case "settings.get":
+      respond(state, connection, requestId, readSettings(state, request.params.namespace), (result) =>
+        encodeFrame(
+          { kind: "host-response", method: "settings.get" },
+          hostResponse(state, requestId, result),
+        ),
+      );
+      return;
+
+    case "settings.update":
+      respond(state, connection, requestId, updateSettings(state, request.params), (result) =>
+        encodeFrame(
+          { kind: "host-response", method: "settings.update" },
+          hostResponse(state, requestId, result),
+        ),
       );
       return;
 
@@ -913,6 +947,194 @@ function pluginOperationError(
   }
   if (info?.status === "error") return protocolError("PLUGIN_UNAVAILABLE");
   return protocolError("INTERNAL_ERROR");
+}
+
+/** The result both settings operations answer with. */
+type SettingsResult = OperationMap["settings.get"]["result"];
+
+/**
+ * One bounded read of a namespace: what is stored, and what this instance runs.
+ *
+ * It takes no lease: a read is not a mutation, and the contract says an occupied
+ * host still lets a client look. What it does *not* do is serve a namespace this
+ * host has no business answering about — an arbitrary name, an unknown plugin,
+ * or a registered plugin that declares no configuration contract are one
+ * answer, and it is not "here is some stored value".
+ */
+function readSettings(state: HostState, namespace: string): OperationOutcome<SettingsResult> {
+  const target = settingsTargetOf(namespace, state.settingsAuthority.pluginContracts);
+  if (target === undefined) return operationFailed(protocolError("CAPABILITY_NOT_SUPPORTED"));
+
+  let record;
+  try {
+    record = state.repository.getSettingsNamespace(namespace);
+  } catch (error) {
+    return operationFailed(
+      error instanceof StoreUntrustedError ? storageUnavailableError() : protocolError("INTERNAL_ERROR"),
+    );
+  }
+  if (record === undefined) return operationFailed(protocolError("INTERNAL_ERROR"));
+
+  const snapshot = settingsSnapshotOf({
+    namespace,
+    desired: record,
+    effective: state.configuration.effective.get(namespace),
+  });
+  // A stored value this host cannot read as JSON is refused, not repaired: the
+  // caller is told the host could not answer rather than shown a rewritten one.
+  if (snapshot === undefined) return operationFailed(protocolError("INTERNAL_ERROR"));
+  return operationSucceeded({ settings: snapshot });
+}
+
+/**
+ * One compare-and-set write of a namespace's desired value.
+ *
+ * The order is the contract. A closed/storage check comes first, then the
+ * registry's own mutation lease — taken, not waited for, so a busy host answers
+ * HOST_BUSY rather than racing a run it is executing. The value is validated by
+ * the authority this instance started with, the frame the caller will receive
+ * is composed and measured *before* anything durable happens, and only then
+ * does the CAS run. A conflict writes nothing and a lost receipt is answered
+ * from the batch's own evidence — never by rewriting, replaying or assuming a
+ * rollback. What the caller receives on success is a *desired* commit: this
+ * instance keeps running what it started with, and the answer says so.
+ */
+function updateSettings(
+  state: HostState,
+  params: { readonly namespace: string; readonly expectedRevision: number; readonly value: import("@every-dagent/protocol").JsonValue },
+): OperationOutcome<SettingsResult> {
+  if (state.closing) return operationFailed(shuttingDownError());
+  if (state.storageFault) return operationFailed(storageUnavailableError());
+
+  const target = settingsTargetOf(params.namespace, state.settingsAuthority.pluginContracts);
+  if (target === undefined) return operationFailed(protocolError("CAPABILITY_NOT_SUPPORTED"));
+
+  const lease = state.gate.tryAcquire("mutation");
+  if (lease === undefined) return operationFailed(protocolError("HOST_BUSY"));
+  try {
+    return applySettingsUpdate(state, target, params);
+  } finally {
+    // The lease is released only here: after the durable commit, after any
+    // publication, and after this operation knows what it will answer.
+    lease.release();
+  }
+}
+
+function applySettingsUpdate(
+  state: HostState,
+  target: import("./configuration.js").SettingsTarget,
+  params: { readonly namespace: string; readonly expectedRevision: number; readonly value: import("@every-dagent/protocol").JsonValue },
+): OperationOutcome<SettingsResult> {
+  // The value as storage will hold it, measured the way storage measures it:
+  // escaped, in UTF-8, against the one bound this profile enforces.
+  const valueJson = JSON.stringify(params.value);
+  if (Buffer.byteLength(valueJson, "utf8") > MAX_SETTINGS_VALUE_BYTES) {
+    return operationFailed(limitExceededError());
+  }
+
+  const checked = validateSettingsValue({
+    target,
+    value: params.value,
+    authority: state.settingsAuthority,
+  });
+  if (!checked.ok) return operationFailed(protocolError("SETTINGS_INVALID"));
+
+  let current;
+  try {
+    current = state.repository.getSettingsNamespace(params.namespace);
+  } catch (error) {
+    return operationFailed(
+      error instanceof StoreUntrustedError ? storageUnavailableError() : protocolError("INTERNAL_ERROR"),
+    );
+  }
+  // A managed namespace exists from the moment the store is initialized; one
+  // that does not is a store this host cannot have written, and an update is
+  // not an initialization.
+  if (current === undefined) return operationFailed(protocolError("INTERNAL_ERROR"));
+
+  // The frame the caller will receive, composed now and held to the frame bound
+  // — the desired value *and* the effective one, so an update cannot succeed
+  // and then fail to be expressible.
+  const prospective: SettingsResult = {
+    settings: Object.freeze({
+      namespace: params.namespace,
+      desiredRevision: current.revision + 1,
+      effectiveRevision: state.configuration.effective.get(params.namespace)?.revision ?? null,
+      restartRequired: true,
+      desiredValue: params.value,
+      effectiveValue: state.configuration.effective.get(params.namespace)?.value ?? null,
+    }),
+  };
+  if (!settingsResultFits(state, prospective)) {
+    return operationFailed(limitExceededError());
+  }
+
+  let outcome;
+  try {
+    outcome = state.repository.updateSettingsNamespace({
+      namespace: params.namespace,
+      expectedRevision: params.expectedRevision,
+      schemaVersion: checked.schemaVersion,
+      valueJson,
+      at: Date.now(),
+    });
+  } catch (error) {
+    if (error instanceof CommitOutcomeUnknownError) markStorageFault(state);
+    return operationFailed(storageUnavailableError());
+  }
+
+  if (outcome.kind === "not-found") return operationFailed(protocolError("INTERNAL_ERROR"));
+  if (outcome.kind === "revision-conflict") return operationFailed(revisionConflictError());
+
+  const snapshot = settingsSnapshotOf({
+    namespace: params.namespace,
+    desired: outcome.record,
+    effective: state.configuration.effective.get(params.namespace),
+  });
+  if (snapshot === undefined) return operationFailed(protocolError("INTERNAL_ERROR"));
+
+  // The commit stands from here on. What follows is publication: the settings
+  // invalidation always, and — for a plugin's configuration — the summary whose
+  // revision moved and the catalogue revision that travels with it.
+  const restartRequired = snapshot.restartRequired;
+  try {
+    publishValidatedEvent(
+      state,
+      settingsUpdatedEvent(params.namespace, outcome.record.revision, restartRequired),
+    );
+  } catch {
+    // A subscriber that cannot be told reads the new state on its next cut or
+    // read; the durable commit is not undone by a delivery failure.
+  }
+
+  if (target.kind === "plugin") {
+    const revisions = state.pluginConfigRevisions.get(target.pluginId);
+    if (revisions !== undefined) revisions.desired = outcome.record.revision;
+    try {
+      observePlugin(state, target.pluginId);
+    } catch (error) {
+      // The configuration is committed, but the catalogue revision that has to
+      // travel with its summary did not land: this host can no longer state
+      // which catalogue version it is serving, so it stops claiming one.
+      if (!(error instanceof ProjectionError)) markStorageFault(state);
+      return operationFailed(storageUnavailableError());
+    }
+  }
+
+  return operationSucceeded({ settings: snapshot });
+}
+
+/**
+ * Whether one settings result can travel in one frame, measured with the
+ * protocol's own encoder on the frame the caller will really receive.
+ */
+function settingsResultFits(state: HostState, result: SettingsResult): boolean {
+  // The method is fixed here: an update's success answer is the same shape a
+  // read answers with, and it is the frame this caller will receive.
+  return encodeFrame(
+    { kind: "host-response", method: "settings.update" },
+    hostResponse(state, PREPARED_REQUEST_ID, result),
+  ).success;
 }
 
 /** The success envelope for one request, without the method-specific encoding. */

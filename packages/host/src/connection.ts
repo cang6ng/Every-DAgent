@@ -355,6 +355,24 @@ export function collectionInvalidatedEvent(collections: CollectionRevisions): Ev
   return (base) => ({ ...base, scope, type: "collection.invalidated", payload });
 }
 
+/**
+ * A namespace's desired value moved.
+ *
+ * The event is a bounded invalidation and nothing else: which namespace, which
+ * revision, and whether a restart is now owed. The value itself never travels
+ * here — a client that wants it reads the namespace — and neither does anything
+ * effective, because that is this instance's own fact.
+ */
+export function settingsUpdatedEvent(
+  namespace: string,
+  revision: number,
+  restartRequired: boolean,
+): EventBuilder {
+  const scope: EventScope = Object.freeze({ kind: "host" as const });
+  const payload = Object.freeze({ namespace, revision, restartRequired });
+  return (base) => ({ ...base, scope, type: "settings.updated", payload });
+}
+
 export function pluginUpdatedEvent(pluginId: string, plugin: PluginSummary): EventBuilder {
   const scope: PluginScope = Object.freeze({ kind: "plugin" as const, pluginId });
   const payload = Object.freeze({ plugin });

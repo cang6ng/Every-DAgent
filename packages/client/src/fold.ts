@@ -288,6 +288,8 @@ export function foldEvent(previous: HostSnapshot, event: HostEvent, watermark: W
       return foldCollectionInvalidated(previous, event.payload.collections, watermark);
     case "plugin.updated":
       return foldPluginUpdated(previous, event.payload.plugin, watermark);
+    case "settings.updated":
+      return foldSettingsUpdated(previous, event.payload, watermark);
     case "run.output.delta":
     case "run.tool.call":
     case "run.tool.result":
@@ -313,6 +315,7 @@ function directoryOf(previous: HostSnapshot): Omit<HostSnapshot, "watermark"> {
     sessions: previous.sessions,
     runs: previous.runs,
     plugins: previous.plugins,
+    settings: previous.settings,
   };
 }
 
@@ -518,6 +521,48 @@ function foldCollectionInvalidated(
     ok: true,
     presentation: withWatermark(
       { ...directoryOf(previous), collections: newRevisions(previous.collections, collections) },
+      watermark,
+    ),
+  };
+}
+
+/**
+ * One namespace's revisions moved.
+ *
+ * The directory carries the *summary* of the host's own two namespaces, and
+ * this is what keeps it current: the announced revision and restart flag move,
+ * and nothing else does. A namespace the cut does not carry — a plugin's, whose
+ * state travels as a plugin summary — moves the stream position and no more,
+ * and an announcement that is not newer than what the client holds is late
+ * rather than wrong: it is read, it advances the position, and it changes
+ * nothing.
+ */
+function foldSettingsUpdated(
+  previous: HostSnapshot,
+  payload: { readonly namespace: Id; readonly revision: number; readonly restartRequired: boolean },
+  watermark: Watermark,
+): FoldOutcome {
+  const index = previous.settings.findIndex((entry) => entry.namespace === payload.namespace);
+  if (index < 0) {
+    return { ok: true, presentation: withWatermark(directoryOf(previous), watermark) };
+  }
+
+  const existing = previous.settings[index];
+  if (existing === undefined || existing.desiredRevision >= payload.revision) {
+    return { ok: true, presentation: withWatermark(directoryOf(previous), watermark) };
+  }
+
+  const moved = Object.freeze({
+    ...existing,
+    desiredRevision: payload.revision,
+    restartRequired: payload.restartRequired,
+  });
+  const settings = [...previous.settings];
+  settings[index] = moved;
+  return {
+    ok: true,
+    presentation: withWatermark(
+      { ...directoryOf(previous), settings: Object.freeze(settings) },
       watermark,
     ),
   };

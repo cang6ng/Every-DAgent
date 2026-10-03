@@ -51,6 +51,8 @@ export type {
   Sequence,
   SessionSummary,
   SessionSummaryPage,
+  SettingsSnapshot,
+  SettingsSummary,
   StorageIdentity,
   TerminalRunSnapshot,
   Watermark,

@@ -20,6 +20,7 @@ import type {
   RunSummaryPage,
   SessionSummary,
   SessionSummaryPage,
+  SettingsSnapshot,
   StorageIdentity,
   TerminalRunSnapshot,
 } from "@every-dagent/protocol";
@@ -114,6 +115,11 @@ export function pluginSummary(status: PluginSummary["status"] = "disabled"): Plu
     version: "0.1.0",
     permissions: [],
     status,
+    desiredEnabled: false,
+    configRevision: null,
+    effectiveConfigRevision: null,
+    restartRequired: false,
+    unavailable: status === "error",
   };
 }
 
@@ -312,6 +318,22 @@ export function hostSnapshot(): HostSnapshot {
     sessions: sessionPage([sessionSummary()]),
     runs: runPage(),
     plugins: [pluginSummary()],
+    settings: [
+      { namespace: "host", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
+      { namespace: "model", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
+    ],
+  };
+}
+
+/** One settings snapshot, as a read of a namespace answers. */
+export function settingsSnapshot(): SettingsSnapshot {
+  return {
+    namespace: "host",
+    desiredRevision: 2,
+    effectiveRevision: 1,
+    restartRequired: true,
+    desiredValue: { systemPrompt: "next" },
+    effectiveValue: { systemPrompt: "current" },
   };
 }
 

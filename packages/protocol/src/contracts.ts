@@ -507,6 +507,43 @@ export interface HistoryPage {
 }
 
 /**
+ * One settings namespace, as a bounded read of its desired and effective state.
+ *
+ * The two revisions are the whole point: `desiredRevision` is what the store
+ * holds and what a client compares against to write, and `effectiveRevision` is
+ * what the host instance is actually running — `null` only for a namespace this
+ * instance never made effective, which a ready host does not have. They
+ * disagree exactly when a restart is pending, and the values are carried whole
+ * because this is the one read that is *asked* for a namespace; a snapshot
+ * carries only the summary.
+ */
+export interface SettingsSnapshot {
+  readonly namespace: Id;
+  readonly desiredRevision: Revision;
+  readonly effectiveRevision: Revision | null;
+  /** Whether a restart would apply a desired revision this instance does not run. */
+  readonly restartRequired: boolean;
+  readonly desiredValue: JsonValue;
+  readonly effectiveValue: JsonValue | null;
+}
+
+/**
+ * The fixed, bounded summary of one namespace, for the snapshot every
+ * subscriber receives.
+ *
+ * The values are deliberately absent: a snapshot carries the state a client
+ * needs to plan around — which revisions are in force, and whether anything is
+ * waiting for a restart — and the values themselves are read on demand through
+ * `settings.get`. Nothing here can grow with the size of a setting.
+ */
+export interface SettingsSummary {
+  readonly namespace: Id;
+  readonly desiredRevision: Revision;
+  readonly effectiveRevision: Revision | null;
+  readonly restartRequired: boolean;
+}
+
+/**
  * The bounded current state a `subscriptions.open` installs. A cut, not a
  * database: each window says how much of its collection it holds.
  */
@@ -518,6 +555,12 @@ export interface HostSnapshot {
   readonly sessions: SessionSummaryPage;
   readonly runs: RunSummaryPage;
   readonly plugins: readonly PluginSummary[];
+  /**
+   * The host's own two namespaces, fixed in order: `host` then `model`. Plugin
+   * configuration is not here — it is plugin state, and it travels in the
+   * plugin summaries.
+   */
+  readonly settings: readonly SettingsSummary[];
 }
 
 /**

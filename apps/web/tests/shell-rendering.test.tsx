@@ -63,6 +63,10 @@ function presentation(parts: Partial<HostSnapshot> = {}): HostSnapshot {
     sessions: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
     runs: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
     plugins: [],
+    settings: [
+      { namespace: "host", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
+      { namespace: "model", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
+    ],
     ...parts,
   };
 }
@@ -102,6 +106,7 @@ function snapshot(parts: Partial<ClientSnapshot> = {}): ClientSnapshot {
     presentationHost: "current",
     live: {},
     history: {},
+    settings: {},
     stale: false,
     error: null,
   };
@@ -609,6 +614,14 @@ describe("the host panel and the whole shell", () => {
           get: async () => ({ run: activeRun() }),
           list: async () => ({ runs: presentation().runs }),
           cancel: async () => ({ run: activeRun() }),
+        },
+        settings: {
+          get: async () => {
+            throw new Error("nothing is read here");
+          },
+          update: async () => {
+            throw new Error("nothing is written here");
+          },
         },
         plugins: { list: async () => ({ plugins: [] }), enable: async () => ({ plugin: plugins0() }), disable: async () => ({ plugin: plugins0() }) },
       },

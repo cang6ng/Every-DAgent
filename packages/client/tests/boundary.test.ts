@@ -57,6 +57,7 @@ describe("dependency boundary", () => {
         "fold.ts",
         "index.ts",
         "reverse.ts",
+        "settings.ts",
         "store.ts",
       ].sort(),
     );
@@ -169,6 +170,7 @@ describe("public surface", () => {
       "resync",
       "runs",
       "sessions",
+      "settings",
       "subscribe",
     ]);
     expect(Object.keys(factory.sessions).sort()).toEqual([

@@ -36,9 +36,10 @@ describe("host description", () => {
         // Fixed-fence history paging and the CAS session mutations are real.
         historyPages: true,
         sessionMutations: true,
+        // Reads and CAS writes by namespace, wired end to end in this build.
+        settings: true,
         // In the frozen v2 inventory but not implemented by this milestone,
         // reported as `false` rather than left out.
-        settings: false,
         approvals: false,
       },
       clientCapabilities: { reverseRequests: false },

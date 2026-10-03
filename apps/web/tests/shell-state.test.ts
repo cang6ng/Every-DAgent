@@ -112,6 +112,10 @@ function presentationFixture(parts: Partial<HostSnapshot> = {}): HostSnapshot {
     sessions: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
     runs: { items: [], collectionRevision: 1, nextCursor: null, hasMore: false },
     plugins: [],
+    settings: [
+      { namespace: "host", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
+      { namespace: "model", desiredRevision: 1, effectiveRevision: 1, restartRequired: false },
+    ],
     ...parts,
   };
 }
@@ -151,6 +155,7 @@ function snapshotFixture(parts: Partial<ClientSnapshot> = {}): ClientSnapshot {
     presentationHost: "current",
     live: {},
     history: {},
+    settings: {},
     stale: false,
     error: null,
   };
@@ -271,6 +276,17 @@ class FakeClient implements Client {
     cancel: (params: OperationMap["runs.cancel"]["params"]): Promise<OperationMap["runs.cancel"]["result"]> => {
       this.calls.push({ method: "runs.cancel", params });
       return this.onCancel === undefined ? Promise.reject(new Error("no cancel behaviour")) : this.onCancel(params);
+    },
+  };
+
+  readonly settings = {
+    get: (params: OperationMap["settings.get"]["params"]): Promise<OperationMap["settings.get"]["result"]> => {
+      this.calls.push({ method: "settings.get", params });
+      return Promise.reject(new Error("not used"));
+    },
+    update: (params: OperationMap["settings.update"]["params"]): Promise<OperationMap["settings.update"]["result"]> => {
+      this.calls.push({ method: "settings.update", params });
+      return Promise.reject(new Error("not used"));
     },
   };
 

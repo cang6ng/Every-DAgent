@@ -57,6 +57,7 @@ import {
 import type { ClientMisuseReason, ConnectionLostReason, ProtocolViolationReason } from "./errors.js";
 import { ClientError, clientMisuse, connectionLost, protocolViolation, remoteError } from "./errors.js";
 import { applyHistoryPage, deepFreeze, foldEvent, foldHistoryEvent, foldLiveEvent, liveRefreshExtends } from "./fold.js";
+import { applySettingsSnapshot, foldSettingsEvent, forgetSettings, markSettingsStale } from "./settings.js";
 import type { ReverseHandlerContext, ReverseHandlerOutcome, ReverseTable } from "./reverse.js";
 import type { ClientSnapshot, ConnectionStatus, PresentationStore } from "./store.js";
 import { createStore } from "./store.js";
@@ -151,6 +152,8 @@ const CAPABILITY_OF: Readonly<Record<OperationName, keyof HostCapabilities | und
   "plugins.list": "plugins",
   "plugins.enable": "plugins",
   "plugins.disable": "plugins",
+  "settings.get": "settings",
+  "settings.update": "settings",
   "subscriptions.open": "subscriptions",
   "subscriptions.close": "subscriptions",
 });
@@ -347,6 +350,14 @@ export class ClientConnection {
   private sync: Promise<void> | undefined;
   /** Whether a snapshot has ever been installed on this connection. */
   private everOpened = false;
+  /**
+   * The host instance the settings cache came from, or `undefined` before any
+   * connection bound one. It outlives a generation on purpose: a reconnect to
+   * the same instance keeps what was read, and one to a different instance
+   * drops it — the two are different facts, and only the field can tell them
+   * apart.
+   */
+  private settingsHost: string | undefined;
   private readonly pendings = new Map<string, PendingRequest>();
   private requestCounter = 0;
   private readonly reversePendings = new Map<string, ReversePending>();
@@ -511,11 +522,15 @@ export class ClientConnection {
     const attempt: Attempt = { epoch, aborted: false, promise, settle };
     this.attempt = attempt;
 
+    const current = this.store.get();
     this.store.update({
       status: "connecting",
       error: null,
-      stale: this.store.get().presentation !== null,
-      presentationHost: this.store.get().presentation === null ? "none" : "unconfirmed",
+      stale: current.presentation !== null,
+      presentationHost: current.presentation === null ? "none" : "unconfirmed",
+      // What the cache holds was read on the connection that just ended: it may
+      // still be true, and it is not claimed to be. A read clears the mark.
+      settings: markSettingsStale(current.settings),
     });
 
     const retire = (): void => {
@@ -704,6 +719,15 @@ export class ClientConnection {
             // may change under the other.
             const frozen = deepFreeze(description);
             this.identity = { hostInstanceId: frozen.hostInstanceId, description: frozen };
+
+            // A settings cache records one host instance's *effective* state.
+            // Binding to a different instance drops it: another process's
+            // revision and value are not this host's facts, and a cache that
+            // outlived its host would be a claim about something that no longer
+            // exists. A reconnect to the same instance keeps it, marked stale
+            // until a read confirms it.
+            const settingsHost = this.settingsHost;
+            this.settingsHost = frozen.hostInstanceId;
             this.store.update({
               description: frozen,
               presentationHost:
@@ -712,6 +736,9 @@ export class ClientConnection {
                   : presentation.hostInstanceId === frozen.hostInstanceId
                     ? "current"
                     : "previous",
+              ...(settingsHost !== undefined && settingsHost !== frozen.hostInstanceId
+                ? { settings: forgetSettings() }
+                : {}),
             });
             resolve(frozen);
           },
@@ -1118,6 +1145,53 @@ export class ClientConnection {
     });
   }
 
+  /**
+   * One read of a settings namespace, filed before the caller is resolved.
+   *
+   * The answer is the host's own snapshot, and it is what the replica keeps —
+   * unless a newer revision is already held, in which case the caller still
+   * receives it and the replica does not step backwards.
+   */
+  requestSettings(
+    params: OperationMap["settings.get"]["params"],
+  ): Promise<OperationMap["settings.get"]["result"]> {
+    return new Promise<OperationMap["settings.get"]["result"]>((resolve, reject) => {
+      this.send("settings.get", params, {
+        accept: (result) => {
+          this.store.update({ settings: applySettingsSnapshot(this.store.get().settings, result.settings) });
+          resolve(result);
+        },
+        decline: (error) => {
+          reject(error);
+        },
+      });
+    });
+  }
+
+  /**
+   * One compare-and-set settings write, filed the same way.
+   *
+   * Nothing here replays it. A write whose answer never arrives leaves the
+   * caller with an `unknown` outcome and the replica untouched; the way to find
+   * out what happened is another read, which is exactly what the contract
+   * prescribes for a lost write answer.
+   */
+  requestSettingsUpdate(
+    params: OperationMap["settings.update"]["params"],
+  ): Promise<OperationMap["settings.update"]["result"]> {
+    return new Promise<OperationMap["settings.update"]["result"]>((resolve, reject) => {
+      this.send("settings.update", params, {
+        accept: (result) => {
+          this.store.update({ settings: applySettingsSnapshot(this.store.get().settings, result.settings) });
+          resolve(result);
+        },
+        decline: (error) => {
+          reject(error);
+        },
+      });
+    });
+  }
+
   request<M extends OperationName>(
     method: M,
     params: OperationMap[M]["params"],
@@ -1316,6 +1390,7 @@ export class ClientConnection {
       return;
     }
     const history = foldHistoryEvent(current.history, event);
+    const settings = foldSettingsEvent(current.settings, event);
     if (event.type === "session.deleted") {
       // From here on, a page for this identity is a page for something the
       // client knows is gone: it is answered to whoever asked and is not filed.
@@ -1330,7 +1405,7 @@ export class ClientConnection {
     // The frame is applied whole or not at all: the position moves only once the
     // fold has accepted it, so a rejected event leaves no trace.
     stream.expected = event.sequence + 1;
-    this.store.update({ presentation: folded.presentation, live: live.live, history });
+    this.store.update({ presentation: folded.presentation, live: live.live, history, settings });
   }
 
   // -------------------------------------------------------------------------

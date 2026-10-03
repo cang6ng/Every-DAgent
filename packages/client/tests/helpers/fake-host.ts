@@ -27,6 +27,7 @@ import type {
   RunSummaryPage,
   SessionSummary,
   SessionSummaryPage,
+  SettingsSummary,
   StorageIdentity,
   TerminalRunSnapshot,
 } from "@every-dagent/protocol";
@@ -45,6 +46,12 @@ type ClientRequestEnvelope = Extract<DecodedMessage, { kind: "client-request" }>
 
 /** One event a test wants on the current stream, without the envelope boilerplate. */
 export type FakeEvent =
+  | {
+      readonly type: "settings.updated";
+      readonly namespace: string;
+      readonly revision: number;
+      readonly restartRequired: boolean;
+    }
   | {
       readonly type: "session.created";
       readonly session: SessionSummary;
@@ -178,7 +185,7 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
     reverseRequests: true,
     historyPages: true,
     sessionMutations: true,
-    settings: false,
+    settings: true,
     approvals: false,
     ...options.capabilities,
   });
@@ -326,6 +333,7 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
       readonly sessions?: SessionSummaryPage;
       readonly runs?: RunSummaryPage;
       readonly plugins?: readonly PluginSummary[];
+      readonly settings?: readonly SettingsSummary[];
       readonly storage?: StorageIdentity;
       readonly collections?: CollectionRevisions;
     } = {},
@@ -342,6 +350,12 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
         fields.runs ??
         Object.freeze({ items: Object.freeze([]), collectionRevision: 1, nextCursor: null, hasMore: false }),
       plugins: Object.freeze([...(fields.plugins ?? [])]),
+      settings: Object.freeze([
+        ...(fields.settings ?? [
+          Object.freeze({ namespace: "host", desiredRevision: 1, effectiveRevision: 1, restartRequired: false }),
+          Object.freeze({ namespace: "model", desiredRevision: 1, effectiveRevision: 1, restartRequired: false }),
+        ]),
+      ]),
     });
   }
 
@@ -413,6 +427,18 @@ export function createFakeHost(options: FakeHostOptions = {}): FakeHost {
     };
 
     switch (event.type) {
+      case "settings.updated":
+        sendEvent({
+          ...base,
+          type: "settings.updated",
+          scope: { kind: "host" },
+          payload: {
+            namespace: event.namespace,
+            revision: event.revision,
+            restartRequired: event.restartRequired,
+          },
+        });
+        return;
       case "session.created":
         sendEvent({
           ...base,

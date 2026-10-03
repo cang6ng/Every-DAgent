@@ -280,6 +280,8 @@ export function encodeFrame(target: { readonly kind: "host-response"; readonly m
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "plugins.list" }, message: HostResponse<"plugins.list">): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "plugins.enable" }, message: HostResponse<"plugins.enable">): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "plugins.disable" }, message: HostResponse<"plugins.disable">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "settings.get" }, message: HostResponse<"settings.get">): EncodeFrameResult;
+export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "settings.update" }, message: HostResponse<"settings.update">): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "subscriptions.open" }, message: HostResponse<"subscriptions.open">): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method: "subscriptions.close" }, message: HostResponse<"subscriptions.close">): EncodeFrameResult;
 export function encodeFrame(target: { readonly kind: "host-response"; readonly method?: never }, message: HostErrorResponse): EncodeFrameResult;

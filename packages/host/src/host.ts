@@ -40,7 +40,7 @@ import {
   validateLoopResourceLimits,
 } from "@every-dagent/agent-core";
 import { createPluginManager } from "@every-dagent/plugin-system";
-import type { Plugin, PluginPermission, PluginStorage } from "@every-dagent/plugin-system";
+import type { Plugin, PluginConfigValue, PluginPermission, PluginStorage } from "@every-dagent/plugin-system";
 import type { OperationMap, ProtocolChannel } from "@every-dagent/protocol";
 import { PROTOCOL_VERSION, validateMessage } from "@every-dagent/protocol";
 
@@ -256,6 +256,27 @@ export async function composeHost(options: HostOptions, internals: HostInternals
         revisions: loaded.revisions,
       },
       disposeComposition: execution.dispose,
+      // The same authorities startup used: the composition's judgement of a
+      // model profile and each registered plugin's own contract. A settings
+      // write is never judged by a second, differently-configured reading.
+      settingsAuthority: {
+        validateModel: (value) => options.composition.validateModel(value),
+        pluginContracts: new Map(
+          options.plugins.flatMap((plugin) => {
+            const contract = plugin.configuration;
+            if (contract === undefined) return [];
+            return [
+              [
+                plugin.manifest.id,
+                {
+                  schemaVersion: contract.schemaVersion,
+                  validate: (value: PluginConfigValue): boolean => contract.validate(value),
+                },
+              ],
+            ] as const;
+          }),
+        ),
+      },
       plugins: new Map(),
       pluginOrder: [],
       pluginIntents: new Map(

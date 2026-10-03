@@ -44,6 +44,8 @@ import {
   type RunSummaryPage,
   type SessionSummary,
   type SessionSummaryPage,
+  type SettingsSnapshot,
+  type SettingsSummary,
   type StorageIdentity,
   type TerminalRunSnapshot,
 } from "./contracts.js";
@@ -692,6 +694,48 @@ const collectionRevisionsSchema: v.GenericSchema<CollectionRevisions> = v.object
 });
 
 // ---------------------------------------------------------------------------
+// Settings.
+// ---------------------------------------------------------------------------
+
+/**
+ * One namespace's desired/effective state.
+ *
+ * The two revisions and the flag are checked against each other here, so a
+ * snapshot cannot report a restart as pending while its own numbers say the
+ * revisions agree: the flag is derived from exactly those two fields.
+ */
+const settingsSnapshotSchema: v.GenericSchema<SettingsSnapshot> = v.pipe(
+  v.object({
+    namespace: idSchema,
+    desiredRevision: revisionSchema,
+    effectiveRevision: v.union([v.null(), revisionSchema]),
+    restartRequired: v.boolean(),
+    desiredValue: JsonValueSchema,
+    effectiveValue: v.union([v.null(), JsonValueSchema]),
+  }),
+  v.check(
+    (settings) =>
+      settings.restartRequired ===
+      (settings.effectiveRevision === null || settings.desiredRevision !== settings.effectiveRevision),
+  ),
+);
+
+/** The values-free summary a snapshot carries for one namespace. */
+const settingsSummarySchema: v.GenericSchema<SettingsSummary> = v.pipe(
+  v.object({
+    namespace: idSchema,
+    desiredRevision: revisionSchema,
+    effectiveRevision: v.union([v.null(), revisionSchema]),
+    restartRequired: v.boolean(),
+  }),
+  v.check(
+    (settings) =>
+      settings.restartRequired ===
+      (settings.effectiveRevision === null || settings.desiredRevision !== settings.effectiveRevision),
+  ),
+);
+
+// ---------------------------------------------------------------------------
 // Snapshots.
 // ---------------------------------------------------------------------------
 
@@ -706,6 +750,7 @@ const hostSnapshotSchema: v.GenericSchema<HostSnapshot> = v.pipe(
     sessions: sessionPageSchema,
     runs: runPageSchema,
     plugins: v.array(pluginSummarySchema),
+    settings: v.array(settingsSummarySchema),
   }),
   // What the snapshot can prove about itself, and nothing more. The directory
   // and the run window are each bounded, so a run may legitimately outlive the
@@ -715,6 +760,8 @@ const hostSnapshotSchema: v.GenericSchema<HostSnapshot> = v.pipe(
   v.check((snapshot) => {
     const sessionIds = new Set(snapshot.sessions.items.map((session) => session.sessionId));
     const pluginIds = new Set(snapshot.plugins.map((plugin) => plugin.id));
+    const settingsNamespaces = new Set(snapshot.settings.map((settings) => settings.namespace));
+    if (settingsNamespaces.size !== snapshot.settings.length) return false;
     if (pluginIds.size !== snapshot.plugins.length) return false;
     const runIds = new Set(snapshot.runs.items.map((run) => run.runId));
     if (runIds.size !== snapshot.runs.items.length) return false;
@@ -784,6 +831,8 @@ export {
   runSummarySchema,
   sequenceSchema,
   sessionPageSchema,
+  settingsSnapshotSchema,
+  settingsSummarySchema,
   sessionSummarySchema,
   storageIdentitySchema,
   terminalRunSchema,

@@ -128,11 +128,22 @@ export function toolItem(
 export function pluginSummary(
   overrides: Partial<PluginSummary> & { readonly id: string },
 ): PluginSummary {
+  const status = overrides.status ?? ("disabled" as const);
+  const desiredEnabled = overrides.desiredEnabled ?? false;
+  const configRevision = overrides.configRevision ?? null;
+  const effectiveConfigRevision = overrides.effectiveConfigRevision ?? configRevision;
   return Object.freeze({
     name: `Plugin ${overrides.id}`,
     version: "1.0.0",
     permissions: Object.freeze([]),
-    status: "disabled" as const,
+    status,
+    desiredEnabled,
+    configRevision,
+    effectiveConfigRevision,
+    restartRequired:
+      overrides.restartRequired ??
+      (configRevision !== null && configRevision !== effectiveConfigRevision),
+    unavailable: overrides.unavailable ?? (status === "error" || (desiredEnabled && status !== "enabled")),
     ...overrides,
   });
 }

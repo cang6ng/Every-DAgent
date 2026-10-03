@@ -37,6 +37,7 @@ import { MAX_REQUEST_ID_BYTES, MAX_TITLE_CHARS, PROTOCOL_VERSION, encodeFrame } 
 import { storedProtocolError } from "./errors.js";
 import { encodeCursor, readSessionPage, sessionSummaryOf } from "./history.js";
 import type { Lease, RegistryGate } from "./registry-gate.js";
+import { HOST_NAMESPACE, MODEL_NAMESPACE } from "./settings-profile.js";
 import { refuseCorruptRun, servesRun } from "./run.js";
 import { heaviestAcceptedText, type Repository, type RunRecord, type SessionRecord } from "./repository.js";
 import type { ReverseOutcome, ReverseProfile, ReverseTimer } from "./reverse.js";
@@ -209,6 +210,24 @@ export interface HostConfiguration {
   readonly revisions: import("./composition.js").SettingsRevisions;
 }
 
+/**
+ * What the settings surface judges a *new* value with.
+ *
+ * The composition's own model validation and every registered plugin's contract
+ * are facts this instance holds, so a settings write is judged by the same
+ * authority the startup used — never by a second reading that could disagree.
+ */
+export interface SettingsAuthority {
+  readonly validateModel: (value: import("@every-dagent/protocol").JsonValue) => { readonly ok: boolean };
+  readonly pluginContracts: ReadonlyMap<string, PluginContract>;
+}
+
+/** One registered plugin's configuration contract, as the settings surface uses it. */
+export interface PluginContract {
+  readonly schemaVersion: number;
+  readonly validate: (value: import("@every-dagent/plugin-system").PluginConfigValue) => boolean;
+}
+
 export interface HostState {
   readonly hostInstanceId: string;
   readonly name: string;
@@ -223,6 +242,8 @@ export interface HostState {
   readonly configuration: HostConfiguration;
   /** The composition's own release path, held from the moment it handed execution over. */
   readonly disposeComposition: (() => void | Promise<void>) | undefined;
+  /** How a settings write is judged; see the note on `SettingsAuthority`. */
+  readonly settingsAuthority: SettingsAuthority;
   /** The published plugin summaries, by id, in registration order. */
   readonly plugins: Map<string, PluginSummary>;
   readonly pluginOrder: string[];
@@ -631,6 +652,7 @@ export function captureHostSnapshot(
         hasMore: hasMoreRuns,
       }),
       plugins: Object.freeze(state.pluginOrder.map((pluginId) => pluginSummaryOf(state, pluginId))),
+      settings: settingsSummariesOf(state),
     });
 
   let snapshot = compose();
@@ -723,7 +745,34 @@ export function snapshotCoreOf(
       hasMore: false,
     }),
     plugins: Object.freeze(state.pluginOrder.map((pluginId) => pluginSummaryOf(state, pluginId))),
+    settings: settingsSummariesOf(state),
   });
+}
+
+/**
+ * The fixed, bounded summary of the host's own two namespaces.
+ *
+ * Two entries, always, in one order: a snapshot says which revisions are in
+ * force and whether a restart is owed, and never carries a value. The durable
+ * revisions are read here — inside the cut's own synchronous step, like every
+ * other window — and the effective ones come from what this instance consumed.
+ */
+export function settingsSummariesOf(state: HostState): readonly import("@every-dagent/protocol").SettingsSummary[] {
+  const summaries: import("@every-dagent/protocol").SettingsSummary[] = [];
+  for (const namespace of [HOST_NAMESPACE, MODEL_NAMESPACE]) {
+    const record = state.repository.getSettingsNamespace(namespace);
+    if (record === undefined) throw new Error("a managed settings namespace is missing");
+    const effective = state.configuration.effective.get(namespace);
+    summaries.push(
+      Object.freeze({
+        namespace,
+        desiredRevision: record.revision,
+        effectiveRevision: effective?.revision ?? null,
+        restartRequired: effective === undefined || effective.revision !== record.revision,
+      }),
+    );
+  }
+  return Object.freeze(summaries);
 }
 
 /**

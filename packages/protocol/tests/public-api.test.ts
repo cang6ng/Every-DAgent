@@ -46,7 +46,7 @@ describe("public API surface", () => {
     expect(PROTOCOL_VERSION).toBe("2");
   });
 
-  it("pins the sixteen operation names at the type level", () => {
+  it("pins the eighteen operation names at the type level", () => {
     const pinned: Expect<
       Equal<
         OperationName,
@@ -64,6 +64,8 @@ describe("public API surface", () => {
         | "plugins.list"
         | "plugins.enable"
         | "plugins.disable"
+        | "settings.get"
+        | "settings.update"
         | "subscriptions.open"
         | "subscriptions.close"
       >
@@ -71,7 +73,7 @@ describe("public API surface", () => {
     expect(pinned).toBe(true);
   });
 
-  it("pins the eleven event type literals at the type level", () => {
+  it("pins the twelve event type literals at the type level", () => {
     const pinned: Expect<
       Equal<
         HostEvent["type"],
@@ -84,6 +86,7 @@ describe("public API surface", () => {
         | "run.tool.result"
         | "run.ended"
         | "plugin.updated"
+        | "settings.updated"
         | "collection.invalidated"
         | "host.request.cancelled"
       >

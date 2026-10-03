@@ -78,6 +78,24 @@ export interface Client {
     enable(params: OperationMap["plugins.enable"]["params"]): Promise<OperationMap["plugins.enable"]["result"]>;
     disable(params: OperationMap["plugins.disable"]["params"]): Promise<OperationMap["plugins.disable"]["result"]>;
   };
+
+  readonly settings: {
+    /**
+     * Reads one namespace whole, and files what the host answered.
+     *
+     * This is the only way to obtain a namespace's values: a `settings.updated`
+     * event says a revision moved and never carries a value, so a client that
+     * needs one reads it.
+     */
+    get(params: OperationMap["settings.get"]["params"]): Promise<OperationMap["settings.get"]["result"]>;
+    /**
+     * Replaces one namespace's desired value against the revision the caller
+     * read. A conflict is refused by the host and changes nothing, here or
+     * there, and a lost answer is never resent: a later read is how the caller
+     * finds out what really happened.
+     */
+    update(params: OperationMap["settings.update"]["params"]): Promise<OperationMap["settings.update"]["result"]>;
+  };
 }
 
 export function createClient(options: ClientOptions): Client {
@@ -123,6 +141,13 @@ export function createClientWith(options: ClientOptions, internals: ClientIntern
         connection.request("runs.list", params),
       cancel: (params: OperationMap["runs.cancel"]["params"]): Promise<OperationMap["runs.cancel"]["result"]> =>
         connection.request("runs.cancel", params),
+    },
+
+    settings: {
+      get: (params: OperationMap["settings.get"]["params"]): Promise<OperationMap["settings.get"]["result"]> =>
+        connection.requestSettings(params),
+      update: (params: OperationMap["settings.update"]["params"]): Promise<OperationMap["settings.update"]["result"]> =>
+        connection.requestSettingsUpdate(params),
     },
 
     plugins: {

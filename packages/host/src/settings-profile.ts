@@ -13,6 +13,12 @@
  * namespace's name, one namespace's encoded value and one system prompt.
  */
 
+/** The namespace this host's own settings live in. */
+export const HOST_NAMESPACE = "host";
+
+/** The namespace the model profile lives in. */
+export const MODEL_NAMESPACE = "model";
+
 /** The largest encoded value one settings namespace may hold. */
 export const MAX_SETTINGS_VALUE_BYTES = 16 * 1024;
 

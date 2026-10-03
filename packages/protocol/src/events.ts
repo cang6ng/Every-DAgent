@@ -23,6 +23,7 @@ import type {
   Id,
   LiveToolItem,
   PluginSummary,
+  Revision,
   SessionSummary,
   TerminalRunSnapshot,
 } from "./contracts.js";
@@ -34,6 +35,7 @@ import {
   plainStringSchema,
   pluginSummarySchema,
   requestIdSchema,
+  revisionSchema,
   sessionSummarySchema,
   terminalRunSchema,
 } from "./schemas.js";
@@ -103,6 +105,15 @@ export type HostEvent =
       readonly scope: EventScope & { readonly kind: "plugin"; readonly pluginId: Id };
       readonly type: "plugin.updated";
       readonly payload: { readonly plugin: PluginSummary };
+    })
+  | (HostEventBase & {
+      readonly scope: EventScope & { readonly kind: "host" };
+      readonly type: "settings.updated";
+      readonly payload: {
+        readonly namespace: Id;
+        readonly revision: Revision;
+        readonly restartRequired: boolean;
+      };
     })
   | (HostEventBase & {
       readonly scope: EventScope & { readonly kind: "host" };
@@ -264,6 +275,20 @@ const eventSchemas = {
     }),
     v.check((event) => event.scope.pluginId === event.payload.plugin.id),
   ),
+  // A namespace's desired value moved. The event is a bounded invalidation and
+  // nothing more: no value, no effective state and no secret travels with it —
+  // a client that wants the value reads the namespace, and one that lost this
+  // event is re-synchronized by the same read.
+  "settings.updated": v.object({
+    ...eventBaseEntries,
+    type: v.literal("settings.updated"),
+    scope: v.object({ kind: v.literal("host") }),
+    payload: v.object({
+      namespace: idSchema,
+      revision: revisionSchema,
+      restartRequired: v.boolean(),
+    }),
+  }),
   // A catalogue's revision moved without a summary to carry. The revisions are
   // the whole message: a client holding an older page learns its page is no
   // longer the current catalogue and re-reads, rather than stitching versions.

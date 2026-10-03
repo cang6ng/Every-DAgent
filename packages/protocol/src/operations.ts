@@ -4,12 +4,14 @@
  *
  * What is here is exactly what this host implements: sessions (list, create,
  * get, history, rename, delete), runs (start, get, list, cancel), plugins
- * (list, enable, disable) and subscriptions. There is no `tools.execute`, no
- * `runs.resume`, no `approvals.*`, no credential operation, no plugin install
- * and no arbitrary RPC. `settings.*` and the approval profiles are declared in
- * the frozen v2 inventory but are not implemented by this milestone, so they
- * are absent rather than stubbed — an unimplemented method answers
- * METHOD_NOT_FOUND, which is the truth.
+ * (list, enable, disable), settings (get, update) and subscriptions. There is
+ * no `tools.execute`, no `runs.resume`, no `approvals.*`, no credential
+ * operation, no plugin install and no arbitrary RPC. The approval profiles are
+ * declared in the frozen v2 inventory but are not implemented by this
+ * milestone, so they are absent rather than stubbed — an unimplemented method
+ * answers METHOD_NOT_FOUND, which is the truth. `settings.*` is by namespace,
+ * never a key/value store: an update replaces one namespace's whole value
+ * against a revision, and there is no way to write an arbitrary key.
  *
  * `OperationMap` is the single source of truth for both the public TypeScript
  * contract and the runtime schemas: the schemas in this module are keyed by
@@ -32,12 +34,14 @@ import type {
   RunSummaryPage,
   SessionSummary,
   SessionSummaryPage,
+  SettingsSnapshot,
 } from "./contracts.js";
 import { MAX_PAGE_ITEMS } from "./contracts.js";
 import {
   clientCapabilitiesSchema,
   generationStringSchema,
   hasNonWhitespaceSchema,
+  JsonValueSchema,
   historyPageSchema,
   hostDescriptionSchema,
   hostSnapshotSchema,
@@ -53,6 +57,7 @@ import {
   runSnapshotSchema,
   sessionPageSchema,
   sessionSummarySchema,
+  settingsSnapshotSchema,
   titleSchema,
 } from "./schemas.js";
 
@@ -105,6 +110,9 @@ export interface PluginsListResult {
 }
 export interface PluginResult {
   readonly plugin: PluginSummary;
+}
+export interface SettingsResult {
+  readonly settings: SettingsSnapshot;
 }
 export interface SubscriptionsOpenResult {
   readonly snapshot: HostSnapshot;
@@ -195,6 +203,16 @@ export interface OperationMap {
   "plugins.list": { params: EmptyParams; result: PluginsListResult };
   "plugins.enable": { params: { readonly pluginId: Id }; result: PluginResult };
   "plugins.disable": { params: { readonly pluginId: Id }; result: PluginResult };
+  "settings.get": { params: { readonly namespace: Id }; result: SettingsResult };
+  "settings.update": {
+    params: {
+      readonly namespace: Id;
+      readonly expectedRevision: Revision;
+      /** The full replacement value; a namespace is replaced, never patched. */
+      readonly value: JsonValue;
+    };
+    result: SettingsResult;
+  };
   "subscriptions.open": { params: EmptyParams; result: SubscriptionsOpenResult };
   "subscriptions.close": { params: { readonly streamId: Id }; result: SubscriptionsCloseResult };
 }
@@ -313,6 +331,14 @@ const paramsSchemas = {
   "plugins.list": emptyParamsSchema,
   "plugins.enable": v.object({ pluginId: pluginIdSchema }),
   "plugins.disable": v.object({ pluginId: pluginIdSchema }),
+  "settings.get": v.object({ namespace: idSchema }),
+  "settings.update": v.object({
+    namespace: idSchema,
+    expectedRevision: revisionSchema,
+    // The protocol checks that this *is* a JSON value; what a value may mean is
+    // the host's own schema, and a mismatch there is SETTINGS_INVALID.
+    value: JsonValueSchema,
+  }),
   "subscriptions.open": emptyParamsSchema,
   "subscriptions.close": v.object({ streamId: idSchema }),
 } as const;
@@ -350,6 +376,8 @@ const resultSchemas = {
   "plugins.list": v.object({ plugins: v.array(pluginSummarySchema) }),
   "plugins.enable": v.object({ plugin: pluginSummarySchema }),
   "plugins.disable": v.object({ plugin: pluginSummarySchema }),
+  "settings.get": v.object({ settings: settingsSnapshotSchema }),
+  "settings.update": v.object({ settings: settingsSnapshotSchema }),
   "subscriptions.open": v.pipe(
     v.object({ snapshot: hostSnapshotSchema }),
     // The initial watermark always starts the stream at zero.
@@ -499,6 +527,22 @@ const requestSchemas = {
     requestId: requestIdSchema,
     method: v.literal("plugins.disable"),
     params: paramsSchemas["plugins.disable"],
+    hostInstanceId: idSchema,
+  }),
+  "settings.get": v.object({
+    kind: v.literal("client-request"),
+    protocolVersion: v.literal("2"),
+    requestId: requestIdSchema,
+    method: v.literal("settings.get"),
+    params: paramsSchemas["settings.get"],
+    hostInstanceId: idSchema,
+  }),
+  "settings.update": v.object({
+    kind: v.literal("client-request"),
+    protocolVersion: v.literal("2"),
+    requestId: requestIdSchema,
+    method: v.literal("settings.update"),
+    params: paramsSchemas["settings.update"],
     hostInstanceId: idSchema,
   }),
   "subscriptions.open": v.object({
