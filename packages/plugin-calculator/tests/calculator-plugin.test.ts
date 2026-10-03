@@ -42,6 +42,7 @@ describe("calculator plugin", () => {
         },
       },
       capabilities: {},
+      config: undefined,
       onDispose: () => {},
     });
 
