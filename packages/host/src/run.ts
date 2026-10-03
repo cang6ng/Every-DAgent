@@ -24,7 +24,7 @@
  * connection that dies mid-flight.
  */
 
-import { restoreSessionWindow } from "@every-dagent/agent-core";
+import { ContextBudgetError, restoreSessionWindow } from "@every-dagent/agent-core";
 import type { AgentRuntime, RuntimeEvent, Session, TurnEndReason } from "@every-dagent/agent-core";
 import type { CollectionRevisions, LiveToolItem, OperationMap, ProtocolError } from "@every-dagent/protocol";
 
@@ -197,6 +197,36 @@ export function startRun(
   // the session cannot be used.
   const lease = state.gate.tryAcquire("execution");
   if (lease === undefined) return operationFailed(protocolError("HOST_BUSY"));
+
+  // The last check before anything durable, and the only one that needs the
+  // runtime: whether a run with this input could be sent *at all*. History is
+  // not loaded and no provider is reached — the smallest legal request is
+  // composed from the session's system prompt, the tools the registry offers
+  // right now, and this one user message — because a turn of history can always
+  // be absent, and a floor that does not fit under this model's budget is a run
+  // that could never be sent. Nothing has been recorded yet, so a refusal here
+  // is total: no submission, no run, no canonical fact, no model call.
+  try {
+    state.runtime.preflight({ sessionId: params.sessionId, text: params.text });
+  } catch (error) {
+    lease.release();
+    return operationFailed(
+      error instanceof ContextBudgetError ? limitExceededError() : protocolError("INTERNAL_ERROR"),
+    );
+  }
+
+  // Two facts the preflight could not have observed, re-read because it is the
+  // only work between the earlier checks and the admission. A shutdown that
+  // began, and a store that stopped being trustworthy: either way this run must
+  // not be admitted, and the answer is the one that path already gives.
+  if (state.closing) {
+    lease.release();
+    return operationFailed(shuttingDownError());
+  }
+  if (state.storageFault) {
+    lease.release();
+    return operationFailed(storageUnavailableError());
+  }
 
   let admission;
   try {

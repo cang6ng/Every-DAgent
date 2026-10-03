@@ -1,4 +1,4 @@
-import { errorMessageOf } from "../errors.js";
+import { errorMessageOf, TurnResourceFault } from "../errors.js";
 import type { AgentLoop, AgentLoopEvent, AgentLoopInput, TurnOutcome } from "../loop/agent-loop.js";
 import type { Session } from "../session/session.js";
 import type { TurnEndReason } from "../session/session-event.js";
@@ -135,11 +135,16 @@ async function driveTurn(
  * is the one that promised the turn would be closed. A loop that rejects still gets
  * its turn written down as one that ended.
  *
+ * A resource fault is the exception, and it is the reason this function exists in
+ * this shape rather than as a bare call: a tool has already run and its result
+ * cannot be kept, so the turn must *not* be closed. The caller gets the fault and
+ * the log keeps the turn open, which is the honest description of what happened.
  */
 async function runLoop(deps: AgentRuntimeDeps, input: AgentLoopInput): Promise<TurnOutcome> {
   try {
     return await deps.loop.runTurn(input);
   } catch (error) {
+    if (error instanceof TurnResourceFault) throw error;
     if (input.context.signal.aborted) return { reason: "cancelled", text: "" };
     return { reason: "error", text: "", error: errorMessageOf(error) };
   }

@@ -1,7 +1,7 @@
 import type { ContextBuilder, FixedContext } from "../context/context-builder.js";
 import { assertModelRequestFits, ownFixedContext, ownModelRequest } from "../context/context-guard.js";
 import { defineModelBudget, validateModelLimits, type ModelBudget, type ModelLimits } from "../context/model-budget.js";
-import { NonRetryableModelError, errorMessageOf } from "../errors.js";
+import { NonRetryableModelError, TurnResourceFault, errorMessageOf } from "../errors.js";
 import type { ToolCall } from "../model/message.js";
 import type { ModelClient, ModelRequest } from "../model/model-client.js";
 import type { RuntimeContext } from "../runtime/runtime-context.js";
@@ -9,6 +9,13 @@ import type { Session } from "../session/session.js";
 import type { SessionEventInput, TurnEndReason } from "../session/session-event.js";
 import type { ToolExecutionResult } from "../tools/tool.js";
 import type { ToolRegistry } from "../tools/tool-registry.js";
+import {
+  assertToolInput,
+  LOOP_RESOURCE_LIMITS,
+  TurnResourceMeter,
+  validateLoopResourceLimits,
+  type LoopResourceLimits,
+} from "./turn-resources.js";
 
 /**
  * How many model calls one turn may spend.
@@ -17,18 +24,24 @@ import type { ToolRegistry } from "../tools/tool-registry.js";
  * budget is checked before a call, never after its tools have run: a turn either
  * completes inside the budget or stops wanting another step.
  */
-export const MAX_STEPS = 12;
+export const MAX_STEPS = LOOP_RESOURCE_LIMITS.maxSteps;
 
 /**
  * Attempts per model step, counting the first one — two retries, then the turn
  * fails. Retries stay inside their step and spend no step budget.
  */
-export const MAX_MODEL_ATTEMPTS = 3;
+export const MAX_MODEL_ATTEMPTS = LOOP_RESOURCE_LIMITS.maxModelAttempts;
 
 export interface AgentLoopDeps {
   readonly modelClient: ModelClient;
   readonly tools: ToolRegistry;
   readonly contextBuilder: ContextBuilder;
+  /**
+   * A smaller resource profile, for a composition or a test that wants the same
+   * rules with tighter numbers. Left out, the shared approved profile applies;
+   * either way there is one object, never two copies of the same number.
+   */
+  readonly limits?: LoopResourceLimits;
 }
 
 /**
@@ -125,12 +138,13 @@ export function createAgentLoop(deps: AgentLoopDeps): AgentLoop {
   // Validated once, at the composition that will really run: an adapter that
   // cannot state a usable capability, or a profile that leaves no room for
   // input, is refused here rather than discovered per request.
+  const limits = validateLoopResourceLimits(deps.limits ?? LOOP_RESOURCE_LIMITS);
   const modelLimits = validateModelLimits(deps.modelClient.limits);
   const budget = defineModelBudget(modelLimits);
   const composed: ComposedStep = { limits: modelLimits, budget };
 
   return {
-    runTurn: (input: AgentLoopInput): Promise<TurnOutcome> => runTurn(deps, composed, input),
+    runTurn: (input: AgentLoopInput): Promise<TurnOutcome> => runTurn(deps, limits, composed, input),
     preflight: (input: AgentPreflightInput): void => preflight(deps, composed, input),
   };
 }
@@ -169,12 +183,14 @@ function preflight(deps: AgentLoopDeps, composed: ComposedStep, { text, context 
  */
 async function runTurn(
   deps: AgentLoopDeps,
+  limits: LoopResourceLimits,
   composed: ComposedStep,
   input: AgentLoopInput,
 ): Promise<TurnOutcome> {
   try {
-    return await runSteps(deps, composed, input);
+    return await runSteps(deps, limits, composed, input);
   } catch (error) {
+    if (error instanceof TurnResourceFault) throw error;
     // Anything else that escaped the step itself came from the Core (context
     // building, the log, the loop's own code) rather than from the model, and is
     // reported the same way: as a turn that ends.
@@ -185,20 +201,23 @@ async function runTurn(
 
 async function runSteps(
   deps: AgentLoopDeps,
+  limits: LoopResourceLimits,
   composed: ComposedStep,
   { session, turnId, context, emit }: AgentLoopInput,
 ): Promise<TurnOutcome> {
+  const meter = new TurnResourceMeter(limits);
+  chargeWhatTheRuntimeAlreadyWrote(meter, session, turnId);
   let lastText = "";
 
   for (let step = 0; ; step++) {
     // The turn's first two checkpoints. An aborted turn stops before a request is
     // built, and here again — after a tool block — before the next step starts.
-    if (context.signal.aborted) return { reason: "cancelled", text: "" };
+    if (context.signal.aborted) return closeTurn(meter, turnId, { reason: "cancelled", text: "" });
 
     // The budget is spent and the model still wanted another step. The previous
     // step's tools have already been dispatched and recorded, so the log stays a
     // complete history; only the choice to continue is taken away.
-    if (step === MAX_STEPS) return { reason: "max_steps", text: lastText };
+    if (step === limits.maxSteps) return closeTurn(meter, turnId, { reason: "max_steps", text: lastText });
 
     // The fixed context is read from the live registry on every step, never
     // snapshotted for the turn: a tool that appears between two steps is a tool
@@ -228,12 +247,20 @@ async function runSteps(
       turnId,
       context,
       emit,
+      meter,
     });
 
-    if (outcome.status === "cancelled") return { reason: "cancelled", text: "" };
-    if (outcome.status === "failed") return { reason: "error", text: "", error: outcome.message };
+    if (outcome.status === "cancelled") return closeTurn(meter, turnId, { reason: "cancelled", text: "" });
+    if (outcome.status === "failed") {
+      return closeTurn(meter, turnId, { reason: "error", text: "", error: outcome.message });
+    }
 
-    session.append({
+    // The whole group is judged before any of it is written down. A step whose
+    // declarations cannot be part of a managed turn is a step that names no
+    // calls at all, so nothing it asked for can have run.
+    assertToolGroup(outcome.toolCalls, limits);
+
+    commitFact(meter, session, {
       type: "message/assistant",
       turnId,
       data: { text: outcome.text, toolCalls: outcome.toolCalls },
@@ -242,10 +269,12 @@ async function runSteps(
 
     // No tool call is the one and only termination condition: the step that asks
     // for nothing carries the final answer.
-    if (outcome.toolCalls.length === 0) return { reason: "completed", text: outcome.text };
+    if (outcome.toolCalls.length === 0) {
+      return closeTurn(meter, turnId, { reason: "completed", text: outcome.text });
+    }
 
     for (const call of outcome.toolCalls) {
-      session.append({
+      commitFact(meter, session, {
         type: "tool/call",
         turnId,
         data: { callId: call.callId, name: call.name, input: call.input },
@@ -257,11 +286,15 @@ async function runSteps(
       const result = await dispatchTool(deps.tools, call, context);
 
       const content = toolResultContent(result);
-      session.append({
-        type: "tool/result",
-        turnId,
-        data: { callId: call.callId, name: call.name, ok: result.ok, content },
-      });
+      commitFact(
+        meter,
+        session,
+        { type: "tool/result", turnId, data: { callId: call.callId, name: call.name, ok: result.ok, content } },
+        // Charged after the tool ran, which is why this one raises a fault rather
+        // than a refusal: the side effect may exist, and nothing about the request
+        // can be re-phrased to make it un-happen.
+        true,
+      );
       emit?.({
         type: "tool/result",
         callId: call.callId,
@@ -271,6 +304,74 @@ async function runSteps(
       });
     }
   }
+}
+
+/**
+ * The turn's closing fact, charged before the Runtime writes it.
+ *
+ * The reason and the error are known here, and they are what the `turn/end`
+ * record will hold, so the meter can account for the last fact of the turn like
+ * every other one. It is charged without the headroom check the content facts
+ * keep, because that headroom was reserved for exactly this: a turn that fit its
+ * content can always be closed, whatever it decided in the end.
+ */
+function closeTurn(meter: TurnResourceMeter, turnId: string, outcome: TurnOutcome): TurnOutcome {
+  meter.commitTerminal("the turn's end", {
+    type: "turn/end",
+    turnId,
+    data: { reason: outcome.reason, ...(outcome.error === undefined ? {} : { error: outcome.error }) },
+  });
+  return outcome;
+}
+
+/**
+ * Records one fact of the turn: charged first, written second.
+ *
+ * The order is the point. A fact the meter refuses never reaches the log, so a
+ * turn that could not be kept whole is a turn that was never half-written — and
+ * a turn whose *result* could not be kept stops there with a fault, because the
+ * tool that produced it has already run.
+ */
+function commitFact(
+  meter: TurnResourceMeter,
+  session: Session,
+  fact: SessionEventInput,
+  producedByATool = false,
+): void {
+  if (producedByATool) meter.commitResult("a tool result", fact);
+  else meter.commit(fact.type === "tool/call" ? "a tool call" : "the step's declaration", fact);
+  session.append(fact);
+}
+
+/**
+ * What the Runtime already recorded for this turn, read back from the log.
+ *
+ * The turn's framing and its user input are written by the AgentRuntime before
+ * the loop is called. The meter counts what happened rather than what this file
+ * expected to happen, so they are read from the session instead of passed in.
+ */
+function chargeWhatTheRuntimeAlreadyWrote(meter: TurnResourceMeter, session: Session, turnId: string): void {
+  for (const event of session.events()) {
+    if (event.turnId !== turnId) continue;
+    if (event.type === "turn/start") meter.commit("the turn's start", { type: event.type, turnId, data: event.data });
+    else if (event.type === "message/user") meter.commit("the turn's input", { type: event.type, turnId, data: event.data });
+  }
+}
+
+/**
+ * The whole group of one step's calls, judged together.
+ *
+ * Counted and measured as a group because that is the only moment at which the
+ * answer is still free: after the assistant declaration is written, the calls
+ * exist and the first of them runs.
+ */
+function assertToolGroup(calls: readonly ToolCall[], limits: LoopResourceLimits): void {
+  if (calls.length > limits.maxToolCallsPerStep) {
+    throw new NonRetryableModelError(
+      `a model step declared ${calls.length} tool calls, more than this profile allows`,
+    );
+  }
+  for (const call of calls) assertToolInput(call, limits);
 }
 
 /** The observation a call gets when the turn was cancelled before it could run. */
@@ -285,6 +386,9 @@ const CANCELLED_TOOL_RESULT = "tool not executed: the turn was cancelled";
  * rejects on the next request, and the loop's promise not to produce one cannot
  * depend on every injected ToolRegistry keeping its own.
  *
+ * The one thing it does not swallow is a resource fault: a tool that says the
+ * turn can no longer be recorded honestly is not a tool that failed, and turning
+ * it into an ordinary `ok: false` would report a side effect as a clean miss.
  */
 async function dispatchTool(
   tools: ToolRegistry,
@@ -296,6 +400,7 @@ async function dispatchTool(
   try {
     return await tools.execute(call.name, call.input, context);
   } catch (error) {
+    if (error instanceof TurnResourceFault) throw error;
     return { ok: false, error: errorMessageOf(error) };
   }
 }
@@ -314,6 +419,7 @@ interface ModelStepInput {
   readonly turnId: string;
   readonly context: RuntimeContext;
   readonly emit: ((event: AgentLoopEvent) => void) | undefined;
+  readonly meter: TurnResourceMeter;
 }
 
 /**
@@ -337,17 +443,19 @@ interface ModelStepInput {
  * fits rather than trusting the proof it was built with.
  */
 async function runModelStep(step: ModelStepInput): Promise<ModelStepResult> {
-  const { modelClient, request, limits, fixed, session, turnId, context, emit } = step;
+  const { modelClient, request, limits, fixed, session, turnId, context, emit, meter } = step;
   const failures: string[] = [];
   // Consecutive identical causes collapse into one, so a broken transport reads as
   // one reason instead of three, and no attempt's cause hides another's.
   const recordFailure = (message: string): void => {
     if (failures.at(-1) !== message) failures.push(message);
   };
-  const attempts = MAX_MODEL_ATTEMPTS;
+  const attempts = meter.profile.maxModelAttempts;
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     if (context.signal.aborted) return { status: "cancelled" };
+    // A previous attempt's staged step is gone; nothing of it is recorded.
+    meter.discardStaging();
 
     assertModelRequestFits(request, { limits, fixed, turn: { events: session.events(), turnId } });
 
@@ -362,11 +470,13 @@ async function runModelStep(step: ModelStepInput): Promise<ModelStepResult> {
 
         switch (event.type) {
           case "text-delta":
+            meter.stageText(event.text);
             text += event.text;
             emit?.({ type: "assistant/chunk", text: event.text });
             break;
 
           case "tool-call":
+            meter.stageCall(event.call);
             // Shallow copy: a client that keeps its own reference to the call it
             // emitted must not be able to reach back into what this step recorded.
             // `input` stays by reference, exactly as Session.deriveMessages treats it.
@@ -379,6 +489,7 @@ async function runModelStep(step: ModelStepInput): Promise<ModelStepResult> {
       }
     } catch (error) {
       if (context.signal.aborted) return { status: "cancelled" };
+      if (error instanceof TurnResourceFault) throw error;
       if (error instanceof NonRetryableModelError) return { status: "failed", message: errorMessageOf(error) };
 
       recordFailure(errorMessageOf(error));

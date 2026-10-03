@@ -60,6 +60,9 @@ export type {
   FixedContextInput,
 } from "./context/context-builder.js";
 
+export { LOOP_RESOURCE_LIMITS, TERMINAL_HEADROOM_BYTES, TurnResourceMeter, validateLoopResourceLimits } from "./loop/turn-resources.js";
+export type { LoopResourceLimits } from "./loop/turn-resources.js";
+
 export { MAX_MODEL_ATTEMPTS, MAX_STEPS, createAgentLoop } from "./loop/agent-loop.js";
 export type {
   AgentLoop,

@@ -33,6 +33,10 @@ vi.mock("@every-dagent/agent-core", async (importOriginal) => {
       return {
         run: (input: Parameters<typeof runtime.run>[0]) => runtime.run(input),
         stream: (input: Parameters<typeof runtime.stream>[0]) => heldStream(runtime.stream(input)),
+        // Forwarded, and deliberately not held: the admission preflight is
+        // synchronous and touches no execution state, so a run's feasibility is
+        // never what this wrapper is widening.
+        preflight: (input: Parameters<typeof runtime.preflight>[0]) => runtime.preflight(input),
       };
     },
   };

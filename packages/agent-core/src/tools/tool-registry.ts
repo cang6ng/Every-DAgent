@@ -1,4 +1,4 @@
-import { errorMessageOf } from "../errors.js";
+import { errorMessageOf, TurnResourceFault } from "../errors.js";
 import type { RuntimeContext } from "../runtime/runtime-context.js";
 import type { Tool, ToolExecutionResult } from "./tool.js";
 
@@ -54,6 +54,11 @@ class MapToolRegistry implements ToolRegistry {
     try {
       return { ok: true, value: await tool.execute(input, context) };
     } catch (error) {
+      // A tool that says the turn itself can no longer be recorded honestly is
+      // not a tool that failed: answering it with `ok: false` would report a
+      // side effect as a clean miss, so the fault travels out through the one
+      // catch every tool call goes through.
+      if (error instanceof TurnResourceFault) throw error;
       return { ok: false, error: errorMessageOf(error) };
     }
   }
