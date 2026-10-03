@@ -69,6 +69,7 @@ describe("dependency boundary", () => {
         "repository.ts",
         "reverse.ts",
         "run.ts",
+        "settings-profile.ts",
         "state.ts",
       ].sort(),
     );

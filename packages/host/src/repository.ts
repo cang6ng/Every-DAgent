@@ -43,6 +43,8 @@ import type {
 } from "@every-dagent/protocol";
 import { validateJsonValue } from "@every-dagent/protocol";
 
+import { isSettingsNamespace, MAX_SETTINGS_VALUE_BYTES } from "./settings-profile.js";
+
 /** What one write's own evidence proves about a batch whose receipt was lost. */
 type WriteVerdict<T> =
   | { readonly kind: "committed"; readonly value: T }
@@ -71,8 +73,17 @@ type TransactionState = "ended" | "open" | "unknown";
  * store written before version 2 has no such half, and nothing here invents
  * one: a turn without an owner reads exactly like a turn with the wrong one,
  * and both are refused.
+ *
+ * Version 3 adds durable configuration: one row per settings namespace holding
+ * the *desired* value a client asked for (with its own schema version and CAS
+ * revision), and one row per plugin holding its desired-enabled intent. What is
+ * deliberately absent is any notion of what a host instance made effective —
+ * effective state is a fact about one running instance, and a store that kept
+ * it would be claiming an instance's memory on its behalf. A store written
+ * before version 3 simply has no configuration, and the first startup after the
+ * migration initializes it once from the composition's trusted defaults.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** A committed session event, in the shape the store keeps it. */
 export interface StoredRecord {
@@ -283,6 +294,61 @@ export type DeleteOutcome =
   | { readonly kind: "revision-conflict"; readonly session: SessionRecord }
   | { readonly kind: "busy" };
 
+/** One namespace's durable desired configuration, as the store keeps it. */
+export interface SettingsNamespaceRecord {
+  readonly namespace: string;
+  readonly schemaVersion: number;
+  /** The CAS revision of this namespace alone; starts at 1 and only moves forward. */
+  readonly revision: number;
+  /** The desired value, encoded exactly as it will be read back. */
+  readonly valueJson: string;
+  readonly updatedAt: number;
+}
+
+/** One plugin's durable desired-enabled intent. */
+export interface PluginIntentRecord {
+  readonly pluginId: string;
+  readonly desiredEnabled: boolean;
+  readonly updatedAt: number;
+}
+
+/** The configuration a first startup initializes, as one atomic batch. */
+export interface InitializeConfigurationInput {
+  readonly at: number;
+  readonly namespaces: readonly {
+    readonly namespace: string;
+    readonly schemaVersion: number;
+    readonly valueJson: string;
+  }[];
+  readonly pluginIntents: readonly { readonly pluginId: string; readonly desiredEnabled: boolean }[];
+}
+
+export interface UpdateSettingsNamespaceInput {
+  readonly namespace: string;
+  readonly expectedRevision: number;
+  readonly schemaVersion: number;
+  readonly valueJson: string;
+  readonly at: number;
+}
+
+export interface SetPluginIntentInput {
+  readonly pluginId: string;
+  readonly desiredEnabled: boolean;
+  readonly at: number;
+}
+
+/**
+ * What a settings CAS decided.
+ *
+ * `not-found` is a namespace this store holds no row for — a state the host
+ * does not produce (bootstrap writes every managed namespace) and therefore
+ * refuses rather than creating on demand: an update is not an initialization.
+ */
+export type UpdateNamespaceOutcome =
+  | { readonly kind: "updated"; readonly record: SettingsNamespaceRecord }
+  | { readonly kind: "not-found" }
+  | { readonly kind: "revision-conflict"; readonly record: SettingsNamespaceRecord };
+
 /** A committed record the store would have to truncate to keep. */
 export class RecordTooLargeError extends Error {
   constructor(detail: string) {
@@ -473,6 +539,44 @@ export interface Repository {
    * client pages by, so a lifecycle change still has to move it.
    */
   bumpPluginRevision(): CollectionRevisions;
+
+  // Configuration. Reads return exactly what the store holds; writes are one
+  // transaction each, with the same commit-evidence rules as every other write.
+  /**
+   * One namespace's desired configuration, or `undefined` when it was never
+   * initialized. What comes back is the *desired* value: the store has no
+   * opinion about what any host instance made of it.
+   */
+  getSettingsNamespace(namespace: string): SettingsNamespaceRecord | undefined;
+  /**
+   * Initializes the configuration a first startup owns, in one transaction.
+   *
+   * Every requested row must be absent: a namespace or intent this store
+   * already holds is refused rather than overwritten, because "initialize" is
+   * the one write whose meaning depends on there being nothing there — an
+   * overwrite is an update, and updates go through CAS. On refusal nothing is
+   * written, so a startup that cannot honestly initialize leaves no half of a
+   * configuration behind.
+   */
+  initializeConfiguration(input: InitializeConfigurationInput): void;
+  /**
+   * One compare-and-set write of a namespace's desired value.
+   *
+   * The expected revision is re-checked inside the transaction, so a conflict
+   * is decided against what the store holds rather than against a read that
+   * already happened. A conflict writes nothing. A revision at the safe-integer
+   * ceiling is refused (fail closed) rather than wrapped.
+   */
+  updateSettingsNamespace(input: UpdateSettingsNamespaceInput): UpdateNamespaceOutcome;
+  /** One plugin's desired-enabled intent, or `undefined` when it has none. */
+  getPluginIntent(pluginId: string): PluginIntentRecord | undefined;
+  /**
+   * Records one plugin's desired-enabled intent, creating the row when the
+   * plugin has never had one. The write is idempotent in value: it reports what
+   * the store now holds either way, so a caller can tell a durable intent from
+   * a failed write by the answer alone.
+   */
+  setPluginDesiredEnabled(input: SetPluginIntentInput): PluginIntentRecord;
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,6 +1157,31 @@ const MIGRATIONS: readonly Migration[] = [
       // claims to be.
       `ALTER TABLE turns ADD COLUMN run_id TEXT`,
       `CREATE UNIQUE INDEX turns_by_owner ON turns (run_id) WHERE run_id IS NOT NULL`,
+    ],
+  },
+  {
+    version: 3,
+    statements: [
+      // Desired configuration, one row per namespace. The CHECKs are the
+      // invariants the writers already hold themselves to, restated where the
+      // store can refuse a row this build did not write: a revision starts at
+      // one, a schema version is never zero, and a value is always present.
+      // There is no effective column on purpose.
+      `CREATE TABLE settings_namespaces (
+         namespace TEXT PRIMARY KEY,
+         schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
+         revision INTEGER NOT NULL CHECK (revision >= 1),
+         value_json TEXT NOT NULL,
+         updated_at INTEGER NOT NULL
+       )`,
+      // Desired-enabled intent, one row per plugin. It is the durable half of
+      // `plugins.enable` / `plugins.disable`; the actual lifecycle is this
+      // instance's fact and is not stored here.
+      `CREATE TABLE plugin_intents (
+         plugin_id TEXT PRIMARY KEY,
+         desired_enabled INTEGER NOT NULL CHECK (desired_enabled IN (0, 1)),
+         updated_at INTEGER NOT NULL
+       )`,
     ],
   },
 ];
@@ -2503,8 +2632,229 @@ class SqliteRepository implements Repository {
     );
   }
 
-  private committedResult(sessionId: string, runId: string): CommitTurnResult {
-    const session = this.getSession(sessionId);
+  // -------------------------------------------------------------------------
+  // Configuration.
+  // -------------------------------------------------------------------------
+
+  /**
+   * One namespace's desired value, held to the shape a committed row must have.
+   *
+   * A row that is not what a settings row is — no revision, a revision below
+   * one, no value — is refused rather than read with a substituted value: a
+   * repaired setting is a different intent presented as the stored one.
+   */
+  getSettingsNamespace(namespace: string): SettingsNamespaceRecord | undefined {
+    this.assertTrusted();
+    assertSettingsNamespace(namespace);
+    const row = this.database
+      .prepare(
+        "SELECT namespace, schema_version, revision, value_json, updated_at FROM settings_namespaces WHERE namespace = ?",
+      )
+      .get(namespace) as Row | undefined;
+    if (row === undefined) return undefined;
+    return settingsNamespaceOf(row);
+  }
+
+  /**
+   * Writes the first configuration a store ever holds, in one transaction.
+   *
+   * The check that every requested row is absent happens *inside* the
+   * transaction as well as before it: the outside check decides what the caller
+   * asks for, the inside one is what makes "initialize" mean initialize even if
+   * something else wrote in between. A refusal leaves the store exactly as it
+   * was — no half of a bootstrap is ever visible.
+   */
+  initializeConfiguration(input: InitializeConfigurationInput): void {
+    const namespaces = input.namespaces.map((entry) => ({
+      namespace: entry.namespace,
+      schemaVersion: entry.schemaVersion,
+      valueJson: entry.valueJson,
+    }));
+    for (const entry of namespaces) {
+      assertSettingsNamespace(entry.namespace);
+      assertSchemaVersion(entry.schemaVersion);
+      assertValueFits(entry.valueJson);
+    }
+    const intents = input.pluginIntents.map((entry) => ({
+      pluginId: entry.pluginId,
+      desiredEnabled: entry.desiredEnabled,
+    }));
+    for (const entry of intents) {
+      assertPluginIntentId(entry.pluginId);
+      if (typeof entry.desiredEnabled !== "boolean") {
+        throw new StorageOpenError("a plugin intent is not a boolean");
+      }
+    }
+
+    this.write<true>(
+      () => {
+        for (const entry of namespaces) {
+          if (this.rawNamespaceRow(entry.namespace) !== undefined) {
+            throw new StorageOpenError("the settings namespace is already initialized");
+          }
+          this.database
+            .prepare(
+              `INSERT INTO settings_namespaces (namespace, schema_version, revision, value_json, updated_at)
+               VALUES (?, ?, 1, ?, ?)`,
+            )
+            .run(entry.namespace, entry.schemaVersion, entry.valueJson, input.at);
+        }
+        for (const entry of intents) {
+          if (this.rawIntentRow(entry.pluginId) !== undefined) {
+            throw new StorageOpenError("the plugin intent is already initialized");
+          }
+          this.database
+            .prepare(
+              "INSERT INTO plugin_intents (plugin_id, desired_enabled, updated_at) VALUES (?, ?, ?)",
+            )
+            .run(entry.pluginId, entry.desiredEnabled ? 1 : 0, input.at);
+        }
+        return true;
+      },
+      () => {
+        // The batch's own evidence: every requested row present exactly as
+        // requested means it landed; no requested row present means it did
+        // not; anything in between is a store this write cannot vouch for.
+        let present = 0;
+        for (const entry of namespaces) {
+          const row = this.rawNamespaceRow(entry.namespace);
+          if (row === undefined) continue;
+          if (
+            row["revision"] !== 1 ||
+            row["schema_version"] !== entry.schemaVersion ||
+            row["value_json"] !== entry.valueJson
+          ) {
+            return { kind: "indeterminate" as const };
+          }
+          present += 1;
+        }
+        for (const entry of intents) {
+          const row = this.rawIntentRow(entry.pluginId);
+          if (row === undefined) continue;
+          if ((row["desired_enabled"] === 1) !== entry.desiredEnabled) {
+            return { kind: "indeterminate" as const };
+          }
+          present += 1;
+        }
+        const total = namespaces.length + intents.length;
+        if (present === total) return { kind: "committed" as const, value: true as const };
+        if (present === 0) return { kind: "absent" as const };
+        return { kind: "indeterminate" as const };
+      },
+    );
+  }
+
+  /**
+   * One compare-and-set write of a namespace's desired value.
+   *
+   * The revision is re-read and compared inside the transaction, and the UPDATE
+   * carries the same expectation in its own `WHERE`, so a conflict is decided
+   * against the store and not against a read that already happened. The
+   * revision ceiling is refused rather than wrapped: a counter that cannot
+   * advance is a fact this write reports instead of inventing.
+   */
+  updateSettingsNamespace(input: UpdateSettingsNamespaceInput): UpdateNamespaceOutcome {
+    assertSettingsNamespace(input.namespace);
+    assertSchemaVersion(input.schemaVersion);
+    assertValueFits(input.valueJson);
+
+    return this.write<UpdateNamespaceOutcome>(
+      () => {
+        const current = this.getSettingsNamespace(input.namespace);
+        if (current === undefined) return { kind: "not-found" } as const;
+        if (current.revision !== input.expectedRevision) {
+          return { kind: "revision-conflict", record: current } as const;
+        }
+        if (current.revision >= Number.MAX_SAFE_INTEGER) {
+          throw new StorageOpenError("the settings revision cannot advance");
+        }
+        this.database
+          .prepare(
+            `UPDATE settings_namespaces SET
+               revision = revision + 1, schema_version = ?, value_json = ?, updated_at = MAX(updated_at, ?)
+             WHERE namespace = ? AND revision = ?`,
+          )
+          .run(input.schemaVersion, input.valueJson, input.at, input.namespace, input.expectedRevision);
+        const updated = this.getSettingsNamespace(input.namespace);
+        if (updated === undefined) throw new StorageOpenError("the settings write could not be read back");
+        return { kind: "updated", record: updated } as const;
+      },
+      () => {
+        // The batch's own evidence: exactly one revision past the expected one,
+        // holding exactly the requested value, is this write's own result. The
+        // expected revision itself means the write did not land.
+        const row = this.rawNamespaceRow(input.namespace);
+        if (row === undefined) return { kind: "indeterminate" as const };
+        if (
+          row["revision"] === input.expectedRevision + 1 &&
+          row["schema_version"] === input.schemaVersion &&
+          row["value_json"] === input.valueJson
+        ) {
+          const record = this.getSettingsNamespace(input.namespace);
+          if (record === undefined) return { kind: "indeterminate" as const };
+          return { kind: "committed" as const, value: { kind: "updated", record } as const };
+        }
+        if (row["revision"] === input.expectedRevision) return { kind: "absent" as const };
+        return { kind: "indeterminate" as const };
+      },
+    );
+  }
+
+  getPluginIntent(pluginId: string): PluginIntentRecord | undefined {
+    this.assertTrusted();
+    assertPluginIntentId(pluginId);
+    const row = this.rawIntentRow(pluginId);
+    return row === undefined ? undefined : pluginIntentOf(row);
+  }
+
+  setPluginDesiredEnabled(input: SetPluginIntentInput): PluginIntentRecord {
+    assertPluginIntentId(input.pluginId);
+    if (typeof input.desiredEnabled !== "boolean") {
+      throw new StorageOpenError("a plugin intent is not a boolean");
+    }
+
+    return this.write<PluginIntentRecord>(
+      () => {
+        this.database
+          .prepare(
+            `INSERT INTO plugin_intents (plugin_id, desired_enabled, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT (plugin_id) DO UPDATE SET
+               desired_enabled = excluded.desired_enabled,
+               updated_at = MAX(plugin_intents.updated_at, excluded.updated_at)`,
+          )
+          .run(input.pluginId, input.desiredEnabled ? 1 : 0, input.at);
+        const record = this.getPluginIntent(input.pluginId);
+        if (record === undefined) throw new StorageOpenError("the plugin intent could not be read back");
+        return record;
+      },
+      () => {
+        const row = this.rawIntentRow(input.pluginId);
+        if (row === undefined) return { kind: "indeterminate" as const };
+        if ((row["desired_enabled"] === 1) === input.desiredEnabled) {
+          const record = this.getPluginIntent(input.pluginId);
+          if (record === undefined) return { kind: "indeterminate" as const };
+          return { kind: "committed" as const, value: record };
+        }
+        return { kind: "indeterminate" as const };
+      },
+    );
+  }
+
+  /** The raw namespace row, or `undefined` when the store holds none. */
+  private rawNamespaceRow(namespace: string): Row | undefined {
+    return this.database
+      .prepare("SELECT namespace, schema_version, revision, value_json, updated_at FROM settings_namespaces WHERE namespace = ?")
+      .get(namespace) as Row | undefined;
+  }
+
+  /** The raw plugin-intent row, or `undefined` when the store holds none. */
+  private rawIntentRow(pluginId: string): Row | undefined {
+    return this.database
+      .prepare("SELECT plugin_id, desired_enabled, updated_at FROM plugin_intents WHERE plugin_id = ?")
+      .get(pluginId) as Row | undefined;
+  }
+
+  private committedResult(sessionId: string, runId: string): CommitTurnResult {    const session = this.getSession(sessionId);
     const run = this.getRun(runId);
     if (session === undefined || run === undefined) {
       throw new StorageOpenError("the commit could not be read back");
@@ -2522,8 +2872,7 @@ class SqliteRepository implements Repository {
 }
 
 /** The turn-end reason a status that claims a settled turn must have been written with. */
-function endReasonFor(status: RunStatus): EndReason | undefined {
-  switch (status) {
+function endReasonFor(status: RunStatus): EndReason | undefined {  switch (status) {
     case "completed":
       return "completed";
     case "limited":
@@ -2551,6 +2900,90 @@ function statusFor(reason: string): RunStatus {
 }
 
 type Row = Record<string, unknown>;
+
+/**
+ * A namespace name that is not one this build writes.
+ *
+ * The check is here, at the store, and not only in the host, because the store
+ * is the thing that would otherwise keep a second identity for one intent: a
+ * row whose name differs by case or by whitespace reads as a different
+ * namespace to every later comparison.
+ */
+function assertSettingsNamespace(namespace: string): void {
+  if (!isSettingsNamespace(namespace)) {
+    throw new StorageOpenError("a settings namespace is not a name this store writes");
+  }
+}
+
+/** One plugin id, held to the shape its namespace is built from. */
+function assertPluginIntentId(pluginId: string): void {
+  if (!isSettingsNamespace(`plugin:${pluginId}`)) {
+    throw new StorageOpenError("a plugin intent names no plugin this store writes");
+  }
+}
+
+/** A schema version a committed row could carry. */
+function assertSchemaVersion(schemaVersion: number): void {
+  if (!Number.isSafeInteger(schemaVersion) || schemaVersion < 1) {
+    throw new StorageOpenError("a settings schema version is not a positive whole number");
+  }
+}
+
+/** One encoded value, held to the bound this profile writes under. */
+function assertValueFits(valueJson: string): void {
+  if (typeof valueJson !== "string" || Buffer.byteLength(valueJson, "utf8") > MAX_SETTINGS_VALUE_BYTES) {
+    throw new StorageOpenError("the settings value does not fit this store's bound");
+  }
+}
+
+/** One settings row, proven to be the shape a committed row must have. */
+function settingsNamespaceOf(row: Row): SettingsNamespaceRecord {
+  const namespace = row["namespace"];
+  const schemaVersion = row["schema_version"];
+  const revision = row["revision"];
+  const valueJson = row["value_json"];
+  const updatedAt = row["updated_at"];
+  if (typeof namespace !== "string" || !isSettingsNamespace(namespace)) {
+    throw new CorruptRecordError("a settings row carries a namespace this store does not write");
+  }
+  if (!Number.isSafeInteger(schemaVersion) || (schemaVersion as number) < 1) {
+    throw new CorruptRecordError("a settings row carries no legal schema version");
+  }
+  if (!Number.isSafeInteger(revision) || (revision as number) < 1) {
+    throw new CorruptRecordError("a settings row carries no legal revision");
+  }
+  if (typeof valueJson !== "string" || Buffer.byteLength(valueJson, "utf8") > MAX_SETTINGS_VALUE_BYTES) {
+    throw new CorruptRecordError("a settings row carries no value this store would write");
+  }
+  if (typeof updatedAt !== "number" || !Number.isFinite(updatedAt)) {
+    throw new CorruptRecordError("a settings row carries no legal time");
+  }
+  return Object.freeze({
+    namespace,
+    schemaVersion: schemaVersion as number,
+    revision: revision as number,
+    valueJson,
+    updatedAt,
+  });
+}
+
+/** One plugin-intent row, proven to be the shape a committed row must have. */
+function pluginIntentOf(row: Row): PluginIntentRecord {
+  const pluginId = row["plugin_id"];
+  const desiredEnabled = row["desired_enabled"];
+  const updatedAt = row["updated_at"];
+  if (typeof pluginId !== "string" || !isSettingsNamespace(`plugin:${pluginId}`)) {
+    throw new CorruptRecordError("a plugin intent row names no plugin this store writes");
+  }
+  if (desiredEnabled !== 0 && desiredEnabled !== 1) {
+    throw new CorruptRecordError("a plugin intent row is not a boolean");
+  }
+  if (typeof updatedAt !== "number" || !Number.isFinite(updatedAt)) {
+    throw new CorruptRecordError("a plugin intent row carries no legal time");
+  }
+  return Object.freeze({ pluginId, desiredEnabled: desiredEnabled === 1, updatedAt });
+}
+
 
 function sessionOf(row: Row): SessionRecord {
   const blockedReason = row["blocked_reason"];

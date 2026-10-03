@@ -25,6 +25,8 @@ import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
+import { SCHEMA_VERSION } from "../src/repository.js";
+
 import {
   awaitRunTerminal,
   composeTestHost,
@@ -422,7 +424,7 @@ describe("R05 legacy history fails closed", () => {
       const before = canonicalFingerprint(path, "s-legacy");
 
       const composed = composeTestHost({ modelClient: scriptedModel([textReply("unused")]).client, location: path });
-      expect(composed.repository.schemaVersion).toBe(2);
+      expect(composed.repository.schemaVersion).toBe(SCHEMA_VERSION);
       const client = connect(composed.host);
       await client.describe();
 
@@ -441,7 +443,7 @@ describe("R05 legacy history fails closed", () => {
       // legacy row byte-for-byte as the old build wrote it.
       const database = new DatabaseSync(path);
       const version = database.prepare("PRAGMA user_version").get() as { readonly user_version?: number };
-      expect(version.user_version).toBe(2);
+      expect(version.user_version).toBe(SCHEMA_VERSION);
       const owners = database.prepare("SELECT run_id FROM turns").all() as { readonly run_id?: string | null }[];
       expect(owners.map((row) => row.run_id ?? null)).toEqual([null]);
       database.close();

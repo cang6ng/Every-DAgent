@@ -21,6 +21,8 @@ import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
+import { SCHEMA_VERSION } from "../src/repository.js";
+
 import {
   abortAwareReply,
   awaitRunTerminal,
@@ -567,7 +569,7 @@ describe("E2 legacy stores", () => {
 
       const model = scriptedModel([textReply("unused")]);
       const composed = composeTestHost({ modelClient: model.client, location: path });
-      expect(composed.repository.schemaVersion).toBe(2);
+      expect(composed.repository.schemaVersion).toBe(SCHEMA_VERSION);
       const client = connect(composed.host);
       await client.describe();
 
@@ -603,7 +605,7 @@ describe("E2 legacy stores", () => {
       // run's current pointer), and every legacy row is exactly as it was.
       const database = new DatabaseSync(path);
       const version = database.prepare("PRAGMA user_version").get() as { readonly user_version?: number };
-      expect(version.user_version).toBe(2);
+      expect(version.user_version).toBe(SCHEMA_VERSION);
       const owners = database.prepare("SELECT session_id, run_id FROM turns ORDER BY session_id").all() as {
         readonly run_id?: string | null;
       }[];
