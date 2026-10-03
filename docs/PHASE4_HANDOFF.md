@@ -348,3 +348,254 @@ composition，也不能先 admit durable Run 再暴露。Repair 完成后 full g
 
 `.zcode/` 内的 probe / mutation / scratch 是过程证据，**不是** contract authority，也不构成本文档的组成
 部分；它们保持有意 untracked、不 stage、不 commit。
+## M3 Final Closeout / Seal
+
+> 本节为 seal 轮追加，只记录 M3 关闭与该轮之后的事实；以上 P4.0 冻结、M1 Batch 1 closeout、M1 seal 与 M2
+> seal 的历史事实不被追溯改写。本节由独立 docs-only commit（`docs: seal phase 4 m3`）记录；文档不引用该
+> 提交自身的 SHA。
+
+### Current State
+
+| Milestone | 状态 |
+| --- | --- |
+| P4.0 | COMPLETE / FROZEN |
+| M1 | COMPLETE / SEALED |
+| M2 | COMPLETE / SEALED |
+| M3 | **COMPLETE / SEALED** |
+| M4 | NOT STARTED |
+| M5 | NOT STARTED |
+
+M3 不再重新打开，除非后续真实 regression 证明 Frozen Contract violation。
+
+### Owner Acceptance
+
+M3 IMPLEMENTATION **PASS**；M3 OWNER ACCEPTANCE **PASS**；M3 READY TO SEAL **YES**。Repair rounds：**0 / 1**
+（本轮不使用 owner repair）。实现期（acceptance 之前）由 implementer 当轮发现并修复的缺陷不计为 owner
+repair round，见本节 Review / Acceptance Policy。
+
+### M3 Final Implementation Baseline
+
+`fa814b8210ebe205f5436152c5b7335f1808815f` — `test(m3): close configuration acceptance`
+
+它由 M3 的 5 个 semantic commits 组成（自 `0e823bd` 起，未 amend/squash/rebase）：
+
+| SHA | Subject |
+| --- | --- |
+| `d363e5772c207252803acb6bbd22ece9b7527f52` | `feat(host): persist versioned configuration` |
+| `48fb2525c0645f1e75c73cf723e3a5963ac64961` | `feat(host): compose runtime from persisted settings` |
+| `6fd254ebebdd6f1d7ce41b637a9cd89e086db377` | `feat(host): restore persistent plugin intent` |
+| `7bf25ee5822a04ec1fa14e58d7715b0f14c7578f` | `feat(protocol): expose persistent configuration state` |
+| `fa814b8210ebe205f5436152c5b7335f1808815f` | `test(m3): close configuration acceptance` |
+
+seal commit 只更新本 HANDOFF。
+
+### Frozen Contract Authority
+
+- `docs/PHASE4_PLATFORM_SPEC.md`
+- `docs/PHASE4_M1_CONTRACT_ERRATA.md`
+
+两者共同构成契约权威；两份冻结文档自冻结以来未被修改。Protocol generation 保持 `"2"`：M3 implementation
+**未修改 Frozen Contract**，未重定义任何已冻结语义，未新增 production dependency。schema 由 **2 → 3**，
+这是 M3 明确授权并要求的迁移。
+
+### M3 Delivered Capabilities
+
+1. durable versioned non-secret settings（`settings_namespaces`：namespace/schema_version/revision/value_json/updated_at）
+2. namespace-scoped CAS（事务内重读 revision，冲突零写，revision 上界 fail closed）
+3. 三个 namespace 域：`host`、`model`、`plugin:<pluginId>`（各自独立 revision，互不制造冲突）
+4. desired / effective 分离（desired 落库，effective 是本实例内存事实）
+5. restartRequired（只由 config/settings 的 revision 差异推导）
+6. ordinary settings restart-to-apply（无 model/contextBuilder/system prompt/loop/plugin config 热换）
+7. async settings-driven Host readiness（`createHost`/`composeHost` 返回 Promise，完成后才交出可执行 Host）
+8. trusted provider/model catalog validation（精确 provider/model 查询）
+9. trusted endpoint allowlist（canonical full base endpoint 精确匹配，拒绝时不回显 URL）
+10. explicit composition-only credential boundary（CredentialProvider 只在 trusted composition 内部）
+11. no ambient credential fallback（apiKey 必须显式，禁 `undefined → SDK credential store`）
+12. trusted bootstrap defaults persisted once（首版验证后一次事务写入，此后不覆盖）
+13. HostSettings runtime consumption（默认 ContextBuilder 的 systemPrompt、AgentLoop 的 maxSteps/maxModelAttempts）
+14. ModelSettings runtime consumption（provider/model/baseURL/timeout 经 composition 真实落到 adapter）
+15. M2 output reserve 集成（`outputReserveTokens` 只收紧、不放大 M2 默认 R，并贯穿 preflight/selection/final guard/实际 cap）
+16. plugin config schema/version（descriptor 的 schemaVersion + defaultValue + 纯同步 validate）
+17. registered / desiredEnabled / actual lifecycle 严格分离
+18. plugin desired/effective config revision 分离
+19. intent-first plugin lifecycle（先 durable intent，再 lifecycle；失败不回滚 desired）
+20. startup plugin restore（每个最多一次尝试，不后台重试）
+21. unknown plugin retention without code loading（保留 durable row，不 install/import/load）
+22. `settings.get`（有界期望/生效快照；未托管 namespace 一律 CAPABILITY_NOT_SUPPORTED）
+23. `settings.update`（expectedRevision + 封闭 schema full replacement，零写冲突）
+24. `settings.updated`（bounded invalidation，只带 namespace/revision/restartRequired）
+25. `SettingsSnapshot`
+26. safe PluginSummary settings state（desiredEnabled/configRevision/effectiveConfigRevision/restartRequired/unavailable）
+27. bounded Client settings projection（有界 cache、迟到读单调、事件只标 stale、不自动 replay）
+
+### Desired / Effective Law
+
+Database 只持久 **desired**：values、revision、schema/version。当前 Host 仅在内存维护 **effective**：
+values 与 effective revisions。
+
+effective **不是** durable flag，也**不是**上一 Host 的遗留事实：它由本实例在 readiness 中读取并校验
+desired、经 trusted composition 构造执行后才成立，effectiveRevision 不从旧 Host 或 DB 继承。
+
+- 普通 settings update：desired 前进、effective 不变、`restartRequired=true`。
+- clean restart 成功后：desired 成为 effective、`restartRequired=false`。
+- `desiredEnabled != actual` 只由 lifecycle 表达，**不得**被写成 restartRequired。
+
+### Settings Whitelist
+
+| Namespace | implemented（首版） | deferred | forbidden |
+| --- | --- | --- | --- |
+| HostSettings | `systemPrompt`（UTF-8 ≤8 KiB）；`loop.maxSteps`（1..现有 hard max）；`loop.maxModelAttempts`（1..现有 hard max） | `maxToolCallsPerStep`、`maxNeutralItemBytes`、`maxCurrentTurnBytes`、`maxJsonDepth` 的配置化；approval timeout | apiKey/token/auth、arbitrary SDK options、grants、DB path、module path、tool policy |
+| ModelSettings | `provider`、`model`、`baseURL?`、`outputReserveTokens?`、`timeoutMs?` | `temperature`（需先有真实 adapter consumption） | 同上，另含 headers/retries/env、secret URL |
+| PluginSettings | 版本化、经可信插件 schema 校验的 non-secret config | plugin config schema migration tooling | 安装位置/代码、权限自授、credentials |
+
+HostSettings 的两项 loop 值只能收紧当前 hard profile，不能突破 M2 上限；ModelSettings 的 provider/model
+必须精确命中 trusted catalog，baseURL 必须精确命中 trusted allowlist。
+
+### Credential Boundary
+
+CredentialProvider 只在 trusted composition 内部使用，首版支持 **controlled environment mapping** 与
+**explicit injection**（映射声明变量名，禁止由 provider string 动态拼环境变量名）。
+
+credential 不得进入：ordinary settings、SQLite config、Protocol DTO、ClientSnapshot、plugin config、
+session metadata、ordinary logs/errors。missing credential 在 provider construction 之前 **startup fail
+closed**；不得把 `undefined` 交给 SDK 触发 ambient credential store。
+
+现有证据为 **real pi-ai serializer + stubbed transport**（真实序列化器 + 被替换的 socket）：证明受管
+credential 确实进入 provider auth 请求（authorization header）。**real provider：NOT RUN**，不得记为 PASS。
+
+### Plugin Truth Model
+
+三层严格分离：**registered**（由 registered-only catalogue membership 表达，DB row 绝不是 installed
+proof）、**desiredEnabled**（durable intent）、**actual lifecycle**（本实例事实）。config 另有两态：
+**desired config revision** 与 **effective config revision**，以及由两者推出的 `restartRequired`。
+
+- config update：restart-to-apply。
+- enable/disable：可 live，但**只能使用本实例 current effective config**。
+- intent write 必须先于 lifecycle；lifecycle 失败**不回滚** desired，actual 按真实 disabled/error/cleanup 上报。
+- unknown plugin：保留 durable row，不自动 install/import/load，不进入 snapshot。
+- plugin 的 effective config 在注册时绑定并 deep-freeze，`enable()` 不接收 config；不存在 hot reload /
+  setConfig / dynamic resolver。
+
+### Startup Readiness
+
+顺序语义：storage ownership → schema/migration → load/bootstrap desired settings → validate desired →
+trusted composition → credential resolution → execution dependency construction → M2 validation →
+reconciliation → plugin registration/restore → readiness/publication checks → effective revisions → ready。
+
+上述必要阶段全部完成前，不得返回 executable Host；任何一步失败按逆序释放（settle lifecycle → 释放
+plugins → dispose composition → 最后关库）。durable failure **不得** fallback ephemeral。
+
+### Protocol / Client
+
+新增 `settings.get`、`settings.update`、`settings.updated` 与 `SettingsSnapshot`；`PluginSummary` 增加
+desired/config/restart 安全状态；`HostSnapshot` 增加固定的 safe settings summaries；`capabilities.settings`
+在 repository/dispatcher/Protocol/Client/readiness 全部接线完成后才置 `true`。Protocol 仍为 `"2"`。
+
+`settings.updated` 只广播 bounded invalidation（namespace/revision/restartRequired），不广播完整 config 或
+secret；丢失事件靠 resync/settings.get，不建设 durable event replay。
+
+Client 保持 React-free、immutable、bounded、non-authoritative：有界 settings cache（当前 implementation
+profile：最多 8 个 namespace）、迟到读不覆盖更高 revision、重连/换 Host 使旧 effective fact 失效（换
+hostInstance 直接丢弃 cache）、写入不自动 replay（丢失应答靠显式 read 确认）。
+
+### Credential Sentinel Evidence
+
+正式测试在运行时生成 `CREDENTIAL_SENTINEL_M3_DO_NOT_LEAK_<random>`（不硬编码进源码），并先证明它确实
+进入 trusted provider auth path（stubbed socket 收到 `authorization: Bearer <sentinel>`）。随后检查
+runtime produced artifacts，全部 **0 次出现**：
+
+| artifact | sentinel 出现次数 |
+| --- | --- |
+| SQLite logical rows / DB main file / journal-WAL-SHM 若存在 | 0 |
+| actual encoded Protocol frames（host 方向） | 0 |
+| SettingsSnapshot / settings.get/update result | 0 |
+| PluginSummary / HostSnapshot | 0 |
+| ClientSnapshot / cache | 0 |
+| Session metadata/history、Run failure/terminal | 0 |
+| startup safe error、provider construction failure | 0 |
+| captured logs/stdout/stderr | 0 |
+
+这是**系统受管 credential 流**的验收，不是通用 secret detector：它不声称能识别用户主动粘贴进聊天或普通
+文本的秘密，也不宣称能隔离恶意同进程插件。
+
+### M3 Acceptance
+
+**A01–A40：40/40 PASS**（覆盖位置：`packages/host/tests/settings-repository.test.ts`、`settings-composition.test.ts`、
+`settings-rpc.test.ts`、`plugin-configuration.test.ts`、`packages/model-pi-ai/tests/pi-ai-composition.test.ts`、
+`packages/client/tests/settings.test.ts`、`settings-projection.test.ts`、`tests/integration/persistent-configuration.test.ts`、
+`tests/integration/credential-boundary.test.ts`）。
+
+额外的关键断言同样通过：host/model CAS 互不冲突；error 状态插件仍可先持久化 desired=false；
+settings 迟到 read 不覆盖更高 revision；storageFault 后 settings 入口不绕过 M1 fail-closed
+（`settings.get`/`settings.update` 都在 current-state 边界内）。
+
+### Negative Controls
+
+| NC | mutant | 结果 |
+| --- | --- | --- |
+| NC1 | settings CAS 忽略调用方 expectedRevision | **KILLED** |
+| NC2 | startup 用 hardcoded/bootstrap model 而非持久化值 | **KILLED** |
+| NC3 | credential 被写入 settings DB | **KILLED** |
+| NC4 | missing credential 传 undefined 允许 ambient fallback | **KILLED** |
+| NC5 | plugin lifecycle 先于 intent commit | **KILLED** |
+| NC6 | lifecycle 失败后 rollback desired | **KILLED** |
+| NC7 | pending plugin config 被当作 effective 使用/上报 | **KILLED** |
+| NC8 | 每次 startup bootstrap 覆盖已有 desired | **KILLED** |
+
+**8/8 KILLED**：每条均以 business assertion 失败，mutant 真实加载、restore 精确、恢复后目标测试重新变绿；
+compile/import/not-run 不计入。
+
+### M3 Evidence
+
+| 项目 | 结果 |
+| --- | --- |
+| full offline（排除 `real-provider` 与 `.zcode/**`；本机有 Chrome，浏览器用例实际执行） | **1460 passed / 0 failed / 0 skipped / 1460 total** |
+| real Chrome strict（`pnpm test:web:browser`） | **17 passed / 0 failed / 0 skipped**（原 17 required cases 全通过，无 SKIP；未新增 M3 browser case） |
+| Host / repository | **391 passed** |
+| plugin-system | **81 passed** |
+| Protocol | **182 passed** |
+| Client | **212 passed** |
+| model-pi-ai（adapter） | **60 passed** |
+| Integration | **152 passed** |
+| typecheck（root + browser project） | **PASS** |
+| `pnpm build:web` | **PASS** |
+| `git diff --check` | clean |
+| negative controls | **NC1–NC8 = 8/8 KILLED** |
+| real provider | **NOT RUN**（未运行，不记为 PASS；faux provider / stubbed socket / serializer body 均不冒充 real-provider） |
+
+全部 gate 在最终 implementation baseline `fa814b8` 上通过；seal 轮为 docs-only，未重跑上述 suite。
+
+### M3 Hardening Backlog
+
+非阻塞项，记录但不属于 M3 blocker：
+
+1. `temperature` 等更多 ModelSettings 需要先有真实 adapter consumption。
+2. 更多 `LoopResourceLimits` 的配置化需要单独的边界验收。
+3. plugin config schema migration tooling（未来再做；绝不自动 fallback 到 default）。
+4. M5 settings/restart UX。
+5. 更强的真实 disk-full / read-only / cross-platform storage fault suite。
+6. 未来更多 provider/profile 仍需各自的 serializer/body readiness evidence。
+7. credential vault / OAuth 明确仍不属于当前能力。
+
+以下**不是** backlog，它们是 M3 contract 本身：credential 不进入普通 settings/wire/DB/log、CAS 正确性、
+plugin pending config 语义、startup readiness、endpoint trust。
+
+### M4 Boundary
+
+下一个 milestone 为 **M4 — Tool Policy / Minimal HITL**，状态 **NOT STARTED**。既有 Frozen Phase 4 边界
+记录如下（本轮不定义实现）：prepared execution binding、policy 决策 allow / deny / require-approval、
+Host-owned ApprovalRecord、approve 先于 tool invocation、same-host execution capability、
+timeout/cancel/disconnect 竞态、每个 executionId at-most-once dispatch。
+
+本轮不设计 M4、不实施 M4、不改 policy production code、不加 approval UI。
+
+### Review / Acceptance Policy
+
+M3 采用：ChatGPT architecture research（含 D1–D14 冻结决策）→ Sol 6.1 一份 Implementation Plan →
+DSFlash 一次性 implementation（实现期内自行发现并修复缺陷，均在 acceptance 之前）→ project-owner
+acceptance PASS。**Owner repair：NOT USED**（0 / 1）。
+
+**实施后没有发生“外部 Sol 最终独立 implementation review PASS”**，本节不作此表述。
+
+`.zcode/` 内的 probe / mutation / scratch 是过程证据，**不是** contract authority，也不构成本文档的组成
+部分；它们保持有意 untracked、不 stage、不 commit。
